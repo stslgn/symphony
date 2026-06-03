@@ -1276,6 +1276,87 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server treats invalid markup runtime notifications as terminal turn errors" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-invalid-markup-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-94")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-94"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-94"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"fields":{"error":"invalid markup in final assistant message","message":"ignoring assistant output"}}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-invalid-markup",
+        identifier: "MT-94",
+        title: "Invalid markup final output",
+        description: "Ensure invalid final markup fails fast instead of waiting forever",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-94",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:error, {:terminal_protocol_error, :invalid_markup, "invalid markup in final assistant message"}} =
+               AppServer.run(workspace, "Capture invalid markup runtime failure", issue, on_message: on_message)
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :terminal_protocol_error,
+                         reason: {:terminal_protocol_error, :invalid_markup, "invalid markup in final assistant message"}
+                       }}
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :turn_ended_with_error,
+                         reason: {:terminal_protocol_error, :invalid_markup, "invalid markup in final assistant message"}
+                       }}
+
+      refute_received {:app_server_message, %{event: :turn_completed}}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server launches over ssh for remote workers" do
     test_root =
       Path.join(

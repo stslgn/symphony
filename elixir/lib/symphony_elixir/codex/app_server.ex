@@ -365,59 +365,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
-      {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
-
-      {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
-        emit_turn_event(
-          on_message,
-          :turn_failed,
-          payload,
-          payload_string,
-          port,
-          Map.get(payload, "params")
-        )
-
-        {:error, {:turn_failed, Map.get(payload, "params")}}
-
-      {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
-        emit_turn_event(
-          on_message,
-          :turn_cancelled,
-          payload,
-          payload_string,
-          port,
-          Map.get(payload, "params")
-        )
-
-        {:error, {:turn_cancelled, Map.get(payload, "params")}}
-
-      {:ok, %{"method" => method} = payload}
-      when is_binary(method) ->
-        handle_turn_method(
+      {:ok, payload} ->
+        handle_decoded_incoming(
           port,
           on_message,
           payload,
           payload_string,
-          method,
           timeout_ms,
           tool_executor,
           auto_approve_requests
         )
-
-      {:ok, payload} ->
-        emit_message(
-          on_message,
-          :other_message,
-          %{
-            payload: payload,
-            raw: payload_string
-          },
-          metadata_from_message(port, payload)
-        )
-
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -433,6 +390,95 @@ defmodule SymphonyElixir.Codex.AppServer do
             metadata_from_message(port, %{raw: payload_string})
           )
         end
+
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp handle_decoded_incoming(port, on_message, payload, payload_string, timeout_ms, tool_executor, auto_approve_requests) do
+    case terminal_protocol_error_reason(payload) do
+      {:ok, reason} ->
+        Logger.warning("Codex terminal protocol error: reason=#{inspect(reason)} payload=#{inspect(payload)}")
+
+        emit_message(
+          on_message,
+          :terminal_protocol_error,
+          %{
+            payload: payload,
+            raw: payload_string,
+            reason: reason
+          },
+          metadata_from_message(port, payload)
+        )
+
+        {:error, reason}
+
+      :error ->
+        handle_decoded_protocol_message(
+          port,
+          on_message,
+          payload,
+          payload_string,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests
+        )
+    end
+  end
+
+  defp handle_decoded_protocol_message(port, on_message, payload, payload_string, timeout_ms, tool_executor, auto_approve_requests) do
+    case payload do
+      %{"method" => "turn/completed"} = payload ->
+        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+        {:ok, :turn_completed}
+
+      %{"method" => "turn/failed", "params" => _} = payload ->
+        emit_turn_event(
+          on_message,
+          :turn_failed,
+          payload,
+          payload_string,
+          port,
+          Map.get(payload, "params")
+        )
+
+        {:error, {:turn_failed, Map.get(payload, "params")}}
+
+      %{"method" => "turn/cancelled", "params" => _} = payload ->
+        emit_turn_event(
+          on_message,
+          :turn_cancelled,
+          payload,
+          payload_string,
+          port,
+          Map.get(payload, "params")
+        )
+
+        {:error, {:turn_cancelled, Map.get(payload, "params")}}
+
+      %{"method" => method} = payload
+      when is_binary(method) ->
+        handle_turn_method(
+          port,
+          on_message,
+          payload,
+          payload_string,
+          method,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests
+        )
+
+      payload ->
+        emit_message(
+          on_message,
+          :other_message,
+          %{
+            payload: payload,
+            raw: payload_string
+          },
+          metadata_from_message(port, payload)
+        )
 
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
     end
@@ -521,6 +567,38 @@ defmodule SymphonyElixir.Codex.AppServer do
           receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
         end
     end
+  end
+
+  defp terminal_protocol_error_reason(payload) when is_map(payload) do
+    payload
+    |> collect_error_strings()
+    |> Enum.find(&invalid_markup_error?/1)
+    |> case do
+      nil -> :error
+      message -> {:ok, {:terminal_protocol_error, :invalid_markup, message}}
+    end
+  end
+
+  defp terminal_protocol_error_reason(_payload), do: :error
+
+  defp collect_error_strings(payload) when is_map(payload) do
+    Enum.flat_map(payload, fn {key, value} ->
+      key_string = to_string(key)
+      current = if key_string in ["error", "message", "reason"] and is_binary(value), do: [value], else: []
+      current ++ collect_error_strings(value)
+    end)
+  end
+
+  defp collect_error_strings(payload) when is_list(payload) do
+    Enum.flat_map(payload, &collect_error_strings/1)
+  end
+
+  defp collect_error_strings(_payload), do: []
+
+  defp invalid_markup_error?(message) when is_binary(message) do
+    message
+    |> String.downcase()
+    |> String.contains?("invalid markup")
   end
 
   defp maybe_handle_approval_request(

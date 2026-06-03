@@ -1454,6 +1454,19 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert StatusDashboard.humanize_codex_message(wrapped) =~ "in 10"
   end
 
+  test "status dashboard humanizes terminal protocol errors" do
+    message = %{
+      event: :terminal_protocol_error,
+      message: %{
+        reason: {:terminal_protocol_error, :invalid_markup, "invalid markup in final assistant message"}
+      }
+    }
+
+    humanized = StatusDashboard.humanize_codex_message(message)
+    assert humanized =~ "terminal codex protocol error"
+    assert humanized =~ "invalid_markup"
+  end
+
   test "status dashboard uses shell command line as exec command status text" do
     message = %{
       event: :notification,

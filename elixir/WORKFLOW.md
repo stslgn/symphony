@@ -66,6 +66,7 @@ Instructions:
 1. This is an unattended orchestration session. Never ask a human to perform follow-up actions.
 2. Only stop early for a true blocker (missing required auth/permissions/secrets). If blocked, record it in the workpad and move the issue according to workflow.
 3. Final message must report completed actions and blockers only. Do not include "next steps for user".
+4. Do not emit Codex Desktop app directives or raw app markup in final messages or comments, including `::git-*`, `::archive`, and `::code-comment`. Use plain Markdown summaries only.
 
 Work only in the provided repository copy. Do not touch any other path.
 
