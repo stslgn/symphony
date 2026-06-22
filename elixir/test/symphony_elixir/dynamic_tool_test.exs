@@ -20,6 +20,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
            ] = DynamicTool.tool_specs()
 
     assert description =~ "Linear"
+    assert description =~ "slugId"
   end
 
   test "unsupported tools return a failure payload with the supported tool list" do
@@ -231,6 +232,67 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "message" => "`linear_graphql.variables` must be a JSON object when provided."
              }
            }
+  end
+
+  test "linear_graphql rejects common stale Linear project slug queries before calling Linear" do
+    selection =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Project { project(id: \"project-1\") { id slug } }"},
+        linear_client: fn _query, _variables, _opts ->
+          flunk("linear client should not be called for invalid project slug field")
+        end
+      )
+
+    assert selection["success"] == false
+
+    assert Jason.decode!(selection["output"]) == %{
+             "error" => %{
+               "message" => "Linear Project does not expose `slug`. Use `slugId` for project reads and filters."
+             }
+           }
+
+    filter =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Issues { issues(filter: { project: { slug: { eq: \"abc\" } } }) { nodes { id } } }"},
+        linear_client: fn _query, _variables, _opts ->
+          flunk("linear client should not be called for invalid project slug filter")
+        end
+      )
+
+    assert filter["success"] == false
+  end
+
+  test "linear_graphql rejects repeated unaliased type introspection before calling Linear" do
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Types { __type(name: \"Issue\") { name } __type(name: \"Project\") { name } }"},
+        linear_client: fn _query, _variables, _opts ->
+          flunk("linear client should not be called for conflicting introspection fields")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Repeated `__type` introspection fields must use GraphQL aliases."
+             }
+           }
+
+    aliased =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Types { issueType: __type(name: \"Issue\") { name } projectType: __type(name: \"Project\") { name } }"},
+        linear_client: fn query, _variables, _opts ->
+          assert query =~ "issueType: __type"
+          {:ok, %{"data" => %{"issueType" => %{"name" => "Issue"}, "projectType" => %{"name" => "Project"}}}}
+        end
+      )
+
+    assert aliased["success"] == true
   end
 
   test "linear_graphql formats transport and auth failures" do

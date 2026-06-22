@@ -8,6 +8,11 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @linear_graphql_tool "linear_graphql"
   @linear_graphql_description """
   Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
+
+  Prefer the issue context already provided in the prompt. Use this tool only
+  for exact Linear reads or writes that are still required. Linear projects use
+  `slugId`, not `slug`; repeated `__type` introspection fields must be aliased.
+  Do not retry an unchanged failing query shape in a loop.
   """
   @linear_graphql_input_schema %{
     "type" => "object",
@@ -57,6 +62,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
 
     with {:ok, query, variables} <- normalize_linear_graphql_arguments(arguments),
+         :ok <- validate_linear_graphql_query(query),
          {:ok, response} <- linear_client.(query, variables, []) do
       graphql_response(response)
     else
@@ -90,6 +96,19 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp normalize_linear_graphql_arguments(_arguments), do: {:error, :invalid_arguments}
 
+  defp validate_linear_graphql_query(query) when is_binary(query) do
+    cond do
+      invalid_project_slug_query?(query) ->
+        {:error, :invalid_project_slug_query}
+
+      repeated_unaliased_type_introspection?(query) ->
+        {:error, :unaliased_type_introspection_conflict}
+
+      true ->
+        :ok
+    end
+  end
+
   defp normalize_query(arguments) do
     case Map.get(arguments, "query") || Map.get(arguments, :query) do
       query when is_binary(query) ->
@@ -108,6 +127,19 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       variables when is_map(variables) -> {:ok, variables}
       _ -> {:error, :invalid_variables}
     end
+  end
+
+  defp invalid_project_slug_query?(query) when is_binary(query) do
+    Regex.match?(~r/project\s*(?:\([^)]*\))?\s*\{[^{}]*\bslug\b/s, query) or
+      Regex.match?(~r/project\s*:\s*\{[^{}]*\bslug\s*:/s, query)
+  end
+
+  defp repeated_unaliased_type_introspection?(query) when is_binary(query) do
+    query
+    |> String.replace(~r/[A-Za-z_][A-Za-z0-9_]*\s*:\s*__type\s*\(/, "")
+    |> then(&Regex.scan(~r/__type\s*\(/, &1))
+    |> length()
+    |> Kernel.>(1)
   end
 
   defp graphql_response(response) do
@@ -164,6 +196,22 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     %{
       "error" => %{
         "message" => "`linear_graphql.variables` must be a JSON object when provided."
+      }
+    }
+  end
+
+  defp tool_error_payload(:invalid_project_slug_query) do
+    %{
+      "error" => %{
+        "message" => "Linear Project does not expose `slug`. Use `slugId` for project reads and filters."
+      }
+    }
+  end
+
+  defp tool_error_payload(:unaliased_type_introspection_conflict) do
+    %{
+      "error" => %{
+        "message" => "Repeated `__type` introspection fields must use GraphQL aliases."
       }
     }
   end
