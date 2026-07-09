@@ -183,7 +183,9 @@ Parsed `WORKFLOW.md` payload:
 - `config` (map)
   - YAML front matter root object.
 - `prompt_template` (string)
-  - Markdown body after front matter, trimmed.
+  - The rendered worker prompt template. By default this is the Markdown body
+    after front matter, trimmed. Implementations MAY extract an explicit runtime
+    prompt section from that body when documented.
 
 #### 4.1.3 Service Config (Typed View)
 
@@ -317,11 +319,17 @@ Parsing rules:
 - If front matter is absent, treat the entire file as prompt body and use an empty config map.
 - YAML front matter MUST decode to a map/object; non-map YAML is an error.
 - Prompt body is trimmed before use.
+- Implementations MAY reserve an explicit Markdown marker, such as
+  `## Symphony Runtime Prompt`, to separate operator documentation from the
+  worker prompt template. When such a marker is used, the marker section through
+  the end of the file becomes `prompt_template`; the full body remains available
+  as workflow documentation.
 
 Returned workflow object:
 
 - `config`: front matter root object (not nested under a `config` key).
-- `prompt_template`: trimmed Markdown body.
+- `prompt_template`: trimmed Markdown body, or the documented runtime prompt
+  section when a marker is present.
 
 ### 5.3 Front Matter Schema
 
@@ -456,7 +464,10 @@ fields locally if they want stricter startup checks.
 
 ### 5.4 Prompt Template Contract
 
-The Markdown body of `WORKFLOW.md` is the per-issue prompt template.
+The Markdown body of `WORKFLOW.md` is the per-issue prompt template unless the
+implementation documents an explicit runtime prompt section marker. The Elixir
+implementation uses `## Symphony Runtime Prompt` as that marker; when present,
+only that section through EOF is rendered for the worker.
 
 Rendering requirements:
 

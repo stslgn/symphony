@@ -81,7 +81,9 @@ Optional flags:
 - `--port` also starts the Phoenix observability service (default: disabled)
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
-Codex session prompt.
+Codex session prompt. If the Markdown body contains `## Symphony Runtime Prompt`, Symphony renders
+that section through the end of the file as the worker prompt and leaves earlier Markdown available
+for operator documentation. Without that marker, the whole Markdown body is rendered as before.
 
 Minimal example:
 
@@ -123,6 +125,8 @@ Notes:
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
+- Use `## Symphony Runtime Prompt` when `WORKFLOW.md` also contains operator-only instructions, so
+  pickup/watch-loop guidance does not get sent to the worker as task instructions.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch

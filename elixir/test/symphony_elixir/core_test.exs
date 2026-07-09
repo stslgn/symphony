@@ -181,6 +181,40 @@ defmodule SymphonyElixir.CoreTest do
              Workflow.load(workflow_path)
   end
 
+  test "workflow load uses Symphony Runtime Prompt section as worker prompt template" do
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "RUNTIME_PROMPT_WORKFLOW.md")
+
+    File.write!(workflow_path, """
+    ---
+    tracker:
+      kind: linear
+    ---
+
+    # Operator workflow
+
+    Operator-only instructions:
+    - Start the Supervisor Watch Loop after runner pickup.
+
+    ## Symphony Runtime Prompt
+
+    You are working on `{{ issue.identifier }}`.
+
+    ## Worker Status Map
+
+    - `Todo` -> start work.
+    """)
+
+    assert {:ok, %{prompt: prompt, prompt_template: prompt_template}} = Workflow.load(workflow_path)
+
+    assert prompt =~ "Operator-only instructions"
+    assert prompt =~ "Supervisor Watch Loop"
+    assert prompt_template =~ "## Symphony Runtime Prompt"
+    assert prompt_template =~ "You are working on `{{ issue.identifier }}`."
+    assert prompt_template =~ "## Worker Status Map"
+    refute prompt_template =~ "Operator-only instructions"
+    refute prompt_template =~ "Supervisor Watch Loop"
+  end
+
   test "workflow load accepts unterminated front matter with an empty prompt" do
     workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "UNTERMINATED_WORKFLOW.md")
     File.write!(workflow_path, "---\ntracker:\n  kind: linear\n")
@@ -784,6 +818,35 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Ticket S-1 Refactor backend request path"
     assert prompt =~ "labels=backend"
     assert prompt =~ "attempt=3"
+  end
+
+  test "prompt builder renders only the runtime prompt section when present" do
+    workflow_prompt = """
+    # Operator workflow
+
+    Supervisor Watch Loop must observe runner pickup.
+
+    ## Symphony Runtime Prompt
+
+    Ticket {{ issue.identifier }} {{ issue.title }}
+    """
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    issue = %Issue{
+      identifier: "S-2",
+      title: "Post canary window",
+      description: "Worker should not inherit operator-only instructions",
+      state: "Agent Ready",
+      url: "https://example.org/issues/S-2",
+      labels: ["production-risk"]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt =~ "Ticket S-2 Post canary window"
+    assert prompt =~ "## Symphony Runtime Prompt"
+    refute prompt =~ "Supervisor Watch Loop"
   end
 
   test "prompt builder renders issue datetime fields without crashing" do

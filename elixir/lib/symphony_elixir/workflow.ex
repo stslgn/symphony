@@ -66,12 +66,13 @@ defmodule SymphonyElixir.Workflow do
     case front_matter_yaml_to_map(front_matter_lines) do
       {:ok, front_matter} ->
         prompt = Enum.join(prompt_lines, "\n") |> String.trim()
+        prompt_template = runtime_prompt_template(prompt)
 
         {:ok,
          %{
            config: front_matter,
            prompt: prompt,
-           prompt_template: prompt
+           prompt_template: prompt_template
          }}
 
       {:error, :workflow_front_matter_not_a_map} ->
@@ -110,6 +111,18 @@ defmodule SymphonyElixir.Workflow do
         {:ok, _} -> {:error, :workflow_front_matter_not_a_map}
         {:error, reason} -> {:error, reason}
       end
+    end
+  end
+
+  defp runtime_prompt_template(prompt) when is_binary(prompt) do
+    case :binary.match(prompt, "## Symphony Runtime Prompt") do
+      {start, _length} ->
+        prompt
+        |> binary_part(start, byte_size(prompt) - start)
+        |> String.trim()
+
+      :nomatch ->
+        prompt
     end
   end
 
