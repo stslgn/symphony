@@ -1467,6 +1467,19 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert humanized =~ "invalid_markup"
   end
 
+  test "status dashboard humanizes app-server runtime errors" do
+    message = %{
+      event: :app_server_error,
+      message: %{
+        reason: {:app_server_error, "conversation unavailable"}
+      }
+    }
+
+    humanized = StatusDashboard.humanize_codex_message(message)
+    assert humanized =~ "codex app-server error"
+    assert humanized =~ "conversation unavailable"
+  end
+
   test "status dashboard uses shell command line as exec command status text" do
     message = %{
       event: :notification,

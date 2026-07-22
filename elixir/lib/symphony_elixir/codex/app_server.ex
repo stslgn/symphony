@@ -456,6 +456,24 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         {:error, {:turn_cancelled, Map.get(payload, "params")}}
 
+      %{"method" => "error"} = payload ->
+        reason = app_server_error_reason(payload)
+
+        Logger.warning("Codex app-server error: reason=#{inspect(reason)} payload=#{truncate_protocol_payload(payload_string)}")
+
+        emit_message(
+          on_message,
+          :app_server_error,
+          %{
+            payload: payload,
+            raw: payload_string,
+            reason: reason
+          },
+          metadata_from_message(port, payload)
+        )
+
+        {:error, reason}
+
       %{"method" => method} = payload
       when is_binary(method) ->
         handle_turn_method(
@@ -581,6 +599,26 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp terminal_protocol_error_reason(_payload), do: :error
 
+  defp app_server_error_reason(payload) when is_map(payload) do
+    error_payload =
+      Map.get(payload, "params") ||
+        Map.get(payload, "error") ||
+        payload
+
+    case first_error_message(error_payload) do
+      nil -> {:app_server_error, compact_protocol_payload(error_payload)}
+      message -> {:app_server_error, message}
+    end
+  end
+
+  defp first_error_message(payload) do
+    payload
+    |> collect_error_strings()
+    |> Enum.map(&String.trim/1)
+    |> Enum.find(&(&1 != ""))
+    |> truncate_protocol_reason()
+  end
+
   defp collect_error_strings(payload) when is_map(payload) do
     Enum.flat_map(payload, fn {key, value} ->
       key_string = to_string(key)
@@ -599,6 +637,31 @@ defmodule SymphonyElixir.Codex.AppServer do
     message
     |> String.downcase()
     |> String.contains?("invalid markup")
+  end
+
+  defp truncate_protocol_reason(nil), do: nil
+
+  defp truncate_protocol_reason(message) when is_binary(message) do
+    trimmed = String.trim(message)
+
+    if String.length(trimmed) > @max_stream_log_bytes do
+      String.slice(trimmed, 0, @max_stream_log_bytes) <> "...<truncated>"
+    else
+      trimmed
+    end
+  end
+
+  defp compact_protocol_payload(payload) do
+    payload
+    |> inspect(limit: 20, printable_limit: @max_stream_log_bytes)
+    |> truncate_protocol_reason()
+  end
+
+  defp truncate_protocol_payload(payload_string) do
+    payload_string
+    |> to_string()
+    |> String.trim()
+    |> truncate_protocol_reason()
   end
 
   defp maybe_handle_approval_request(
