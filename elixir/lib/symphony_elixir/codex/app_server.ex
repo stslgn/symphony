@@ -810,6 +810,28 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_handle_approval_request(
+         port,
+         "mcpServer/elicitation/request",
+         %{"id" => id, "params" => params} = payload,
+         payload_string,
+         on_message,
+         metadata,
+         _tool_executor,
+         auto_approve_requests
+       ) do
+    maybe_auto_answer_mcp_server_elicitation(
+      port,
+      id,
+      params,
+      payload,
+      payload_string,
+      on_message,
+      metadata,
+      auto_approve_requests
+    )
+  end
+
+  defp maybe_handle_approval_request(
          _port,
          _method,
          _payload,
@@ -893,6 +915,48 @@ defmodule SymphonyElixir.Codex.AppServer do
          false
        ) do
     :approval_required
+  end
+
+  defp maybe_auto_answer_mcp_server_elicitation(
+         port,
+         id,
+         params,
+         payload,
+         payload_string,
+         on_message,
+         metadata,
+         true
+       ) do
+    {action, result} =
+      if get_in(params, ["_meta", "codex_approval_kind"]) == "mcp_tool_call" do
+        {"accept", %{"action" => "accept", "content" => %{}}}
+      else
+        {"decline", %{"action" => "decline"}}
+      end
+
+    send_message(port, %{"id" => id, "result" => result})
+
+    emit_message(
+      on_message,
+      :mcp_elicitation_auto_answered,
+      %{payload: payload, raw: payload_string, action: action},
+      metadata
+    )
+
+    :approved
+  end
+
+  defp maybe_auto_answer_mcp_server_elicitation(
+         _port,
+         _id,
+         _params,
+         _payload,
+         _payload_string,
+         _on_message,
+         _metadata,
+         false
+       ) do
+    :input_required
   end
 
   defp maybe_auto_answer_tool_request_user_input(

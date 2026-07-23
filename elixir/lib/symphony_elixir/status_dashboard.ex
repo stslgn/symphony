@@ -1136,6 +1136,16 @@ defmodule SymphonyElixir.StatusDashboard do
     if is_binary(answer), do: "#{base}: #{inline_text(answer)}", else: base
   end
 
+  defp humanize_codex_event(:mcp_elicitation_auto_answered, message, _payload) do
+    action = map_value(message, ["action", :action])
+
+    if is_binary(action) do
+      "MCP server elicitation auto-answered: #{action}"
+    else
+      "MCP server elicitation auto-answered"
+    end
+  end
+
   defp humanize_codex_event(:tool_call_completed, _message, payload),
     do: humanize_dynamic_tool_event("dynamic tool call completed", payload)
 
