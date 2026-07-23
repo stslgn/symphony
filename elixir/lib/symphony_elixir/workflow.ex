@@ -115,13 +115,14 @@ defmodule SymphonyElixir.Workflow do
   end
 
   defp runtime_prompt_template(prompt) when is_binary(prompt) do
-    case :binary.match(prompt, "## Symphony Runtime Prompt") do
-      {start, _length} ->
-        prompt
-        |> binary_part(start, byte_size(prompt) - start)
-        |> String.trim()
+    case Regex.run(~r/(?:^|\R)(## Symphony Runtime Prompt[^\S\r\n]*(?:\R|$).*)/s, prompt,
+           capture: :all_but_first,
+           return: :index
+         ) do
+      [{start, length}] ->
+        prompt |> binary_part(start, length) |> String.trim()
 
-      :nomatch ->
+      nil ->
         prompt
     end
   end

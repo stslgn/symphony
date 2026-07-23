@@ -194,6 +194,7 @@ defmodule SymphonyElixir.CoreTest do
 
     Operator-only instructions:
     - Start the Supervisor Watch Loop after runner pickup.
+    - Mention `## Symphony Runtime Prompt` inline before the real worker section.
 
     ## Symphony Runtime Prompt
 
@@ -212,6 +213,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt_template =~ "You are working on `{{ issue.identifier }}`."
     assert prompt_template =~ "## Worker Status Map"
     refute prompt_template =~ "Operator-only instructions"
+    refute prompt_template =~ "inline before the real worker section"
     refute prompt_template =~ "Supervisor Watch Loop"
   end
 
@@ -824,6 +826,8 @@ defmodule SymphonyElixir.CoreTest do
     workflow_prompt = """
     # Operator workflow
 
+    The operator mentions `## Symphony Runtime Prompt` inline.
+
     Supervisor Watch Loop must observe runner pickup.
 
     ## Symphony Runtime Prompt
@@ -847,6 +851,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Ticket S-2 Post canary window"
     assert prompt =~ "## Symphony Runtime Prompt"
     refute prompt =~ "Supervisor Watch Loop"
+    refute prompt =~ "operator mentions"
   end
 
   test "prompt builder renders issue datetime fields without crashing" do
