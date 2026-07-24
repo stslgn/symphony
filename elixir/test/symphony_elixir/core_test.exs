@@ -217,6 +217,37 @@ defmodule SymphonyElixir.CoreTest do
     refute prompt_template =~ "Supervisor Watch Loop"
   end
 
+  test "workflow load uses the last Symphony Runtime Prompt section when duplicate headings exist" do
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "DUPLICATE_RUNTIME_PROMPT_WORKFLOW.md")
+
+    File.write!(workflow_path, """
+    ---
+    tracker:
+      kind: linear
+    ---
+
+    ## Symphony Runtime Prompt
+
+    Stale worker prompt from an earlier append.
+
+    # Operator workflow
+
+    Runtime assembly source is `## Symphony Runtime Prompt` plus the exact Linear issue.
+
+    ## Symphony Runtime Prompt
+
+    You are the worker for `{{ issue.identifier }}`.
+    Start from the exact Linear issue only.
+    """)
+
+    assert {:ok, %{prompt_template: prompt_template}} = Workflow.load(workflow_path)
+
+    assert prompt_template =~ "You are the worker for `{{ issue.identifier }}`."
+    assert prompt_template =~ "Start from the exact Linear issue only."
+    refute prompt_template =~ "Stale worker prompt"
+    refute prompt_template =~ "Operator workflow"
+  end
+
   test "workflow load accepts unterminated front matter with an empty prompt" do
     workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "UNTERMINATED_WORKFLOW.md")
     File.write!(workflow_path, "---\ntracker:\n  kind: linear\n")

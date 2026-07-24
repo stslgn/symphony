@@ -163,6 +163,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     </td>
                     <td>
                       <div class="session-stack">
+                        <%= if entry.session_title do %>
+                          <span class="muted"><%= entry.session_title %></span>
+                        <% end %>
+
                         <%= if entry.session_id do %>
                           <button
                             type="button"

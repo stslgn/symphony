@@ -1096,11 +1096,17 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp humanize_codex_event(:session_started, _message, payload) do
     session_id = map_value(payload, ["session_id", :session_id])
+    session_title = map_value(payload, ["session_title", :session_title])
 
-    if is_binary(session_id) do
-      "session started (#{session_id})"
-    else
-      "session started"
+    cond do
+      is_binary(session_title) and is_binary(session_id) ->
+        "session started (#{session_title}; #{session_id})"
+
+      is_binary(session_id) ->
+        "session started (#{session_id})"
+
+      true ->
+        "session started"
     end
   end
 
@@ -1182,6 +1188,10 @@ defmodule SymphonyElixir.StatusDashboard do
 
       _ ->
         cond do
+          is_binary(map_value(payload, ["session_title", :session_title])) and
+              is_binary(map_value(payload, ["session_id", :session_id])) ->
+            "session started (#{map_value(payload, ["session_title", :session_title])}; #{map_value(payload, ["session_id", :session_id])})"
+
           is_binary(map_value(payload, ["session_id", :session_id])) ->
             "session started (#{map_value(payload, ["session_id", :session_id])})"
 

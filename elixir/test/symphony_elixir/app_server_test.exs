@@ -143,6 +143,8 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
+      expected_session_title = "Symphony - MT-1001 - Validate explicit turn sandbox policy passthrough"
+
       policy_cases = [
         %{"type" => "dangerFullAccess"},
         %{"type" => "externalSandbox", "profile" => "remote-ci"},
@@ -170,7 +172,22 @@ defmodule SymphonyElixir.AppServerTest do
                    |> String.trim_leading("JSON:")
                    |> Jason.decode!()
                    |> then(fn payload ->
+                     payload["method"] == "thread/start" &&
+                       get_in(payload, ["params", "title"]) == expected_session_title
+                   end)
+                 else
+                   false
+                 end
+               end)
+
+        assert Enum.any?(lines, fn line ->
+                 if String.starts_with?(line, "JSON:") do
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+                   |> then(fn payload ->
                      payload["method"] == "turn/start" &&
+                       get_in(payload, ["params", "title"]) == expected_session_title &&
                        get_in(payload, ["params", "sandboxPolicy"]) == configured_policy
                    end)
                  else

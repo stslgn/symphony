@@ -115,16 +115,30 @@ defmodule SymphonyElixir.Workflow do
   end
 
   defp runtime_prompt_template(prompt) when is_binary(prompt) do
-    case Regex.run(~r/(?:^|\R)(## Symphony Runtime Prompt[^\S\r\n]*(?:\R|$).*)/s, prompt,
-           capture: :all_but_first,
-           return: :index
-         ) do
-      [{start, length}] ->
-        prompt |> binary_part(start, length) |> String.trim()
+    lines = String.split(prompt, ~r/\R/, trim: false)
 
+    case last_runtime_prompt_heading_index(lines) do
       nil ->
         prompt
+
+      index ->
+        lines
+        |> Enum.drop(index)
+        |> Enum.join("\n")
+        |> String.trim()
     end
+  end
+
+  defp last_runtime_prompt_heading_index(lines) when is_list(lines) do
+    lines
+    |> Enum.with_index()
+    |> Enum.reduce(nil, fn {line, index}, last_index ->
+      if String.trim(line) == "## Symphony Runtime Prompt" do
+        index
+      else
+        last_index
+      end
+    end)
   end
 
   defp maybe_reload_store do

@@ -21,13 +21,14 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
+          session_title: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil
         }
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
-    with {:ok, session} <- start_session(workspace, opts) do
+    with {:ok, session} <- start_session(workspace, Keyword.put_new(opts, :session_title, session_title(issue))) do
       try do
         run_turn(session, prompt, issue, opts)
       after
@@ -36,16 +37,40 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  @spec session_title(map()) :: String.t()
+  def session_title(issue) when is_map(issue) do
+    identifier =
+      issue
+      |> issue_field(:identifier)
+      |> normalize_title_part()
+      |> case do
+        "" -> "unknown"
+        value -> value
+      end
+
+    title =
+      issue
+      |> issue_field(:title)
+      |> normalize_title_part()
+      |> truncate_title_part(90)
+
+    case title do
+      "" -> "Symphony - #{identifier}"
+      value -> "Symphony - #{identifier} - #{value}"
+    end
+  end
+
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    session_title = opts |> Keyword.get(:session_title, "Symphony worker") |> normalize_session_title()
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
-      metadata = port_metadata(port, worker_host)
+      metadata = port |> port_metadata(worker_host) |> Map.put(:session_title, session_title)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies, session_title) do
         {:ok,
          %{
            port: port,
@@ -55,6 +80,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
+           session_title: session_title,
            workspace: expanded_workspace,
            worker_host: worker_host
          }}
@@ -75,6 +101,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_requests: auto_approve_requests,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
+          session_title: session_title,
           workspace: workspace
         },
         prompt,
@@ -88,10 +115,10 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, session_title) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
-        Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
+        Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id} session_title=#{inspect(session_title)}")
 
         emit_message(
           on_message,
@@ -99,7 +126,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           %{
             session_id: session_id,
             thread_id: thread_id,
-            turn_id: turn_id
+            turn_id: turn_id,
+            session_title: session_title
           },
           metadata
         )
@@ -113,7 +141,8 @@ defmodule SymphonyElixir.Codex.AppServer do
                result: result,
                session_id: session_id,
                thread_id: thread_id,
-               turn_id: turn_id
+               turn_id: turn_id,
+               session_title: session_title
              }}
 
           {:error, reason} ->
@@ -270,14 +299,14 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies) do
+  defp do_start_session(port, workspace, session_policies, session_title) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies)
+      :ok -> start_thread(port, workspace, session_policies, session_title)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
+  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}, session_title) do
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
@@ -285,6 +314,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
         "cwd" => workspace,
+        "title" => session_title,
         "dynamicTools" => DynamicTool.tool_specs()
       }
     })
@@ -301,7 +331,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+  defp start_turn(port, thread_id, prompt, _issue, workspace, approval_policy, turn_sandbox_policy, session_title) do
     send_message(port, %{
       "method" => "turn/start",
       "id" => @turn_start_id,
@@ -314,7 +344,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           }
         ],
         "cwd" => workspace,
-        "title" => "#{issue.identifier}: #{issue.title}",
+        "title" => session_title,
         "approvalPolicy" => approval_policy,
         "sandboxPolicy" => turn_sandbox_policy
       }
@@ -1193,6 +1223,36 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp issue_context(%{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
+  end
+
+  defp normalize_session_title(title) do
+    case normalize_title_part(title) do
+      "" -> "Symphony worker"
+      value -> truncate_title_part(value, 120)
+    end
+  end
+
+  defp issue_field(issue, key) when is_map(issue) and is_atom(key) do
+    Map.get(issue, key) || Map.get(issue, Atom.to_string(key))
+  end
+
+  defp normalize_title_part(value) when is_binary(value) do
+    value
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+  end
+
+  defp normalize_title_part(nil), do: ""
+  defp normalize_title_part(value) when is_atom(value), do: value |> Atom.to_string() |> normalize_title_part()
+  defp normalize_title_part(value) when is_number(value), do: value |> to_string() |> normalize_title_part()
+  defp normalize_title_part(_value), do: ""
+
+  defp truncate_title_part(value, max_length) when is_binary(value) and is_integer(max_length) do
+    if String.length(value) > max_length do
+      String.slice(value, 0, max_length - 1) <> "..."
+    else
+      value
+    end
   end
 
   defp stop_port(port) when is_port(port) do
