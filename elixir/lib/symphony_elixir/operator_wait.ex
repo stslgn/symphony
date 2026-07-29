@@ -9,7 +9,8 @@ defmodule SymphonyElixir.OperatorWait do
     "waiting_live_approval" => ["approve", "reject"],
     "waiting_infrastructure" => ["retry", "reject"],
     "review_cap_reached" => ["approve", "reject"],
-    "auth_reconnect_required" => ["retry", "reject"]
+    "auth_reconnect_required" => ["retry", "reject"],
+    "run_budget_exhausted" => ["retry", "reject"]
   }
 
   @spec reasons() :: [String.t()]
@@ -55,6 +56,7 @@ defmodule SymphonyElixir.OperatorWait do
          attempt: Map.get(attrs, :attempt, 0),
          stage: Map.get(attrs, :stage, "parked"),
          tracker_state: Map.get(attrs, :tracker_state),
+         terminal_reason: Map.get(attrs, :terminal_reason),
          parked_at: Map.get(attrs, :parked_at) || DateTime.utc_now()
        }}
     else
@@ -74,6 +76,7 @@ defmodule SymphonyElixir.OperatorWait do
       attempt: event["attempt"],
       stage: event["stage"],
       tracker_state: event["tracker_state"],
+      terminal_reason: event["terminal_reason"],
       parked_at: parse_timestamp(event["occurred_at"])
     })
   end

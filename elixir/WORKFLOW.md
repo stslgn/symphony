@@ -28,6 +28,8 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_run_tokens: 250000
+  max_run_seconds: 7200
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never

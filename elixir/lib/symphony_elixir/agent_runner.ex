@@ -131,7 +131,14 @@ defmodule SymphonyElixir.AgentRunner do
           )
 
         {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; parking for operator action")
+
+          send_worker_budget_exhausted(
+            codex_update_recipient,
+            refreshed_issue,
+            opts,
+            max_turns
+          )
 
           :ok
 
@@ -143,6 +150,23 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
   end
+
+  defp send_worker_budget_exhausted(recipient, issue, opts, max_turns)
+       when is_pid(recipient) do
+    send(
+      recipient,
+      {:worker_budget_exhausted, issue.id,
+       %{
+         run_id: Keyword.get(opts, :run_id),
+         terminal_reason: "turn_budget_exhausted",
+         limit: max_turns
+       }}
+    )
+
+    :ok
+  end
+
+  defp send_worker_budget_exhausted(_recipient, _issue, _opts, _max_turns), do: :ok
 
   defp build_turn_prompt(issue, opts, 1, _max_turns) do
     [AppServer.session_title(issue), "\n\n", PromptBuilder.build_prompt(issue, opts)]

@@ -126,7 +126,8 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
         total_tokens: entry.codex_total_tokens
-      }
+      },
+      budget: Map.get(entry, :budget)
     }
   end
 
@@ -153,6 +154,7 @@ defmodule SymphonyElixirWeb.Presenter do
       run_id: entry.run_id,
       attempt: entry.attempt,
       stage: entry.stage,
+      terminal_reason: Map.get(entry, :terminal_reason),
       parked_at: iso8601(entry.parked_at)
     }
   end
@@ -173,7 +175,8 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: running.codex_input_tokens,
         output_tokens: running.codex_output_tokens,
         total_tokens: running.codex_total_tokens
-      }
+      },
+      budget: Map.get(running, :budget)
     }
   end
 
@@ -196,6 +199,7 @@ defmodule SymphonyElixirWeb.Presenter do
       run_id: parked.run_id,
       attempt: parked.attempt,
       stage: parked.stage,
+      terminal_reason: Map.get(parked, :terminal_reason),
       parked_at: iso8601(parked.parked_at)
     }
   end

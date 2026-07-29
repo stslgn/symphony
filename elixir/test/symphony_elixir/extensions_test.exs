@@ -362,7 +362,17 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
-                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
+                 "budget" => %{
+                   "turns" => %{"limit" => 20, "used" => 7, "remaining" => 13},
+                   "tokens" => %{
+                     "limit" => 250_000,
+                     "used" => 12,
+                     "remaining" => 249_988,
+                     "telemetry_observed" => true
+                   },
+                   "time" => %{"limit" => 7_200, "used" => 42, "remaining" => 7_158}
+                 }
                }
              ],
              "retrying" => [
@@ -387,6 +397,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "run_id" => "run-http",
                  "attempt" => 1,
                  "stage" => "parked",
+                 "terminal_reason" => "turn_budget_exhausted",
                  "parked_at" => state_payload["parked"] |> List.first() |> Map.fetch!("parked_at")
                }
              ],
@@ -422,7 +433,17 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event" => "notification",
                "last_message" => "rendered",
                "last_event_at" => nil,
-               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
+               "budget" => %{
+                 "turns" => %{"limit" => 20, "used" => 7, "remaining" => 13},
+                 "tokens" => %{
+                   "limit" => 250_000,
+                   "used" => 12,
+                   "remaining" => 249_988,
+                   "telemetry_observed" => true
+                 },
+                 "time" => %{"limit" => 7_200, "used" => 42, "remaining" => 7_158}
+               }
              },
              "retry" => nil,
              "parked" => nil,
@@ -733,6 +754,16 @@ defmodule SymphonyElixir.ExtensionsTest do
           codex_input_tokens: 4,
           codex_output_tokens: 8,
           codex_total_tokens: 12,
+          budget: %{
+            turns: %{limit: 20, used: 7, remaining: 13},
+            tokens: %{
+              limit: 250_000,
+              used: 12,
+              remaining: 249_988,
+              telemetry_observed: true
+            },
+            time: %{limit: 7_200, used: 42, remaining: 7_158}
+          },
           started_at: DateTime.utc_now()
         }
       ],
@@ -756,6 +787,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           run_id: "run-http",
           attempt: 1,
           stage: "parked",
+          terminal_reason: "turn_budget_exhausted",
           parked_at: DateTime.utc_now()
         }
       ],

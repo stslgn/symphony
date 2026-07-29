@@ -22,6 +22,8 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.agent.max_run_tokens == nil
+    assert config.agent.max_run_seconds == nil
     assert config.codex.dynamic_tool_allowlist == []
     assert config.codex.mcp_tool_auto_approve_allowlist == []
     assert config.codex.mcp_elicitation_auto_approve_allowlist == []
@@ -44,6 +46,22 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      max_run_tokens: 250_000,
+      max_run_seconds: 7_200
+    )
+
+    assert Config.settings!().agent.max_run_tokens == 250_000
+    assert Config.settings!().agent.max_run_seconds == 7_200
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_run_tokens: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_run_tokens"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_run_seconds: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_run_seconds"
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -560,6 +578,137 @@ defmodule SymphonyElixir.CoreTest do
     assert Enum.count(events, &(&1["transition"] == "run_parked")) == 1
     assert Enum.count(events, &(&1["transition"] == "wait_rejected")) == 1
     assert Enum.count(events, &(&1["transition"] == "wait_resumed")) == 1
+  end
+
+  test "observed token budget exhaustion parks the run without scheduling retry" do
+    issue_id = "issue-token-budget"
+
+    ledger_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-token-budget-#{RunLedger.new_id("test")}/events.jsonl"
+      )
+
+    agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    running_entry = %{
+      pid: agent_pid,
+      ref: nil,
+      run_id: "run-token-budget",
+      retry_attempt: 1,
+      identifier: "MT-TOKENS",
+      issue: %Issue{id: issue_id, identifier: "MT-TOKENS", state: "In Progress"},
+      started_at: DateTime.utc_now(),
+      session_id: nil,
+      session_title: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_token_telemetry_observed: false,
+      turn_count: 0,
+      run_budget: %{max_turns: 20, max_tokens: 100, max_seconds: nil},
+      run_budget_timer_ref: nil
+    }
+
+    state = %Orchestrator.State{
+      run_ledger_path: ledger_path,
+      runner_generation: "runner-token-budget",
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    update = %{
+      event: :notification,
+      timestamp: DateTime.utc_now(),
+      run_id: "run-token-budget",
+      payload: %{
+        "method" => "turn/completed",
+        "usage" => %{
+          "input_tokens" => 80,
+          "output_tokens" => 20,
+          "total_tokens" => 100
+        }
+      }
+    }
+
+    assert {:noreply, parked_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update},
+               state
+             )
+
+    refute Map.has_key?(parked_state.running, issue_id)
+    refute Map.has_key?(parked_state.retry_attempts, issue_id)
+    refute MapSet.member?(parked_state.claimed, issue_id)
+    refute Process.alive?(agent_pid)
+
+    assert %{
+             reason: "run_budget_exhausted",
+             terminal_reason: "token_budget_exhausted",
+             allowed_actions: ["retry", "reject"]
+           } = parked_state.parked[issue_id]
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+
+    assert Enum.any?(events, fn event ->
+             event["transition"] == "run_parked" and
+               event["terminal_reason"] == "token_budget_exhausted"
+           end)
+  end
+
+  test "turn and time budget signals park only the matching active run" do
+    Enum.each(
+      [
+        {"turn_budget_exhausted",
+         fn issue_id, run_id ->
+           {:worker_budget_exhausted, issue_id, %{run_id: run_id, terminal_reason: "turn_budget_exhausted"}}
+         end},
+        {"time_budget_exhausted", fn issue_id, run_id -> {:run_budget_timeout, issue_id, run_id} end}
+      ],
+      fn {terminal_reason, message_builder} ->
+        issue_id = "issue-#{terminal_reason}"
+        run_id = "run-#{terminal_reason}"
+        agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+        state = %Orchestrator.State{
+          running: %{
+            issue_id => %{
+              pid: agent_pid,
+              ref: nil,
+              run_id: run_id,
+              retry_attempt: 1,
+              identifier: "MT-BUDGET",
+              issue: %Issue{id: issue_id, identifier: "MT-BUDGET", state: "In Progress"},
+              started_at: DateTime.utc_now(),
+              run_budget_timer_ref: nil
+            }
+          },
+          claimed: MapSet.new([issue_id]),
+          codex_totals: %{
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            seconds_running: 0
+          }
+        }
+
+        assert {:noreply, parked_state} =
+                 Orchestrator.handle_info(message_builder.(issue_id, run_id), state)
+
+        assert parked_state.parked[issue_id].terminal_reason == terminal_reason
+        assert parked_state.parked[issue_id].reason == "run_budget_exhausted"
+        refute Map.has_key?(parked_state.retry_attempts, issue_id)
+        refute Process.alive?(agent_pid)
+      end
+    )
   end
 
   test "terminal issue state stops running agent and cleans workspace" do
@@ -1788,7 +1937,18 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert :ok =
+               AgentRunner.run(issue, self(),
+                 issue_state_fetcher: state_fetcher,
+                 run_id: "run-max-turns"
+               )
+
+      assert_receive {:worker_budget_exhausted, "issue-max-turns",
+                      %{
+                        run_id: "run-max-turns",
+                        terminal_reason: "turn_budget_exhausted",
+                        limit: 2
+                      }}
 
       trace = File.read!(trace_file)
       assert length(String.split(trace, "RUN", trim: true)) == 1

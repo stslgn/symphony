@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Orchestrator do
     AgentRunner,
     Config,
     OperatorWait,
+    RunBudget,
     RunLedger,
     StatusDashboard,
     Tracker,
@@ -233,9 +234,11 @@ defmodule SymphonyElixir.Orchestrator do
             state
             |> apply_codex_token_delta(token_delta)
             |> apply_codex_rate_limits(update)
+            |> Map.put(:running, Map.put(running, issue_id, updated_running_entry))
+            |> maybe_park_exhausted_run(issue_id)
 
           notify_dashboard()
-          {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+          {:noreply, state}
         else
           Logger.warning("Ignoring stale Codex worker update issue_id=#{issue_id} run_id=#{inspect(update[:run_id])}")
           {:noreply, state}
@@ -244,6 +247,33 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
+
+  def handle_info(
+        {:worker_budget_exhausted, issue_id, %{run_id: run_id, terminal_reason: "turn_budget_exhausted"}},
+        state
+      )
+      when is_binary(issue_id) do
+    state =
+      case Map.get(state.running, issue_id) do
+        %{run_id: ^run_id} -> park_budget_exhausted(state, issue_id, "turn_budget_exhausted")
+        _other -> state
+      end
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:run_budget_timeout, issue_id, run_id}, state)
+      when is_binary(issue_id) and is_binary(run_id) do
+    state =
+      case Map.get(state.running, issue_id) do
+        %{run_id: ^run_id} -> park_budget_exhausted(state, issue_id, "time_budget_exhausted")
+        _other -> state
+      end
+
+    notify_dashboard()
+    {:noreply, state}
+  end
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
@@ -490,7 +520,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp park_running_issue(%State{} = state, %Issue{} = issue, reason) do
+  defp park_running_issue(%State{} = state, %Issue{} = issue, reason, opts \\ []) do
     case Map.get(state.running, issue.id) do
       nil ->
         state
@@ -502,7 +532,8 @@ defmodule SymphonyElixir.Orchestrator do
                  identifier: issue.identifier,
                  run_id: Map.get(running_entry, :run_id),
                  attempt: Map.get(running_entry, :retry_attempt, 0),
-                 tracker_state: issue.state
+                 tracker_state: issue.state,
+                 terminal_reason: Keyword.get(opts, :terminal_reason)
                }),
              :ok <- append_run_event(state, operator_wait_event(wait, "run_parked")) do
           Logger.info("Issue parked for operator action: #{issue_context(issue)} reason=#{reason} wait_id=#{wait.wait_id}")
@@ -522,6 +553,42 @@ defmodule SymphonyElixir.Orchestrator do
             Logger.error("Failed to durably park issue_id=#{issue.id} reason=#{reason}: #{inspect(error)}")
             state
         end
+    end
+  end
+
+  defp maybe_park_exhausted_run(%State{} = state, issue_id) do
+    case Map.get(state.running, issue_id) do
+      nil ->
+        state
+
+      running_entry ->
+        reason =
+          RunBudget.exhausted_reason(
+            Map.get(running_entry, :run_budget, disabled_run_budget()),
+            run_budget_metrics(running_entry, DateTime.utc_now())
+          )
+
+        if reason do
+          park_budget_exhausted(state, issue_id, reason)
+        else
+          state
+        end
+    end
+  end
+
+  defp park_budget_exhausted(%State{} = state, issue_id, terminal_reason) do
+    case Map.get(state.running, issue_id) do
+      %{issue: %Issue{} = issue} ->
+        if RunBudget.valid_terminal_reason?(terminal_reason) do
+          Logger.warning("Run budget exhausted: #{issue_context(issue)} terminal_reason=#{terminal_reason}")
+
+          park_running_issue(state, issue, "run_budget_exhausted", terminal_reason: terminal_reason)
+        else
+          state
+        end
+
+      _other ->
+        state
     end
   end
 
@@ -548,9 +615,36 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp stop_running_entry(running_entry) do
+    cancel_run_budget_timer(running_entry)
     if is_pid(running_entry[:pid]), do: terminate_task(running_entry.pid)
     if is_reference(running_entry[:ref]), do: Process.demonitor(running_entry.ref, [:flush])
     :ok
+  end
+
+  defp cancel_run_budget_timer(running_entry) when is_map(running_entry) do
+    case Map.get(running_entry, :run_budget_timer_ref) do
+      ref when is_reference(ref) -> Process.cancel_timer(ref)
+      _other -> false
+    end
+  end
+
+  defp cancel_run_budget_timer(_running_entry), do: false
+
+  defp arm_run_budget_timer(running_entry) do
+    case get_in(running_entry, [:run_budget, :max_seconds]) do
+      seconds when is_integer(seconds) and seconds > 0 ->
+        timer_ref =
+          Process.send_after(
+            self(),
+            {:run_budget_timeout, running_entry.issue.id, running_entry.run_id},
+            seconds * 1_000
+          )
+
+        Map.put(running_entry, :run_budget_timer_ref, timer_ref)
+
+      _other ->
+        running_entry
+    end
   end
 
   defp terminate_running_issue(
@@ -572,13 +666,7 @@ defmodule SymphonyElixir.Orchestrator do
           cleanup_issue_workspace(identifier, worker_host)
         end
 
-        if is_pid(pid) do
-          terminate_task(pid)
-        end
-
-        if is_reference(ref) do
-          Process.demonitor(ref, [:flush])
-        end
+        stop_running_entry(%{running_entry | pid: pid, ref: ref})
 
         %{
           state
@@ -880,13 +968,16 @@ defmodule SymphonyElixir.Orchestrator do
          run_id,
          normalized_attempt
        ) do
+    run_budget = RunBudget.from_agent_config(Config.settings!().agent)
+
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            AgentRunner.run(issue, recipient,
              attempt: attempt,
              worker_host: worker_host,
              run_id: run_id,
              runner_generation: state.runner_generation,
-             stage: "running"
+             stage: "running",
+             max_turns: run_budget.max_turns
            )
          end) do
       {:ok, pid} ->
@@ -914,7 +1005,10 @@ defmodule SymphonyElixir.Orchestrator do
           codex_last_reported_input_tokens: 0,
           codex_last_reported_output_tokens: 0,
           codex_last_reported_total_tokens: 0,
+          codex_token_telemetry_observed: false,
           turn_count: 0,
+          run_budget: run_budget,
+          run_budget_timer_ref: nil,
           retry_attempt: normalized_attempt,
           started_at: DateTime.utc_now()
         }
@@ -924,6 +1018,7 @@ defmodule SymphonyElixir.Orchestrator do
                run_event(running_entry, "run_started", "running")
              ) do
           :ok ->
+            running_entry = arm_run_budget_timer(running_entry)
             running = Map.put(state.running, issue.id, running_entry)
 
             %{
@@ -1427,6 +1522,7 @@ defmodule SymphonyElixir.Orchestrator do
           codex_output_tokens: metadata.codex_output_tokens,
           codex_total_tokens: metadata.codex_total_tokens,
           turn_count: Map.get(metadata, :turn_count, 0),
+          budget: run_budget_snapshot(metadata, now),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
@@ -1464,6 +1560,7 @@ defmodule SymphonyElixir.Orchestrator do
           reason: wait.reason,
           allowed_actions: wait.allowed_actions,
           tracker_state: wait.tracker_state,
+          terminal_reason: Map.get(wait, :terminal_reason),
           parked_at: wait.parked_at
         }
       end)
@@ -1535,6 +1632,9 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+        codex_token_telemetry_observed:
+          Map.get(running_entry, :codex_token_telemetry_observed, false) or
+            token_delta.telemetry_observed,
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
       token_delta
@@ -1618,7 +1718,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp pop_running_entry(state, issue_id) do
-    {Map.get(state.running, issue_id), %{state | running: Map.delete(state.running, issue_id)}}
+    running_entry = Map.get(state.running, issue_id)
+    cancel_run_budget_timer(running_entry)
+    {running_entry, %{state | running: Map.delete(state.running, issue_id)}}
   end
 
   defp record_run_event(%State{} = state, running_entry, transition, stage, extra \\ [])
@@ -1670,7 +1772,8 @@ defmodule SymphonyElixir.Orchestrator do
       wait_id: wait.wait_id,
       parked_reason: wait.reason,
       allowed_actions: wait.allowed_actions,
-      tracker_state: wait.tracker_state
+      tracker_state: wait.tracker_state,
+      terminal_reason: Map.get(wait, :terminal_reason)
     }
   end
 
@@ -1798,6 +1901,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp extract_token_delta(running_entry, %{event: _, timestamp: _} = update) do
     usage = extract_token_usage(update)
 
+    telemetry_observed =
+      Enum.any?([:input, :output, :total], fn token_key ->
+        is_integer(get_token_usage(usage, token_key))
+      end)
+
     {
       compute_token_delta(
         running_entry,
@@ -1826,7 +1934,8 @@ defmodule SymphonyElixir.Orchestrator do
         total_tokens: total.delta,
         input_reported: input.reported,
         output_reported: output.reported,
-        total_reported: total.reported
+        total_reported: total.reported,
+        telemetry_observed: telemetry_observed
       }
     end)
   end
@@ -2078,6 +2187,26 @@ defmodule SymphonyElixir.Orchestrator do
     else
       nil
     end
+  end
+
+  defp run_budget_snapshot(running_entry, now) do
+    RunBudget.snapshot(
+      Map.get(running_entry, :run_budget, disabled_run_budget()),
+      run_budget_metrics(running_entry, now)
+    )
+  end
+
+  defp run_budget_metrics(running_entry, now) do
+    %{
+      turns: Map.get(running_entry, :turn_count, 0),
+      tokens: Map.get(running_entry, :codex_total_tokens, 0),
+      token_telemetry_observed: Map.get(running_entry, :codex_token_telemetry_observed, false),
+      seconds: running_seconds(Map.get(running_entry, :started_at), now)
+    }
+  end
+
+  defp disabled_run_budget do
+    %{max_turns: Config.settings!().agent.max_turns, max_tokens: nil, max_seconds: nil}
   end
 
   defp running_seconds(%DateTime{} = started_at, %DateTime{} = now) do

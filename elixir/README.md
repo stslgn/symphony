@@ -96,6 +96,10 @@ retry timer, are excluded from automatic pickup, and are restored from the
 ledger after restart. Resuming a wait does not bypass the normal exact Linear
 state eligibility check.
 
+Run-budget stops use the same durable model with reason
+`run_budget_exhausted` and exact terminal reason `turn_budget_exhausted`,
+`token_budget_exhausted`, or `time_budget_exhausted`.
+
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt. If the Markdown body contains `## Symphony Runtime Prompt`, Symphony renders
 that section through the end of the file as the worker prompt and leaves earlier Markdown available
@@ -116,6 +120,8 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_run_tokens: 250000
+  max_run_seconds: 7200
 codex:
   command: codex app-server
 ---
@@ -137,8 +143,14 @@ Notes:
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
   unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
   Symphony validation.
-- `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
-  invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.max_turns` is a hard attempt limit on back-to-back Codex turns. If the final allowed turn
+  completes while the issue is still active, Symphony parks the run instead of scheduling an
+  automatic continuation. Default: `20`.
+- `agent.max_run_tokens` optionally caps cumulative Codex tokens observed during one attempt.
+- `agent.max_run_seconds` optionally caps wall-clock seconds for one attempt and can stop an
+  in-flight turn.
+- Reaching any run budget preserves the workspace and creates a durable
+  `run_budget_exhausted` wait. Only an explicit `retry` or `reject` resolves it.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Prompt templates may read immutable run metadata from `run.id`, `run.attempt`,

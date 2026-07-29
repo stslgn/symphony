@@ -7,6 +7,7 @@ defmodule SymphonyElixir.OperatorWaitTest do
     assert OperatorWait.reasons() == [
              "auth_reconnect_required",
              "review_cap_reached",
+             "run_budget_exhausted",
              "waiting_infrastructure",
              "waiting_live_approval",
              "waiting_owner",
@@ -17,6 +18,7 @@ defmodule SymphonyElixir.OperatorWaitTest do
     refute OperatorWait.valid_reason?(:waiting_owner)
     refute OperatorWait.valid_reason?("unknown")
     assert OperatorWait.allowed_actions("waiting_secret") == ["retry", "reject"]
+    assert OperatorWait.allowed_actions("run_budget_exhausted") == ["retry", "reject"]
     assert OperatorWait.allowed_actions("unknown") == []
   end
 
@@ -36,11 +38,13 @@ defmodule SymphonyElixir.OperatorWaitTest do
                identifier: "DUD-1",
                run_id: "run-1",
                attempt: 2,
-               tracker_state: "Human Clarification"
+               tracker_state: "Human Clarification",
+               terminal_reason: "time_budget_exhausted"
              })
 
     assert wait.wait_id == "wait-fixed"
     assert wait.stage == "parked"
+    assert wait.terminal_reason == "time_budget_exhausted"
     assert OperatorWait.action_allowed?(wait, "retry")
     refute OperatorWait.action_allowed?(wait, "approve")
     refute OperatorWait.action_allowed?(wait, :retry)
@@ -59,11 +63,13 @@ defmodule SymphonyElixir.OperatorWaitTest do
       "attempt" => 1,
       "stage" => "human_review",
       "tracker_state" => "Human Review",
+      "terminal_reason" => "turn_budget_exhausted",
       "occurred_at" => "2026-07-29T10:00:00.000Z"
     }
 
     assert {:ok, wait} = OperatorWait.from_ledger_event(event)
     assert wait.parked_at == ~U[2026-07-29 10:00:00.000Z]
+    assert wait.terminal_reason == "turn_budget_exhausted"
 
     assert {:ok, fallback_wait} =
              OperatorWait.from_ledger_event(%{event | "occurred_at" => "bad"})

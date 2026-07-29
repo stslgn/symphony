@@ -252,6 +252,12 @@ Fields:
 - `last_reported_total_tokens` (integer)
 - `turn_count` (integer)
   - Number of coding-agent turns started within the current worker lifetime.
+- `run_budget` (object)
+  - Snapshotted turn, observed-token, and wall-clock limits for the attempt.
+- `run_budget_timer_ref` (runtime-specific timer reference or null)
+- `token_telemetry_observed` (boolean)
+  - When false, status MUST expose token usage and remaining allowance as
+    unknown rather than verified zero.
 
 #### 4.1.7 Retry Entry
 
@@ -290,10 +296,11 @@ Fields:
 
 - `wait_id` (stable unique string)
 - `reason` (`waiting_owner`, `waiting_secret`, `waiting_live_approval`,
-  `waiting_infrastructure`, `review_cap_reached`, or `auth_reconnect_required`)
+  `waiting_infrastructure`, `review_cap_reached`, `auth_reconnect_required`, or
+  `run_budget_exhausted`)
 - `allowed_actions` (bounded list derived from the reason)
 - `issue_id`, `identifier`, `run_id`, and `attempt`
-- `stage`, `tracker_state`, and `parked_at`
+- `stage`, `tracker_state`, `terminal_reason`, and `parked_at`
 
 Operator waits MUST NOT contain prompts, agent output, secrets, private data, or tracker comments.
 
@@ -445,7 +452,20 @@ Fields:
   - Changes SHOULD be re-applied at runtime and affect subsequent dispatch decisions.
 - `max_turns` (positive integer)
   - Default: `20`
-  - Limits the number of coding-agent turns within one worker session.
+  - Hard limit on coding-agent turns within one run attempt.
+  - If the issue remains active after the final allowed turn, the run MUST be
+    parked without automatic continuation or failure retry.
+  - Invalid values fail configuration validation.
+- `max_run_tokens` (positive integer or null)
+  - Default: `null` (disabled).
+  - Limits cumulative Codex tokens observed during one run attempt.
+  - Missing token telemetry MUST be represented as unobserved, not as a
+    verified zero.
+  - Invalid non-null values fail configuration validation.
+- `max_run_seconds` (positive integer or null)
+  - Default: `null` (disabled).
+  - Limits wall-clock runtime for one run attempt and MAY stop an in-flight
+    turn.
   - Invalid values fail configuration validation.
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
@@ -626,6 +646,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.timeout_ms`: integer, default `60000`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
+- `agent.max_run_tokens`: positive integer or null, default `null`
+- `agent.max_run_seconds`: positive integer or null, default `null`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
@@ -681,7 +703,11 @@ Important nuance:
 - The first turn SHOULD use the full rendered task prompt.
 - Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
   original task prompt that is already present in thread history.
-- Once the worker exits normally, the orchestrator still schedules a short continuation retry
+- Reaching the turn, observed-token, or wall-clock attempt budget MUST stop the worker, preserve
+  the workspace, append a durable `run_parked` event with the exact terminal reason, and create a
+  `run_budget_exhausted` operator wait. Budget exhaustion MUST NOT enter the automatic continuation
+  or failure retry paths.
+- Once the worker exits normally for a non-budget reason, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.
 
@@ -1493,6 +1519,16 @@ Minimum endpoints:
             "input_tokens": 1200,
             "output_tokens": 800,
             "total_tokens": 2000
+          },
+          "budget": {
+            "turns": {"limit": 20, "used": 7, "remaining": 13},
+            "tokens": {
+              "limit": 250000,
+              "used": 2000,
+              "remaining": 248000,
+              "telemetry_observed": true
+            },
+            "time": {"limit": 7200, "used": 287, "remaining": 6913}
           }
         }
       ],
@@ -1516,6 +1552,7 @@ Minimum endpoints:
           "run_id": "run_example",
           "attempt": 1,
           "stage": "parked",
+          "terminal_reason": null,
           "parked_at": "2026-02-24T20:15:00Z"
         }
       ],

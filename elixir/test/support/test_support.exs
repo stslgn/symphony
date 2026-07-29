@@ -108,6 +108,8 @@ defmodule SymphonyElixir.TestSupport do
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
           max_turns: 20,
+          max_run_tokens: nil,
+          max_run_seconds: nil,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
           codex_command: "codex app-server",
@@ -148,6 +150,8 @@ defmodule SymphonyElixir.TestSupport do
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
+    max_run_tokens = Keyword.get(config, :max_run_tokens)
+    max_run_seconds = Keyword.get(config, :max_run_seconds)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     codex_command = Keyword.get(config, :codex_command)
@@ -196,6 +200,8 @@ defmodule SymphonyElixir.TestSupport do
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
+        "  max_run_tokens: #{yaml_value(max_run_tokens)}",
+        "  max_run_seconds: #{yaml_value(max_run_seconds)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "codex:",

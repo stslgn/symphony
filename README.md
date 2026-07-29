@@ -10,6 +10,10 @@ _In this [demo video](.github/media/symphony-demo.mp4), Symphony monitors a Line
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 
+Symphony can bound each autonomous run by turns, observed Codex tokens, and
+wall-clock time. Reaching a configured budget parks the run for explicit
+operator resolution instead of silently starting another attempt.
+
 ## Running Symphony
 
 ### Requirements
