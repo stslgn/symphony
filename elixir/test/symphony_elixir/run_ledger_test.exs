@@ -42,7 +42,7 @@ defmodule SymphonyElixir.RunLedgerTest do
                workspace_path: "/tmp/workspaces/DUD-2"
              })
 
-    assert {:ok, %{"issue-stale" => 3}} =
+    assert {:ok, %{recovered_attempts: %{"issue-stale" => 3}, parked: %{}}} =
              RunLedger.reconcile_startup(path, "runner-new")
 
     assert {:ok, events} = RunLedger.read_events(path)
@@ -58,7 +58,8 @@ defmodule SymphonyElixir.RunLedgerTest do
                event["runner_generation"] == "runner-new"
            end)
 
-    assert {:ok, %{}} = RunLedger.reconcile_startup(path, "runner-next")
+    assert {:ok, %{recovered_attempts: %{}, parked: %{}}} =
+             RunLedger.reconcile_startup(path, "runner-next")
   end
 
   test "ignores malformed trailing records during recovery" do
@@ -66,7 +67,8 @@ defmodule SymphonyElixir.RunLedgerTest do
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "{\"transition\":\"run_started\"\n")
 
-    assert {:ok, %{}} = RunLedger.reconcile_startup(path, "runner-new")
+    assert {:ok, %{recovered_attempts: %{}, parked: %{}}} =
+             RunLedger.reconcile_startup(path, "runner-new")
   end
 
   test "ignores non-object records and defaults malformed attempts" do
@@ -88,8 +90,43 @@ defmodule SymphonyElixir.RunLedgerTest do
       ]
     )
 
-    assert {:ok, %{"issue-malformed-attempt" => 1}} =
+    assert {:ok, %{recovered_attempts: %{"issue-malformed-attempt" => 1}, parked: %{}}} =
              RunLedger.reconcile_startup(path, "runner-new")
+  end
+
+  test "startup reconciliation restores parked waits until they are resumed" do
+    path = ledger_path()
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_parked",
+               stage: "parked",
+               run_id: "run-parked",
+               issue_id: "issue-parked",
+               issue_identifier: "DUD-3",
+               attempt: 1,
+               wait_id: "wait-parked",
+               parked_reason: "waiting_owner",
+               allowed_actions: ["approve", "reject"],
+               tracker_state: "Human Review"
+             })
+
+    assert {:ok, %{recovered_attempts: %{}, parked: %{"issue-parked" => parked}}} =
+             RunLedger.reconcile_startup(path, "runner-new")
+
+    assert parked["wait_id"] == "wait-parked"
+    assert parked["parked_reason"] == "waiting_owner"
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "wait_resumed",
+               stage: "released",
+               issue_id: "issue-parked",
+               wait_id: "wait-parked"
+             })
+
+    assert {:ok, %{recovered_attempts: %{}, parked: %{}}} =
+             RunLedger.reconcile_startup(path, "runner-next")
   end
 
   test "returns filesystem read and create errors" do

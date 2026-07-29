@@ -13,17 +13,22 @@ defmodule SymphonyElixir.RunLedger do
                           "run_completed",
                           "run_failed",
                           "run_interrupted",
+                          "run_parked",
                           "run_stopped"
                         ])
   @allowed_fields MapSet.new([
+                    :allowed_actions,
                     :attempt,
                     :issue_id,
                     :issue_identifier,
+                    :parked_reason,
                     :run_id,
                     :runner_generation,
                     :stage,
                     :terminal_reason,
+                    :tracker_state,
                     :transition,
+                    :wait_id,
                     :worker_host,
                     :workspace_path
                   ])
@@ -56,18 +61,18 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   @spec reconcile_startup(Path.t(), String.t()) ::
-          {:ok, %{optional(String.t()) => pos_integer()}} | {:error, term()}
+          {:ok, %{recovered_attempts: map(), parked: map()}} | {:error, term()}
   def reconcile_startup(path, runner_generation) do
     reconcile_startup(path, runner_generation, [])
   end
 
   @spec reconcile_startup(Path.t(), String.t(), keyword()) ::
-          {:ok, %{optional(String.t()) => pos_integer()}} | {:error, term()}
+          {:ok, %{recovered_attempts: map(), parked: map()}} | {:error, term()}
   def reconcile_startup(path, runner_generation, opts)
       when is_binary(path) and is_binary(runner_generation) and is_list(opts) do
     append_fn = Keyword.get(opts, :append_fn, &append/2)
 
-    with {:ok, stale_runs} <- unfinished_runs(path),
+    with {:ok, %{stale_runs: stale_runs, parked: parked}} <- recovery_state(path),
          :ok <- append_interrupted_runs(path, stale_runs, runner_generation, append_fn),
          :ok <-
            append_fn.(path, %{
@@ -82,7 +87,7 @@ defmodule SymphonyElixir.RunLedger do
           Map.update(acc, issue_id, next_attempt, &max(&1, next_attempt))
         end)
 
-      {:ok, recovered_attempts}
+      {:ok, %{recovered_attempts: recovered_attempts, parked: parked}}
     end
   end
 
@@ -132,7 +137,7 @@ defmodule SymphonyElixir.RunLedger do
     end
   end
 
-  defp unfinished_runs(path) do
+  defp recovery_state(path) do
     with {:ok, events} <- read_events(path) do
       states =
         Enum.reduce(events, %{}, fn event, acc ->
@@ -145,7 +150,9 @@ defmodule SymphonyElixir.RunLedger do
         |> Enum.filter(&unfinished_run?/1)
         |> Map.new(fn {run_id, state} -> {run_id, state.event} end)
 
-      {:ok, unfinished}
+      parked = Enum.reduce(events, %{}, &update_parked_state/2)
+
+      {:ok, %{stale_runs: unfinished, parked: parked}}
     end
   end
 
@@ -163,6 +170,22 @@ defmodule SymphonyElixir.RunLedger do
   defp update_run_state(acc, _run_id, _event), do: acc
 
   defp unfinished_run?({_run_id, state}), do: state.started and not state.terminal
+
+  defp update_parked_state(%{"transition" => "run_parked", "issue_id" => issue_id} = event, acc)
+       when is_binary(issue_id) do
+    Map.put(acc, issue_id, event)
+  end
+
+  defp update_parked_state(
+         %{"transition" => transition, "issue_id" => issue_id},
+         acc
+       )
+       when transition in ["wait_resumed", "wait_released", "run_started"] and
+              is_binary(issue_id) do
+    Map.delete(acc, issue_id)
+  end
+
+  defp update_parked_state(_event, acc), do: acc
 
   defp append_interrupted_runs(path, stale_runs, runner_generation, append_fn) do
     Enum.reduce_while(stale_runs, :ok, fn {run_id, event}, :ok ->

@@ -342,7 +342,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "parked" => 1},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -369,6 +369,20 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "error" => "boom",
                  "worker_host" => nil,
                  "workspace_path" => nil
+               }
+             ],
+             "parked" => [
+               %{
+                 "issue_id" => "issue-parked",
+                 "issue_identifier" => "MT-PARKED",
+                 "wait_id" => "wait-http",
+                 "reason" => "waiting_owner",
+                 "allowed_actions" => ["approve", "reject"],
+                 "tracker_state" => "Human Review",
+                 "run_id" => "run-http",
+                 "attempt" => 1,
+                 "stage" => "parked",
+                 "parked_at" => state_payload["parked"] |> List.first() |> Map.fetch!("parked_at")
                }
              ],
              "codex_totals" => %{
@@ -406,6 +420,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
              },
              "retry" => nil,
+             "parked" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "last_error" => nil,
@@ -416,6 +431,18 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"status" => "retrying", "retry" => %{"attempt" => 2, "error" => "boom"}} =
              json_response(conn, 200)
+
+    conn = get(build_conn(), "/api/v1/MT-PARKED")
+
+    assert %{
+             "status" => "parked",
+             "parked" => %{
+               "wait_id" => "wait-http",
+               "reason" => "waiting_owner",
+               "allowed_actions" => ["approve", "reject"],
+               "tracker_state" => "Human Review"
+             }
+           } = json_response(conn, 200)
 
     conn = get(build_conn(), "/api/v1/MT-MISSING")
 
@@ -643,7 +670,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1}
+    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "parked" => 1}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -711,6 +738,20 @@ defmodule SymphonyElixir.ExtensionsTest do
           attempt: 2,
           due_in_ms: 2_000,
           error: "boom"
+        }
+      ],
+      parked: [
+        %{
+          issue_id: "issue-parked",
+          identifier: "MT-PARKED",
+          wait_id: "wait-http",
+          reason: "waiting_owner",
+          allowed_actions: ["approve", "reject"],
+          tracker_state: "Human Review",
+          run_id: "run-http",
+          attempt: 1,
+          stage: "parked",
+          parked_at: DateTime.utc_now()
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},

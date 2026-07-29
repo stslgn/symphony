@@ -7,7 +7,16 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, RunLedger, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    Config,
+    OperatorWait,
+    RunLedger,
+    StatusDashboard,
+    Tracker,
+    Workspace
+  }
+
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -36,6 +45,7 @@ defmodule SymphonyElixir.Orchestrator do
       :run_ledger_path,
       :runner_generation,
       running: %{},
+      parked: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       recovered_attempts: %{},
@@ -59,7 +69,7 @@ defmodule SymphonyElixir.Orchestrator do
     runner_generation = RunLedger.new_id("runner")
 
     case RunLedger.reconcile_startup(run_ledger_path, runner_generation) do
-      {:ok, recovered_attempts} ->
+      {:ok, %{recovered_attempts: recovered_attempts, parked: parked_events}} ->
         state = %State{
           poll_interval_ms: config.polling.interval_ms,
           max_concurrent_agents: config.agent.max_concurrent_agents,
@@ -70,6 +80,7 @@ defmodule SymphonyElixir.Orchestrator do
           run_ledger_path: run_ledger_path,
           runner_generation: runner_generation,
           recovered_attempts: recovered_attempts,
+          parked: restore_parked_waits(parked_events),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
@@ -253,7 +264,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
-    state = reconcile_running_issues(state)
+    state =
+      state
+      |> reconcile_running_issues()
+      |> reconcile_parked_issues()
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
@@ -328,6 +342,36 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp reconcile_parked_issues(%State{parked: parked} = state) when map_size(parked) == 0,
+    do: state
+
+  defp reconcile_parked_issues(%State{} = state) do
+    parked_ids = Map.keys(state.parked)
+
+    case Tracker.fetch_issue_states_by_ids(parked_ids) do
+      {:ok, issues} ->
+        Enum.reduce(issues, state, &reconcile_parked_issue/2)
+
+      {:error, reason} ->
+        Logger.debug("Failed to refresh parked issue states: #{inspect(reason)}; keeping operator waits")
+        state
+    end
+  end
+
+  defp reconcile_parked_issue(%Issue{} = issue, %State{} = state) do
+    if terminal_issue_state?(issue.state, terminal_state_set()) or
+         !issue_routable_to_worker?(issue) do
+      release_parked_issue(state, issue.id, "tracker_released")
+    else
+      update_in(state.parked[issue.id], fn
+        nil -> nil
+        wait -> %{wait | tracker_state: issue.state, identifier: issue.identifier}
+      end)
+    end
+  end
+
+  defp reconcile_parked_issue(_issue, state), do: state
+
   @doc false
   @spec reconcile_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
@@ -387,6 +431,9 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, false, "worker_route_removed")
 
+      parked_reason = OperatorWait.reason_for_tracker_state(issue.state) ->
+        park_running_issue(state, issue, parked_reason)
+
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
 
@@ -441,6 +488,69 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         state
     end
+  end
+
+  defp park_running_issue(%State{} = state, %Issue{} = issue, reason) do
+    case Map.get(state.running, issue.id) do
+      nil ->
+        state
+
+      running_entry ->
+        with {:ok, wait} <-
+               OperatorWait.new(reason, %{
+                 issue_id: issue.id,
+                 identifier: issue.identifier,
+                 run_id: Map.get(running_entry, :run_id),
+                 attempt: Map.get(running_entry, :retry_attempt, 0),
+                 tracker_state: issue.state
+               }),
+             :ok <- append_run_event(state, operator_wait_event(wait, "run_parked")) do
+          Logger.info("Issue parked for operator action: #{issue_context(issue)} reason=#{reason} wait_id=#{wait.wait_id}")
+
+          state = record_session_completion_totals(state, running_entry)
+          stop_running_entry(running_entry)
+
+          %{
+            state
+            | running: Map.delete(state.running, issue.id),
+              parked: Map.put(state.parked, issue.id, wait),
+              claimed: MapSet.delete(state.claimed, issue.id),
+              retry_attempts: Map.delete(state.retry_attempts, issue.id)
+          }
+        else
+          {:error, error} ->
+            Logger.error("Failed to durably park issue_id=#{issue.id} reason=#{reason}: #{inspect(error)}")
+            state
+        end
+    end
+  end
+
+  defp release_parked_issue(%State{} = state, issue_id, terminal_reason) do
+    case Map.get(state.parked, issue_id) do
+      nil ->
+        state
+
+      wait ->
+        event =
+          wait
+          |> operator_wait_event("wait_released")
+          |> Map.put(:terminal_reason, terminal_reason)
+
+        case append_run_event(state, event) do
+          :ok ->
+            %{state | parked: Map.delete(state.parked, issue_id)}
+
+          {:error, reason} ->
+            Logger.error("Failed to release parked issue_id=#{issue_id}: #{inspect(reason)}")
+            state
+        end
+    end
+  end
+
+  defp stop_running_entry(running_entry) do
+    if is_pid(running_entry[:pid]), do: terminate_task(running_entry.pid)
+    if is_reference(running_entry[:ref]), do: Process.demonitor(running_entry.ref, [:flush])
+    :ok
   end
 
   defp terminate_running_issue(
@@ -591,7 +701,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp should_dispatch_issue?(
          %Issue{} = issue,
-         %State{running: running, claimed: claimed} = state,
+         %State{running: running, parked: parked, claimed: claimed} = state,
          active_states,
          terminal_states
        ) do
@@ -599,6 +709,7 @@ defmodule SymphonyElixir.Orchestrator do
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
+      !Map.has_key?(parked, issue.id) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
@@ -1217,6 +1328,35 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec park_issue(String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def park_issue(issue_id, reason), do: park_issue(__MODULE__, issue_id, reason)
+
+  @spec park_issue(GenServer.server(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def park_issue(server, issue_id, reason) do
+    if GenServer.whereis(server) do
+      GenServer.call(server, {:park_issue, issue_id, reason})
+    else
+      :unavailable
+    end
+  end
+
+  @spec resolve_wait(String.t(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def resolve_wait(issue_id, wait_id, action),
+    do: resolve_wait(__MODULE__, issue_id, wait_id, action)
+
+  @spec resolve_wait(GenServer.server(), String.t(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def resolve_wait(server, issue_id, wait_id, action) do
+    if GenServer.whereis(server) do
+      GenServer.call(server, {:resolve_wait, issue_id, wait_id, action})
+    else
+      :unavailable
+    end
+  end
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -1235,6 +1375,34 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_call({:park_issue, issue_id, reason}, _from, state) do
+    case Map.get(state.running, issue_id) do
+      %{issue: %Issue{} = issue} ->
+        updated_state = park_running_issue(state, issue, reason)
+
+        case Map.get(updated_state.parked, issue_id) do
+          nil -> {:reply, {:error, :park_failed}, state}
+          wait -> {:reply, {:ok, wait}, updated_state}
+        end
+
+      _ ->
+        {:reply, {:error, :issue_not_running}, state}
+    end
+  end
+
+  def handle_call({:resolve_wait, issue_id, wait_id, action}, _from, state) do
+    case Map.get(state.parked, issue_id) do
+      nil ->
+        {:reply, {:error, :wait_not_found}, state}
+
+      %{wait_id: stored_wait_id} when stored_wait_id != wait_id ->
+        {:reply, {:error, :wait_id_mismatch}, state}
+
+      wait ->
+        resolve_operator_wait(state, wait, action)
+    end
+  end
+
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
@@ -1283,11 +1451,29 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    parked =
+      state.parked
+      |> Enum.map(fn {_issue_id, wait} ->
+        %{
+          issue_id: wait.issue_id,
+          run_id: wait.run_id,
+          attempt: wait.attempt,
+          stage: wait.stage,
+          identifier: wait.identifier,
+          wait_id: wait.wait_id,
+          reason: wait.reason,
+          allowed_actions: wait.allowed_actions,
+          tracker_state: wait.tracker_state,
+          parked_at: wait.parked_at
+        }
+      end)
+
     {:reply,
      %{
        runner_generation: state.runner_generation,
        running: running,
        retrying: retrying,
+       parked: parked,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1460,6 +1646,59 @@ defmodule SymphonyElixir.Orchestrator do
   defp append_run_event(%State{} = state, event) when is_map(event) do
     event = Map.put(event, :runner_generation, state.runner_generation)
     RunLedger.append(state.run_ledger_path, event)
+  end
+
+  defp operator_wait_event(wait, transition) do
+    %{
+      transition: transition,
+      stage: wait.stage,
+      run_id: wait.run_id,
+      issue_id: wait.issue_id,
+      issue_identifier: wait.identifier,
+      attempt: wait.attempt,
+      wait_id: wait.wait_id,
+      parked_reason: wait.reason,
+      allowed_actions: wait.allowed_actions,
+      tracker_state: wait.tracker_state
+    }
+  end
+
+  defp resolve_operator_wait(state, wait, action) do
+    if OperatorWait.action_allowed?(wait, action) do
+      transition = if action == "reject", do: "wait_rejected", else: "wait_resumed"
+      event = operator_wait_event(wait, transition)
+
+      case append_run_event(state, event) do
+        :ok when action == "reject" ->
+          {:reply, {:ok, %{wait: wait, action: action, resumed: false}}, state}
+
+        :ok ->
+          state =
+            state
+            |> Map.update!(:parked, &Map.delete(&1, wait.issue_id))
+            |> schedule_tick(0)
+
+          {:reply, {:ok, %{wait: wait, action: action, resumed: true}}, state}
+
+        {:error, reason} ->
+          {:reply, {:error, {:ledger_write_failed, reason}}, state}
+      end
+    else
+      {:reply, {:error, :action_not_allowed}, state}
+    end
+  end
+
+  defp restore_parked_waits(events) when is_map(events) do
+    Enum.reduce(events, %{}, fn {issue_id, event}, restored ->
+      case OperatorWait.from_ledger_event(event) do
+        {:ok, wait} ->
+          Map.put(restored, issue_id, wait)
+
+        {:error, reason} ->
+          Logger.warning("Ignoring invalid parked wait issue_id=#{issue_id}: #{inspect(reason)}")
+          restored
+      end
+    end)
   end
 
   defp log_run_event_result(:ok, _issue_id), do: :ok

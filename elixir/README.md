@@ -88,6 +88,14 @@ unfinished attempts from the previous runner generation before the first poll;
 an eligible issue is then redispatched with an incremented attempt and a new
 run id.
 
+Human Review and Human Clarification transitions are recorded as durable
+`waiting_owner` operator waits; Deploy Ready is recorded as
+`waiting_live_approval`. The same typed wait model supports secret,
+infrastructure, review-cap, and authentication pauses. Parked issues have no
+retry timer, are excluded from automatic pickup, and are restored from the
+ledger after restart. Resuming a wait does not bypass the normal exact Linear
+state eligibility check.
+
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt. If the Markdown body contains `## Symphony Runtime Prompt`, Symphony renders
 that section through the end of the file as the worker prompt and leaves earlier Markdown available
@@ -171,6 +179,9 @@ The observability UI now runs on a minimal Phoenix stack:
 
 - LiveView for the dashboard at `/`
 - JSON API for operational debugging under `/api/v1/*`
+- `/api/v1/state` exposes separate `running`, `retrying`, and `parked` lists;
+  parked rows include the stable wait id, typed reason, allowed actions, and
+  issue/run identity.
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 

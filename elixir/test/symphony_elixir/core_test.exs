@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.RunLedger
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -352,6 +354,174 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "human review durably parks a running issue without scheduling retry" do
+    issue_id = "issue-human-review"
+    issue_identifier = "MT-555-PARK"
+
+    ledger_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-operator-wait-#{System.unique_integer([:positive])}/events.jsonl"
+      )
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      run_ledger_path: ledger_path,
+      runner_generation: "runner-test",
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          run_id: "run-human-review",
+          retry_attempt: 2,
+          identifier: issue_identifier,
+          issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_identifier,
+      state: "Human Review",
+      title: "Owner review",
+      description: "Waiting for approval",
+      labels: []
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    refute Map.has_key?(updated_state.running, issue_id)
+    refute MapSet.member?(updated_state.claimed, issue_id)
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+    refute Process.alive?(agent_pid)
+
+    assert %{
+             wait_id: "wait_" <> _,
+             reason: "waiting_owner",
+             run_id: "run-human-review",
+             attempt: 2,
+             tracker_state: "Human Review",
+             allowed_actions: ["approve", "reject"]
+           } = updated_state.parked[issue_id]
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+
+    assert Enum.any?(events, fn event ->
+             event["transition"] == "run_parked" and
+               event["issue_id"] == issue_id and
+               event["parked_reason"] == "waiting_owner"
+           end)
+  end
+
+  test "parked issues are excluded from dispatch even when Linear is active" do
+    issue = %Issue{
+      id: "issue-parked-active",
+      identifier: "MT-PARKED-ACTIVE",
+      state: "Todo",
+      title: "Still parked",
+      description: "Explicit resolution is required",
+      labels: [],
+      assigned_to_worker: true
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      parked: %{issue.id => %{wait_id: "wait-active"}},
+      claimed: MapSet.new()
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "typed waits require matching ids and allowed actions before resume" do
+    issue_id = "issue-secret-wait"
+
+    ledger_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-resolve-wait-#{System.unique_integer([:positive])}/events.jsonl"
+      )
+
+    agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    state = %Orchestrator.State{
+      run_ledger_path: ledger_path,
+      runner_generation: "runner-resolve",
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          run_id: "run-secret",
+          retry_attempt: 1,
+          identifier: "MT-SECRET",
+          issue: %Issue{id: issue_id, identifier: "MT-SECRET", state: "In Progress"},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:reply, {:ok, wait}, parked_state} =
+             Orchestrator.handle_call(
+               {:park_issue, issue_id, "waiting_secret"},
+               {self(), make_ref()},
+               state
+             )
+
+    assert wait.reason == "waiting_secret"
+    assert wait.allowed_actions == ["retry", "reject"]
+
+    assert {:reply, {:error, :wait_id_mismatch}, ^parked_state} =
+             Orchestrator.handle_call(
+               {:resolve_wait, issue_id, "wrong-wait", "retry"},
+               {self(), make_ref()},
+               parked_state
+             )
+
+    assert {:reply, {:error, :action_not_allowed}, ^parked_state} =
+             Orchestrator.handle_call(
+               {:resolve_wait, issue_id, wait.wait_id, "approve"},
+               {self(), make_ref()},
+               parked_state
+             )
+
+    assert {:reply, {:ok, %{action: "reject", resumed: false}}, rejected_state} =
+             Orchestrator.handle_call(
+               {:resolve_wait, issue_id, wait.wait_id, "reject"},
+               {self(), make_ref()},
+               parked_state
+             )
+
+    assert rejected_state.parked[issue_id].wait_id == wait.wait_id
+
+    assert {:reply, {:ok, %{action: "retry", resumed: true}}, resumed_state} =
+             Orchestrator.handle_call(
+               {:resolve_wait, issue_id, wait.wait_id, "retry"},
+               {self(), make_ref()},
+               parked_state
+             )
+
+    refute Map.has_key?(resumed_state.parked, issue_id)
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(events, &(&1["transition"] == "run_parked")) == 1
+    assert Enum.count(events, &(&1["transition"] == "wait_rejected")) == 1
+    assert Enum.count(events, &(&1["transition"] == "wait_resumed")) == 1
   end
 
   test "terminal issue state stops running agent and cleans workspace" do

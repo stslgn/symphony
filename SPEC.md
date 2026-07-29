@@ -275,11 +275,27 @@ Fields:
 - `poll_interval_ms` (current effective poll interval)
 - `max_concurrent_agents` (current effective global concurrency limit)
 - `running` (map `issue_id -> running entry`)
+- `parked` (map `issue_id -> OperatorWait`)
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
+
+#### 4.1.9 Operator Wait
+
+A bounded, durable record for work that requires explicit operator action rather than retry.
+
+Fields:
+
+- `wait_id` (stable unique string)
+- `reason` (`waiting_owner`, `waiting_secret`, `waiting_live_approval`,
+  `waiting_infrastructure`, `review_cap_reached`, or `auth_reconnect_required`)
+- `allowed_actions` (bounded list derived from the reason)
+- `issue_id`, `identifier`, `run_id`, and `attempt`
+- `stage`, `tracker_state`, and `parked_at`
+
+Operator waits MUST NOT contain prompts, agent output, secrets, private data, or tracker comments.
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
@@ -636,7 +652,12 @@ claim state.
 4. `RetryQueued`
    - Worker is not running, but a retry timer exists in `retry_attempts`.
 
-5. `Released`
+5. `Parked`
+   - Worker is not running and no retry timer exists.
+   - A durable typed operator wait exists in `parked`.
+   - The issue cannot be dispatched until the wait is explicitly resumed.
+
+6. `Released`
    - Claim removed because issue is terminal, non-active, missing, or retry path completed without
      re-dispatch.
 
@@ -712,6 +733,9 @@ Distinct terminal reasons are important because retry logic and logs differ.
   orchestrator database.
 - Startup reconciliation marks every unfinished run from the previous runner generation as
   `interrupted_by_restart` before scheduling the first poll.
+- Startup reconciliation restores unresolved operator waits before dispatch.
+- A parked issue is excluded from automatic retry and pickup even when its tracker state is active.
+- Resuming a wait removes only the runner-side park; normal exact-state eligibility still applies.
 - A redispatched issue continues with an incremented attempt and a new run id.
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 
@@ -726,7 +750,7 @@ The effective poll interval SHOULD be updated when workflow config changes are r
 
 Tick sequence:
 
-1. Reconcile running issues.
+1. Reconcile running and parked issues.
 2. Run dispatch preflight validation.
 3. Fetch candidate issues from tracker using active states.
 4. Sort issues by dispatch priority.
@@ -743,6 +767,7 @@ An issue is dispatch-eligible only if all are true:
 - It has `id`, `identifier`, `title`, and `state`.
 - Its state is in `active_states` and not in `terminal_states`.
 - It is not already in `running`.
+- It is not in `parked`.
 - It is not already in `claimed`.
 - Global concurrency slots are available.
 - Per-state concurrency slots are available.
@@ -816,7 +841,13 @@ Part B: Tracker state refresh
 - For each running issue:
   - If tracker state is terminal: terminate worker and clean workspace.
   - If tracker state is still active: update the in-memory issue snapshot.
-  - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
+  - If tracker state is `Human Review` or `Human Clarification`: durably park with
+    `waiting_owner`.
+  - If tracker state is `Deploy Ready`: durably park with `waiting_live_approval`.
+  - If tracker state is any other non-active/non-terminal state: terminate worker without workspace
+    cleanup.
+- Refresh parked issue states separately. Terminal or unrouted issues release their wait; all other
+  parked issues remain ineligible until explicitly resumed.
 - If state refresh fails, keep workers running and try again on the next tick.
 
 ### 8.6 Startup Terminal Workspace Cleanup
@@ -1303,6 +1334,7 @@ SHOULD return:
 - `running` (list of running session rows)
 - each running row SHOULD include `turn_count`
 - `retrying` (list of retry queue rows)
+- `parked` (list of typed operator waits)
 - `codex_totals`
   - `input_tokens`
   - `output_tokens`
@@ -1408,7 +1440,8 @@ Minimum endpoints:
 
 - `GET /api/v1/state`
   - Returns a summary view of the current system state (running sessions, retry queue/delays,
-    aggregate token/runtime totals, latest rate limits, and any additional tracked summary fields).
+    parked operator waits, aggregate token/runtime totals, latest rate limits, and any additional
+    tracked summary fields).
   - Suggested response shape:
 
     ```json
@@ -1416,7 +1449,8 @@ Minimum endpoints:
       "generated_at": "2026-02-24T20:15:30Z",
       "counts": {
         "running": 2,
-        "retrying": 1
+        "retrying": 1,
+        "parked": 1
       },
       "running": [
         {
@@ -1443,6 +1477,20 @@ Minimum endpoints:
           "attempt": 3,
           "due_at": "2026-02-24T20:16:00Z",
           "error": "no available orchestrator slots"
+        }
+      ],
+      "parked": [
+        {
+          "issue_id": "ghi789",
+          "issue_identifier": "MT-651",
+          "wait_id": "wait_example",
+          "reason": "waiting_owner",
+          "allowed_actions": ["approve", "reject"],
+          "tracker_state": "Human Review",
+          "run_id": "run_example",
+          "attempt": 1,
+          "stage": "parked",
+          "parked_at": "2026-02-24T20:15:00Z"
         }
       ],
       "codex_totals": {
@@ -1596,14 +1644,16 @@ API design notes:
 
 Current scheduler state remains in-memory, while material run transitions are persisted in an
 append-only JSONL ledger. Restart recovery means the service closes unfinished attempts from the
-previous runner generation, resumes useful operation by polling tracker state, and reuses preserved
-workspaces. Retry timers, running processes, and live agent sessions do not survive process restart.
+previous runner generation, restores unresolved typed operator waits, resumes useful operation by
+polling tracker state, and reuses preserved workspaces. Retry timers, running processes, and live
+agent sessions do not survive process restart.
 
 After restart:
 
 - No retry timers are restored from prior process memory; an interrupted active issue is eligible
   for one new attempt after normal tracker reconciliation.
 - No running sessions are assumed recoverable.
+- Unresolved parked waits are restored and remain ineligible for automatic pickup.
 - Service recovers by:
   - startup terminal workspace cleanup
   - fresh polling of active issues
@@ -1618,7 +1668,10 @@ Operators can control behavior by:
   Section 6.2.
 - Changing issue states in the tracker:
   - terminal state -> running session is stopped and workspace cleaned when reconciled
-  - non-active state -> running session is stopped without cleanup
+  - Human Review, Human Clarification, or Deploy Ready -> running session is durably parked
+  - other non-active state -> running session is stopped without cleanup
+- Explicitly parking an active run with a typed reason, or resuming a matching wait with one of its
+  allowed actions.
 - Restarting the service for process recovery or deployment (not as the normal path for applying
   workflow config changes).
 
@@ -2006,6 +2059,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `Todo` issue with terminal blockers is eligible
 - Active-state issue refresh updates running entry state
 - Non-active state stops running agent without workspace cleanup
+- Human Review parks a running agent with `waiting_owner` and no retry
+- Parked issues are excluded from dispatch until a matching wait is resumed
+- Unresolved waits are restored from the run ledger after restart
 - Terminal state stops running agent and cleans workspace
 - Reconciliation with no running issues is a no-op
 - Normal worker exit schedules a short continuation retry (attempt 1)
@@ -2014,8 +2070,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry
 - Slot exhaustion requeues retries with explicit error reason
-- If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
-  limits
+- If a snapshot API is implemented, it returns running rows, retry rows, parked waits, token totals,
+  and rate limits
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
 
 ### 17.5 Coding-Agent App-Server Client
@@ -2105,6 +2161,7 @@ Use the same validation profiles as Section 17:
 - Exponential retry queue with continuation retries after normal exit
 - Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
 - Reconciliation that stops runs on terminal/non-active tracker states
+- Durable typed operator waits with restart restoration and dispatch exclusion
 - Workspace cleanup for terminal issues (startup sweep + active transition)
 - Structured logs with `issue_id`, `issue_identifier`, and `session_id`
 - Operator-visible observability (structured logs; OPTIONAL snapshot/status surface)
