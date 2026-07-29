@@ -52,8 +52,8 @@ Important boundary:
 - Recover from transient failures with exponential backoff.
 - Load runtime behavior from a repository-owned `WORKFLOW.md` contract.
 - Expose operator-visible observability (at minimum structured logs).
-- Support tracker/filesystem-driven restart recovery without requiring a persistent database; exact
-  in-memory scheduler state is not restored.
+- Support tracker/filesystem-driven restart recovery backed by an append-only durable run ledger;
+  exact in-memory scheduler state is not restored.
 
 ### 2.2 Non-Goals
 
@@ -91,6 +91,7 @@ Important boundary:
    - Owns the in-memory runtime state.
    - Decides which issues to dispatch, retry, stop, or release.
    - Tracks session metrics and retry queue state.
+   - Appends bounded run transitions to the durable ledger.
 
 5. `Workspace Manager`
    - Maps issue identifiers to workspace paths.
@@ -110,6 +111,12 @@ Important boundary:
 
 8. `Logging`
    - Emits structured runtime logs to one or more configured sinks.
+
+9. `Run Ledger`
+   - Stores append-only JSONL transition events with restrictive file permissions.
+   - Records stable issue/run identity, attempt, stage, timestamps, and terminal reasons.
+   - Never stores credentials, raw prompts, raw agent output, private data, or long external
+     comments.
 
 ### 3.2 Abstraction Levels
 
@@ -701,7 +708,11 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - The orchestrator serializes state mutations through one authority to avoid duplicate dispatch.
 - `claimed` and `running` checks are REQUIRED before launching any worker.
 - Reconciliation runs before dispatch on every tick.
-- Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
+- Restart recovery is ledger-, tracker-, and filesystem-driven without requiring a durable
+  orchestrator database.
+- Startup reconciliation marks every unfinished run from the previous runner generation as
+  `interrupted_by_restart` before scheduling the first poll.
+- A redispatched issue continues with an incremented attempt and a new run id.
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 
 ## 8. Polling, Scheduling, and Reconciliation
@@ -1583,14 +1594,15 @@ API design notes:
 
 ### 14.3 Partial State Recovery (Restart)
 
-Current design is intentionally in-memory for scheduler state.
-Restart recovery means the service can resume useful operation by polling tracker state and reusing
-preserved workspaces. It does not mean retry timers, running sessions, or live worker state survive
-process restart.
+Current scheduler state remains in-memory, while material run transitions are persisted in an
+append-only JSONL ledger. Restart recovery means the service closes unfinished attempts from the
+previous runner generation, resumes useful operation by polling tracker state, and reuses preserved
+workspaces. Retry timers, running processes, and live agent sessions do not survive process restart.
 
 After restart:
 
-- No retry timers are restored from prior process memory.
+- No retry timers are restored from prior process memory; an interrupted active issue is eligible
+  for one new attempt after normal tracker reconciliation.
 - No running sessions are assumed recoverable.
 - Service recovers by:
   - startup terminal workspace cleanup

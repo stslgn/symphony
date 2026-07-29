@@ -853,6 +853,32 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "attempt=3"
   end
 
+  test "prompt builder exposes immutable run identity metadata" do
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      prompt: "run={{ run.id }} attempt={{ run.attempt }} stage={{ run.stage }} generation={{ run.runner_generation }}"
+    )
+
+    issue = %Issue{
+      id: "issue-run-identity",
+      identifier: "MT-IDENTITY",
+      title: "Run identity",
+      description: nil,
+      state: "Todo"
+    }
+
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        attempt: 4,
+        run_id: "run-stable",
+        stage: "running",
+        runner_generation: "runner-generation"
+      )
+
+    assert prompt ==
+             "run=run-stable attempt=4 stage=running generation=runner-generation"
+  end
+
   test "prompt builder renders only the runtime prompt section when present" do
     workflow_prompt = """
     # Operator workflow

@@ -31,7 +31,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     case Workspace.create_for_issue(issue, worker_host) do
       {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, opts)
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
@@ -46,21 +46,28 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp codex_message_handler(recipient, issue) do
+  defp codex_message_handler(recipient, issue, opts) do
     fn message ->
-      send_codex_update(recipient, issue, message)
+      send_codex_update(recipient, issue, message, Keyword.get(opts, :run_id))
     end
   end
 
-  defp send_codex_update(recipient, %Issue{id: issue_id}, message)
+  defp send_codex_update(recipient, %Issue{id: issue_id}, message, run_id)
        when is_binary(issue_id) and is_pid(recipient) do
+    message = if is_map(message), do: Map.put(message, :run_id, run_id), else: message
     send(recipient, {:codex_worker_update, issue_id, message})
     :ok
   end
 
-  defp send_codex_update(_recipient, _issue, _message), do: :ok
+  defp send_codex_update(_recipient, _issue, _message, _run_id), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id} = issue, worker_host, workspace)
+  defp send_worker_runtime_info(
+         recipient,
+         %Issue{id: issue_id} = issue,
+         worker_host,
+         workspace,
+         opts
+       )
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
     send(
       recipient,
@@ -68,6 +75,8 @@ defmodule SymphonyElixir.AgentRunner do
        %{
          worker_host: worker_host,
          workspace_path: workspace,
+         run_id: Keyword.get(opts, :run_id),
+         runner_generation: Keyword.get(opts, :runner_generation),
          session_title: AppServer.session_title(issue)
        }}
     )
@@ -75,7 +84,7 @@ defmodule SymphonyElixir.AgentRunner do
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _opts), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
@@ -102,7 +111,7 @@ defmodule SymphonyElixir.AgentRunner do
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: codex_message_handler(codex_update_recipient, issue, opts)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 

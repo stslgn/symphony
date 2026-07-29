@@ -80,6 +80,14 @@ Optional flags:
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
 
+Symphony also writes an append-only `run-ledger.jsonl` beside the application
+log. The file is kept at mode `0600` and contains only bounded run identity,
+attempt, stage, workspace, and terminal-reason fields. It never stores prompts,
+agent output, credentials, or external comments. At startup, Symphony closes
+unfinished attempts from the previous runner generation before the first poll;
+an eligible issue is then redispatched with an incremented attempt and a new
+run id.
+
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt. If the Markdown body contains `## Symphony Runtime Prompt`, Symphony renders
 that section through the end of the file as the worker prompt and leaves earlier Markdown available
@@ -125,6 +133,8 @@ Notes:
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
+- Prompt templates may read immutable run metadata from `run.id`, `run.attempt`,
+  `run.stage`, and `run.runner_generation`.
 - Use `## Symphony Runtime Prompt` when `WORKFLOW.md` also contains operator-only instructions, so
   pickup/watch-loop guidance does not get sent to the worker as task instructions.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

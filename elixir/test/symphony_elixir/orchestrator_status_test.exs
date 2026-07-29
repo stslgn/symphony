@@ -101,6 +101,75 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "orchestrator ignores stale worker updates from a previous run id" do
+    issue_id = "issue-stale-update"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-STALE",
+      title: "Stale update",
+      state: "In Progress"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :StaleUpdateOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      run_id: "run-current",
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      session_title: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      turn_count: 0,
+      retry_attempt: 0,
+      worker_host: nil,
+      workspace_path: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:worker_runtime_info, issue_id, %{run_id: "run-old", workspace_path: "/tmp/stale-workspace"}}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         run_id: "run-old",
+         event: :notification,
+         payload: %{method: "stale-event"},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert [%{run_id: "run-current", workspace_path: nil, last_codex_message: nil}] = snapshot.running
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 

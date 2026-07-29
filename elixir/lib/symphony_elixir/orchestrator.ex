@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, RunLedger, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -33,9 +33,12 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :run_ledger_path,
+      :runner_generation,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
+      recovered_attempts: %{},
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
@@ -49,25 +52,36 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
+    run_ledger_path = Keyword.get(opts, :run_ledger_path, RunLedger.default_path())
+    runner_generation = RunLedger.new_id("runner")
 
-    state = %State{
-      poll_interval_ms: config.polling.interval_ms,
-      max_concurrent_agents: config.agent.max_concurrent_agents,
-      next_poll_due_at_ms: now_ms,
-      poll_check_in_progress: false,
-      tick_timer_ref: nil,
-      tick_token: nil,
-      codex_totals: @empty_codex_totals,
-      codex_rate_limits: nil
-    }
+    case RunLedger.reconcile_startup(run_ledger_path, runner_generation) do
+      {:ok, recovered_attempts} ->
+        state = %State{
+          poll_interval_ms: config.polling.interval_ms,
+          max_concurrent_agents: config.agent.max_concurrent_agents,
+          next_poll_due_at_ms: now_ms,
+          poll_check_in_progress: false,
+          tick_timer_ref: nil,
+          tick_token: nil,
+          run_ledger_path: run_ledger_path,
+          runner_generation: runner_generation,
+          recovered_attempts: recovered_attempts,
+          codex_totals: @empty_codex_totals,
+          codex_rate_limits: nil
+        }
 
-    run_terminal_workspace_cleanup()
-    state = schedule_tick(state, 0)
+        run_terminal_workspace_cleanup()
+        state = schedule_tick(state, 0)
 
-    {:ok, state}
+        {:ok, state}
+
+      {:error, reason} ->
+        {:stop, {:run_ledger_unavailable, reason}}
+    end
   end
 
   @impl true
@@ -135,10 +149,12 @@ defmodule SymphonyElixir.Orchestrator do
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
               state
+              |> record_run_event(running_entry, "run_completed", "released", terminal_reason: "worker_completed")
               |> complete_issue(issue_id)
               |> schedule_issue_retry(issue_id, 1, %{
                 identifier: running_entry.identifier,
                 delay_type: :continuation,
+                previous_run_id: Map.get(running_entry, :run_id),
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path)
               })
@@ -148,9 +164,12 @@ defmodule SymphonyElixir.Orchestrator do
 
               next_attempt = next_retry_attempt_from_running(running_entry)
 
-              schedule_issue_retry(state, issue_id, next_attempt, %{
+              state
+              |> record_run_event(running_entry, "run_failed", "released", terminal_reason: "worker_exit")
+              |> schedule_issue_retry(issue_id, next_attempt, %{
                 identifier: running_entry.identifier,
                 error: "agent exited: #{inspect(reason)}",
+                previous_run_id: Map.get(running_entry, :run_id),
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path)
               })
@@ -170,14 +189,20 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
-        updated_running_entry =
-          running_entry
-          |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
-          |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
-          |> maybe_put_runtime_value(:session_title, runtime_info[:session_title])
+        if runtime_info_matches_run?(runtime_info, running_entry) do
+          updated_running_entry =
+            running_entry
+            |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
+            |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+            |> maybe_put_runtime_value(:session_title, runtime_info[:session_title])
 
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+          state = record_run_event(state, updated_running_entry, "run_runtime_ready", "running")
+          notify_dashboard()
+          {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        else
+          Logger.warning("Ignoring stale worker runtime info issue_id=#{issue_id} run_id=#{inspect(runtime_info[:run_id])}")
+          {:noreply, state}
+        end
     end
   end
 
@@ -190,15 +215,20 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
-        {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        if runtime_info_matches_run?(update, running_entry) do
+          {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
 
-        state =
-          state
-          |> apply_codex_token_delta(token_delta)
-          |> apply_codex_rate_limits(update)
+          state =
+            state
+            |> apply_codex_token_delta(token_delta)
+            |> apply_codex_rate_limits(update)
 
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+          notify_dashboard()
+          {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        else
+          Logger.warning("Ignoring stale Codex worker update issue_id=#{issue_id} run_id=#{inspect(update[:run_id])}")
+          {:noreply, state}
+        end
     end
   end
 
@@ -350,12 +380,12 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        terminate_running_issue(state, issue.id, true, "tracker_terminal")
 
       !issue_routable_to_worker?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        terminate_running_issue(state, issue.id, false, "worker_route_removed")
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -363,7 +393,7 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        terminate_running_issue(state, issue.id, false, "tracker_non_active")
     end
   end
 
@@ -384,7 +414,7 @@ defmodule SymphonyElixir.Orchestrator do
         state_acc
       else
         log_missing_running_issue(state_acc, issue_id)
-        terminate_running_issue(state_acc, issue_id, false)
+        terminate_running_issue(state_acc, issue_id, false, "tracker_not_visible")
       end
     end)
   end
@@ -413,13 +443,19 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
+  defp terminate_running_issue(
+         %State{} = state,
+         issue_id,
+         cleanup_workspace,
+         terminal_reason
+       ) do
     case Map.get(state.running, issue_id) do
       nil ->
         release_issue_claim(state, issue_id)
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
+        state = record_run_event(state, running_entry, "run_stopped", "released", terminal_reason: terminal_reason)
         worker_host = Map.get(running_entry, :worker_host)
 
         if cleanup_workspace do
@@ -477,10 +513,11 @@ defmodule SymphonyElixir.Orchestrator do
       next_attempt = next_retry_attempt_from_running(running_entry)
 
       state
-      |> terminate_running_issue(issue_id, false)
+      |> terminate_running_issue(issue_id, false, "stall_timeout")
       |> schedule_issue_retry(issue_id, next_attempt, %{
         identifier: identifier,
-        error: "stalled for #{elapsed_ms}ms without codex activity"
+        error: "stalled for #{elapsed_ms}ms without codex activity",
+        previous_run_id: Map.get(running_entry, :run_id)
       })
     else
       state
@@ -525,7 +562,7 @@ defmodule SymphonyElixir.Orchestrator do
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
       if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
+        dispatch_issue(state_acc, issue, Map.get(state_acc.recovered_attempts, issue.id))
       else
         state_acc
       end
@@ -658,7 +695,7 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+  defp dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
@@ -692,53 +729,126 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    run_id = RunLedger.new_id("run")
+    normalized_attempt = normalize_retry_attempt(attempt)
+
+    claim_event = %{
+      transition: "run_claimed",
+      stage: "claimed",
+      run_id: run_id,
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      attempt: normalized_attempt,
+      worker_host: worker_host
+    }
+
+    case append_run_event(state, claim_event) do
+      :ok ->
+        start_issue_task(
+          state,
+          issue,
+          attempt,
+          recipient,
+          worker_host,
+          run_id,
+          normalized_attempt
+        )
+
+      {:error, reason} ->
+        Logger.error("Unable to record durable claim for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp start_issue_task(
+         state,
+         issue,
+         attempt,
+         recipient,
+         worker_host,
+         run_id,
+         normalized_attempt
+       ) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient,
+             attempt: attempt,
+             worker_host: worker_host,
+             run_id: run_id,
+             runner_generation: state.runner_generation,
+             stage: "running"
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
 
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
-        running =
-          Map.put(state.running, issue.id, %{
-            pid: pid,
-            ref: ref,
-            identifier: issue.identifier,
-            issue: issue,
-            worker_host: worker_host,
-            workspace_path: nil,
-            session_id: nil,
-            session_title: nil,
-            last_codex_message: nil,
-            last_codex_timestamp: nil,
-            last_codex_event: nil,
-            codex_app_server_pid: nil,
-            codex_input_tokens: 0,
-            codex_output_tokens: 0,
-            codex_total_tokens: 0,
-            codex_last_reported_input_tokens: 0,
-            codex_last_reported_output_tokens: 0,
-            codex_last_reported_total_tokens: 0,
-            turn_count: 0,
-            retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
-          })
-
-        %{
-          state
-          | running: running,
-            claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
+        running_entry = %{
+          run_id: run_id,
+          pid: pid,
+          ref: ref,
+          identifier: issue.identifier,
+          issue: issue,
+          worker_host: worker_host,
+          workspace_path: nil,
+          session_id: nil,
+          session_title: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          last_codex_event: nil,
+          codex_app_server_pid: nil,
+          codex_input_tokens: 0,
+          codex_output_tokens: 0,
+          codex_total_tokens: 0,
+          codex_last_reported_input_tokens: 0,
+          codex_last_reported_output_tokens: 0,
+          codex_last_reported_total_tokens: 0,
+          turn_count: 0,
+          retry_attempt: normalized_attempt,
+          started_at: DateTime.utc_now()
         }
+
+        case append_run_event(
+               state,
+               run_event(running_entry, "run_started", "running")
+             ) do
+          :ok ->
+            running = Map.put(state.running, issue.id, running_entry)
+
+            %{
+              state
+              | running: running,
+                claimed: MapSet.put(state.claimed, issue.id),
+                recovered_attempts: Map.delete(state.recovered_attempts, issue.id),
+                retry_attempts: Map.delete(state.retry_attempts, issue.id)
+            }
+
+          {:error, reason} ->
+            Logger.error("Unable to record durable run start for #{issue_context(issue)}: #{inspect(reason)}")
+            terminate_task(pid)
+            Process.demonitor(ref, [:flush])
+            state
+        end
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
-        schedule_issue_retry(state, issue.id, next_attempt, %{
+        failed_entry = %{
+          run_id: run_id,
+          identifier: issue.identifier,
+          issue: issue,
+          worker_host: worker_host,
+          workspace_path: nil,
+          retry_attempt: normalized_attempt
+        }
+
+        state
+        |> record_run_event(failed_entry, "run_failed", "released", terminal_reason: "spawn_failed")
+        |> schedule_issue_retry(issue.id, next_attempt, %{
           identifier: issue.identifier,
           error: "failed to spawn agent: #{inspect(reason)}",
+          previous_run_id: run_id,
           worker_host: worker_host
         })
     end
@@ -785,6 +895,9 @@ defmodule SymphonyElixir.Orchestrator do
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
 
+    previous_run_id =
+      Map.get(metadata, :previous_run_id) || Map.get(previous_retry, :previous_run_id)
+
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
     end
@@ -794,6 +907,20 @@ defmodule SymphonyElixir.Orchestrator do
     error_suffix = if is_binary(error), do: " error=#{error}", else: ""
 
     Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
+
+    log_run_event_result(
+      append_run_event(state, %{
+        transition: "retry_scheduled",
+        stage: "retry_queued",
+        run_id: previous_run_id,
+        issue_id: issue_id,
+        issue_identifier: identifier,
+        attempt: next_attempt,
+        worker_host: worker_host,
+        workspace_path: workspace_path
+      }),
+      issue_id
+    )
 
     %{
       state
@@ -805,6 +932,7 @@ defmodule SymphonyElixir.Orchestrator do
             due_at_ms: due_at_ms,
             identifier: identifier,
             error: error,
+            previous_run_id: previous_run_id,
             worker_host: worker_host,
             workspace_path: workspace_path
           })
@@ -817,6 +945,7 @@ defmodule SymphonyElixir.Orchestrator do
         metadata = %{
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
+          previous_run_id: Map.get(retry_entry, :previous_run_id),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path)
         }
@@ -972,6 +1101,12 @@ defmodule SymphonyElixir.Orchestrator do
     Map.put(running_entry, key, value)
   end
 
+  defp runtime_info_matches_run?(runtime_info, running_entry) do
+    incoming_run_id = Map.get(runtime_info, :run_id)
+    active_run_id = Map.get(running_entry, :run_id)
+    is_nil(incoming_run_id) or is_nil(active_run_id) or incoming_run_id == active_run_id
+  end
+
   defp select_worker_host(%State{} = state, preferred_worker_host) do
     case Config.settings!().worker.ssh_hosts do
       [] ->
@@ -1110,6 +1245,9 @@ defmodule SymphonyElixir.Orchestrator do
       |> Enum.map(fn {issue_id, metadata} ->
         %{
           issue_id: issue_id,
+          run_id: Map.get(metadata, :run_id),
+          attempt: Map.get(metadata, :retry_attempt, 0),
+          stage: "running",
           identifier: metadata.identifier,
           state: metadata.issue.state,
           worker_host: Map.get(metadata, :worker_host),
@@ -1134,7 +1272,9 @@ defmodule SymphonyElixir.Orchestrator do
       |> Enum.map(fn {issue_id, %{attempt: attempt, due_at_ms: due_at_ms} = retry} ->
         %{
           issue_id: issue_id,
+          run_id: Map.get(retry, :previous_run_id),
           attempt: attempt,
+          stage: "retry_queued",
           due_in_ms: max(0, due_at_ms - now_ms),
           identifier: Map.get(retry, :identifier),
           error: Map.get(retry, :error),
@@ -1145,6 +1285,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     {:reply,
      %{
+       runner_generation: state.runner_generation,
        running: running,
        retrying: retrying,
        codex_totals: state.codex_totals,
@@ -1283,6 +1424,51 @@ defmodule SymphonyElixir.Orchestrator do
     {Map.get(state.running, issue_id), %{state | running: Map.delete(state.running, issue_id)}}
   end
 
+  defp record_run_event(%State{} = state, running_entry, transition, stage, extra \\ [])
+       when is_map(running_entry) and is_binary(transition) and is_binary(stage) do
+    event = run_event(running_entry, transition, stage, extra)
+
+    case append_run_event(state, event) do
+      :ok ->
+        state
+
+      {:error, reason} ->
+        Logger.error("Failed to append Symphony run ledger event issue_id=#{event.issue_id}: #{inspect(reason)}")
+
+        state
+    end
+  end
+
+  defp run_event(running_entry, transition, stage, extra \\ []) do
+    issue = Map.get(running_entry, :issue)
+
+    %{
+      transition: transition,
+      stage: stage,
+      run_id: Map.get(running_entry, :run_id),
+      issue_id: if(is_map(issue), do: Map.get(issue, :id)),
+      issue_identifier: Map.get(running_entry, :identifier),
+      attempt: Map.get(running_entry, :retry_attempt, 0),
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      terminal_reason: Keyword.get(extra, :terminal_reason)
+    }
+  end
+
+  defp append_run_event(%State{run_ledger_path: nil}, _event), do: :ok
+
+  defp append_run_event(%State{} = state, event) when is_map(event) do
+    event = Map.put(event, :runner_generation, state.runner_generation)
+    RunLedger.append(state.run_ledger_path, event)
+  end
+
+  defp log_run_event_result(:ok, _issue_id), do: :ok
+
+  defp log_run_event_result({:error, reason}, issue_id) do
+    Logger.error("Failed to append Symphony retry ledger event issue_id=#{issue_id}: #{inspect(reason)}")
+    :ok
+  end
+
   defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
     runtime_seconds = running_seconds(running_entry.started_at, DateTime.utc_now())
 
@@ -1360,7 +1546,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp extract_token_delta(running_entry, %{event: _, timestamp: _} = update) do
-    running_entry = running_entry || %{}
     usage = extract_token_usage(update)
 
     {
