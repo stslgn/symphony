@@ -135,7 +135,10 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, opts, 1, _max_turns) do
+    [AppServer.session_title(issue), "\n\n", PromptBuilder.build_prompt(issue, opts)]
+    |> IO.iodata_to_binary()
+  end
 
   defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
     """

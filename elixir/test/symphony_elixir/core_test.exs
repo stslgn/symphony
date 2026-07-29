@@ -1454,6 +1454,7 @@ defmodule SymphonyElixir.CoreTest do
         end)
 
       assert length(turn_texts) == 2
+      assert String.starts_with?(Enum.at(turn_texts, 0), "Symphony - MT-247 - Continue until done")
       assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
