@@ -23,7 +23,10 @@ defmodule SymphonyElixir.Config do
   @type codex_runtime_settings :: %{
           approval_policy: String.t() | map(),
           thread_sandbox: String.t(),
-          turn_sandbox_policy: map()
+          turn_sandbox_policy: map(),
+          dynamic_tool_allowlist: [String.t()],
+          mcp_tool_auto_approve_allowlist: [String.t()],
+          mcp_elicitation_auto_approve_allowlist: [String.t()]
         }
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
@@ -108,7 +111,10 @@ defmodule SymphonyElixir.Config do
          %{
            approval_policy: settings.codex.approval_policy,
            thread_sandbox: settings.codex.thread_sandbox,
-           turn_sandbox_policy: turn_sandbox_policy
+           turn_sandbox_policy: turn_sandbox_policy,
+           dynamic_tool_allowlist: settings.codex.dynamic_tool_allowlist,
+           mcp_tool_auto_approve_allowlist: settings.codex.mcp_tool_auto_approve_allowlist,
+           mcp_elicitation_auto_approve_allowlist: settings.codex.mcp_elicitation_auto_approve_allowlist
          }}
       end
     end

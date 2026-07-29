@@ -156,6 +156,8 @@ defmodule SymphonyElixir.Config.Schema do
     import Ecto.Changeset
 
     @primary_key false
+    @supported_dynamic_tools ["linear_graphql"]
+
     embedded_schema do
       field(:command, :string, default: "codex app-server")
 
@@ -171,6 +173,9 @@ defmodule SymphonyElixir.Config.Schema do
 
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
+      field(:dynamic_tool_allowlist, {:array, :string}, default: [])
+      field(:mcp_tool_auto_approve_allowlist, {:array, :string}, default: [])
+      field(:mcp_elicitation_auto_approve_allowlist, {:array, :string}, default: [])
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
@@ -186,6 +191,9 @@ defmodule SymphonyElixir.Config.Schema do
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
+          :dynamic_tool_allowlist,
+          :mcp_tool_auto_approve_allowlist,
+          :mcp_elicitation_auto_approve_allowlist,
           :turn_timeout_ms,
           :read_timeout_ms,
           :stall_timeout_ms
@@ -193,9 +201,58 @@ defmodule SymphonyElixir.Config.Schema do
         empty_values: []
       )
       |> validate_required([:command])
+      |> update_change(:dynamic_tool_allowlist, &normalize_allowlist/1)
+      |> update_change(
+        :mcp_tool_auto_approve_allowlist,
+        &normalize_mcp_tool_allowlist/1
+      )
+      |> update_change(:mcp_elicitation_auto_approve_allowlist, &normalize_allowlist/1)
+      |> validate_subset(:dynamic_tool_allowlist, @supported_dynamic_tools)
+      |> validate_change(
+        :mcp_tool_auto_approve_allowlist,
+        &validate_mcp_tool_allowlist/2
+      )
+      |> validate_change(
+        :mcp_elicitation_auto_approve_allowlist,
+        &validate_non_blank_allowlist/2
+      )
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+
+    defp normalize_allowlist(values) when is_list(values) do
+      values
+      |> Enum.map(&String.trim/1)
+      |> Enum.uniq()
+    end
+
+    defp normalize_mcp_tool_allowlist(values) when is_list(values) do
+      values
+      |> Enum.map(fn value ->
+        case String.split(value, "/", parts: 2) do
+          [server, tool] -> "#{String.trim(server)}/#{String.trim(tool)}"
+          _ -> String.trim(value)
+        end
+      end)
+      |> Enum.uniq()
+    end
+
+    defp validate_mcp_tool_allowlist(field, values) do
+      Enum.flat_map(values, fn value ->
+        case String.split(value, "/", parts: 2) do
+          [server, tool] when server != "" and tool != "" -> []
+          _ -> [{field, "entries must use non-blank server/tool identities"}]
+        end
+      end)
+    end
+
+    defp validate_non_blank_allowlist(field, values) do
+      if Enum.any?(values, &(&1 == "")) do
+        [{field, "entries must not be blank"}]
+      else
+        []
+      end
     end
   end
 

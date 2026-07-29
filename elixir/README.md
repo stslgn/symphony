@@ -165,8 +165,20 @@ hooks:
     git clone --depth 1 "$SOURCE_REPO_URL" .
 codex:
   command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
+  dynamic_tool_allowlist:
+    - linear_graphql
+  mcp_tool_auto_approve_allowlist: []
+  mcp_elicitation_auto_approve_allowlist: []
 ```
 
+- All capability allowlists default to empty. Symphony advertises and executes
+  only client-side dynamic tools in `dynamic_tool_allowlist`.
+- MCP auto-approval is independent of `approval_policy`: tool approvals require
+  an exact `server/tool` entry and elicitation approvals require an exact server
+  entry. Missing or malformed identities are denied or declined.
+- These MCP checks cover Symphony-mediated non-interactive approval responses;
+  MCP servers configured directly in Codex and host/network isolation remain
+  separate boundaries.
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
@@ -182,6 +194,8 @@ The observability UI now runs on a minimal Phoenix stack:
 - `/api/v1/state` exposes separate `running`, `retrying`, and `parked` lists;
   parked rows include the stable wait id, typed reason, allowed actions, and
   issue/run identity.
+- The same state payload exposes the effective capability allowlist names, but
+  never credentials, tool arguments, prompts, or response bodies.
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 

@@ -23,6 +23,12 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           parked: Enum.map(parked, &parked_entry_payload/1),
+          capabilities:
+            Map.get(snapshot, :capabilities, %{
+              dynamic_tools: [],
+              mcp_tool_auto_approve: [],
+              mcp_elicitation_auto_approve: []
+            }),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }

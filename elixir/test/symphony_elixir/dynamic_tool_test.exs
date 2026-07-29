@@ -21,6 +21,23 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert description =~ "Linear"
     assert description =~ "slugId"
+    assert DynamicTool.supported_tool_names() == ["linear_graphql"]
+    assert DynamicTool.tool_specs([]) == []
+  end
+
+  test "capability denials return a bounded failure without tool arguments" do
+    response = DynamicTool.denied_response("linear_graphql", [])
+
+    assert response["success"] == false
+    assert response["symphonyBoundary"] == "dynamic_tool_allowlist"
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => ~s(Dynamic tool denied by Symphony capability policy: "linear_graphql".),
+               "allowedTools" => []
+             },
+             "symphonyBoundary" => "dynamic_tool_allowlist"
+           }
   end
 
   test "unsupported tools return a failure payload with the supported tool list" do

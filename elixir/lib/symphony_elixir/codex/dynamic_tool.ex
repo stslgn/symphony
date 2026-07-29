@@ -47,15 +47,32 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  @spec tool_specs() :: [map()]
-  def tool_specs do
-    [
+  @spec denied_response(term(), [String.t()]) :: map()
+  def denied_response(tool, allowed_tools) when is_list(allowed_tools) do
+    failure_response(%{
+      "error" => %{
+        "message" => "Dynamic tool denied by Symphony capability policy: #{inspect(tool)}.",
+        "allowedTools" => allowed_tools
+      },
+      "symphonyBoundary" => "dynamic_tool_allowlist"
+    })
+    |> Map.put("symphonyBoundary", "dynamic_tool_allowlist")
+  end
+
+  @spec supported_tool_names() :: [String.t()]
+  def supported_tool_names, do: [@linear_graphql_tool]
+
+  @spec tool_specs([String.t()]) :: [map()]
+  def tool_specs(allowed_tools \\ supported_tool_names()) when is_list(allowed_tools) do
+    specs = [
       %{
         "name" => @linear_graphql_tool,
         "description" => @linear_graphql_description,
         "inputSchema" => @linear_graphql_input_schema
       }
     ]
+
+    Enum.filter(specs, &(Map.fetch!(&1, "name") in allowed_tools))
   end
 
   defp execute_linear_graphql(arguments, opts) do
@@ -249,9 +266,5 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "reason" => inspect(reason)
       }
     }
-  end
-
-  defp supported_tool_names do
-    Enum.map(tool_specs(), & &1["name"])
   end
 end

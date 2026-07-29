@@ -171,7 +171,7 @@ defmodule SymphonyElixir.RunLedgerTest do
   defp ledger_path do
     Path.join(
       System.tmp_dir!(),
-      "symphony-run-ledger-#{System.unique_integer([:positive])}/events.jsonl"
+      "symphony-run-ledger-#{RunLedger.new_id("test")}/events.jsonl"
     )
   end
 end

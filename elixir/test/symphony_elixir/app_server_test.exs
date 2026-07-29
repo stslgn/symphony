@@ -526,6 +526,9 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{\"id\":110,\"method\":\"item/tool/requestUserInput\",\"params\":{\"itemId\":\"call-717\",\"questions\":[{\"header\":\"Approve app tool call?\",\"id\":\"mcp_tool_call_approval_call-717\",\"isOther\":false,\"isSecret\":false,\"options\":[{\"description\":\"Run the tool and continue.\",\"label\":\"Approve Once\"},{\"description\":\"Run the tool and remember this choice for this session.\",\"label\":\"Approve this Session\"},{\"description\":\"Decline this tool call and continue.\",\"label\":\"Deny\"},{\"description\":\"Cancel this tool call\",\"label\":\"Cancel\"}],\"question\":\"The linear MCP server wants to run the tool \\\"Save issue\\\", which may modify or delete data. Allow this action?\"}],\"threadId\":\"thread-717\",\"turnId\":\"turn-717\"}}'
             ;;
           5)
+            printf '%s\\n' '{\"id\":111,\"method\":\"item/tool/requestUserInput\",\"params\":{\"itemId\":\"call-718\",\"questions\":[{\"header\":\"Approve app tool call?\",\"id\":\"mcp_tool_call_approval_call-718\",\"isOther\":false,\"isSecret\":false,\"options\":[{\"description\":\"Run the tool and continue.\",\"label\":\"Approve Once\"},{\"description\":\"Run the tool and remember this choice for this session.\",\"label\":\"Approve this Session\"},{\"description\":\"Decline this tool call and continue.\",\"label\":\"Deny\"},{\"description\":\"Cancel this tool call\",\"label\":\"Cancel\"}],\"question\":\"The github MCP server wants to run the tool \\\"merge_pull_request\\\", which may modify data. Allow this action?\"}],\"threadId\":\"thread-717\",\"turnId\":\"turn-717\"}}'
+            ;;
+          6)
             printf '%s\\n' '{\"method\":\"turn/completed\"}'
             exit 0
             ;;
@@ -541,7 +544,8 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         codex_command: "#{codex_binary} app-server",
-        codex_approval_policy: "never"
+        codex_approval_policy: "never",
+        codex_mcp_tool_auto_approve_allowlist: ["linear/Save issue"]
       )
 
       issue = %Issue{
@@ -569,6 +573,21 @@ defmodule SymphonyElixir.AppServerTest do
                  payload["id"] == 110 and
                    get_in(payload, ["result", "answers", "mcp_tool_call_approval_call-717", "answers"]) ==
                      ["Approve this Session"]
+               else
+                 false
+               end
+             end)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload =
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+
+                 payload["id"] == 111 and
+                   get_in(payload, ["result", "answers", "mcp_tool_call_approval_call-718", "answers"]) ==
+                     ["Deny"]
                else
                  false
                end
@@ -628,6 +647,9 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":114,"method":"mcpServer/elicitation/request","params":{"serverName":"linear","threadId":"thread-720","turnId":"turn-720","mode":"form","message":"Provide arbitrary input","requestedSchema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}}'
             ;;
           6)
+            printf '%s\\n' '{"id":115,"method":"mcpServer/elicitation/request","params":{"serverName":"github","threadId":"thread-720","turnId":"turn-720","mode":"form","message":"Allow the GitHub write?","requestedSchema":{"type":"object","properties":{}},"_meta":{"codex_approval_kind":"mcp_tool_call"}}}'
+            ;;
+          7)
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -644,6 +666,7 @@ defmodule SymphonyElixir.AppServerTest do
         workspace_root: workspace_root,
         codex_command: "#{codex_binary} app-server",
         codex_approval_policy: "never",
+        codex_mcp_elicitation_auto_approve_allowlist: ["linear"],
         codex_turn_timeout_ms: 100
       )
 
@@ -678,6 +701,10 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert Enum.any?(responses, fn payload ->
                payload["id"] == 114 and get_in(payload, ["result", "action"]) == "decline"
+             end)
+
+      assert Enum.any?(responses, fn payload ->
+               payload["id"] == 115 and get_in(payload, ["result", "action"]) == "decline"
              end)
     after
       File.rm_rf(test_root)
@@ -860,7 +887,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server rejects unsupported dynamic tool calls without stalling" do
+  test "app server denies unallowlisted dynamic tool calls without stalling" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -921,7 +948,8 @@ defmodule SymphonyElixir.AppServerTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        codex_command: "#{codex_binary} app-server"
+        codex_command: "#{codex_binary} app-server",
+        codex_dynamic_tool_allowlist: []
       )
 
       issue = %Issue{
@@ -950,8 +978,17 @@ defmodule SymphonyElixir.AppServerTest do
                    get_in(payload, ["result", "success"]) == false and
                    String.contains?(
                      get_in(payload, ["result", "output"]),
-                     "Unsupported dynamic tool"
+                     "denied by Symphony capability policy"
                    )
+               else
+                 false
+               end
+             end)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload = line |> String.trim_leading("JSON:") |> Jason.decode!()
+                 payload["id"] == 2 and get_in(payload, ["params", "dynamicTools"]) == []
                else
                  false
                end

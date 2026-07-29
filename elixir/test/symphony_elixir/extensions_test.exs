@@ -343,6 +343,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
              "counts" => %{"running" => 1, "retrying" => 1, "parked" => 1},
+             "capabilities" => %{
+               "dynamic_tools" => ["linear_graphql"],
+               "mcp_tool_auto_approve" => [],
+               "mcp_elicitation_auto_approve" => []
+             },
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -754,6 +759,11 @@ defmodule SymphonyElixir.ExtensionsTest do
           parked_at: DateTime.utc_now()
         }
       ],
+      capabilities: %{
+        dynamic_tools: ["linear_graphql"],
+        mcp_tool_auto_approve: [],
+        mcp_elicitation_auto_approve: []
+      },
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }

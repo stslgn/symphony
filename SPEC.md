@@ -477,6 +477,13 @@ fields locally if they want stricter startup checks.
   - Default: implementation-defined.
 - `turn_sandbox_policy` (Codex `SandboxPolicy` value)
   - Default: implementation-defined.
+- `dynamic_tool_allowlist` (list of exact registered client-side tool names)
+  - Default: empty list.
+  - Unknown tool names MUST fail workflow validation.
+- `mcp_tool_auto_approve_allowlist` (list of exact `server/tool` identities)
+  - Default: empty list.
+- `mcp_elicitation_auto_approve_allowlist` (list of exact MCP server names)
+  - Default: empty list.
 - `turn_timeout_ms` (integer)
   - Default: `3600000` (1 hour)
 - `read_timeout_ms` (integer)
@@ -625,6 +632,9 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
+- `codex.dynamic_tool_allowlist`: list of registered names, default `[]`
+- `codex.mcp_tool_auto_approve_allowlist`: list of `server/tool` identities, default `[]`
+- `codex.mcp_elicitation_auto_approve_allowlist`: list of server names, default `[]`
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
@@ -1066,6 +1076,7 @@ Important emitted events include, for example:
 - `turn_ended_with_error`
 - `turn_input_required`
 - `approval_auto_approved`
+- `capability_denied`
 - `unsupported_tool_call`
 - `notification`
 - `other_message`
@@ -1091,11 +1102,25 @@ Example high-trust behavior:
 
 Unsupported dynamic tool calls:
 
-- Supported dynamic tool calls that are explicitly implemented and advertised by the runtime SHOULD
-  be handled according to their extension contract.
+- Only tools present in the effective workflow allowlist are advertised.
+- Every incoming dynamic tool call MUST be checked against the same allowlist again immediately
+  before execution.
+- Supported dynamic tool calls that are explicitly implemented, allowlisted, and advertised by the
+  runtime SHOULD be handled according to their extension contract.
 - If the agent requests a dynamic tool call that is not supported, return a tool failure response
   using the targeted protocol and continue the session.
+- If the agent requests a supported but non-allowlisted tool, return a bounded capability-denied
+  failure without executing the tool.
 - This prevents the session from stalling on unsupported tool execution paths.
+
+MCP non-interactive approval:
+
+- A general Codex approval policy such as `never` does not grant an MCP capability by itself.
+- MCP tool approval requires an exact normalized `server/tool` allowlist match.
+- MCP elicitation approval requires an exact normalized server allowlist match.
+- Missing, malformed, unparseable, or non-matching identities MUST be denied or declined.
+- These checks govern Symphony-mediated approval responses. They do not disable MCP servers
+  configured directly in Codex or replace host/network isolation.
 
 Optional client-side tool extension:
 
@@ -1335,6 +1360,7 @@ SHOULD return:
 - each running row SHOULD include `turn_count`
 - `retrying` (list of retry queue rows)
 - `parked` (list of typed operator waits)
+- `capabilities` (effective allowlist names only; no credentials, arguments, prompts, or results)
 - `codex_totals`
   - `input_tokens`
   - `output_tokens`
@@ -1745,6 +1771,8 @@ Possible hardening measures include:
   intended project scope, rather than exposing general workspace-wide tracker access.
 - Reducing the set of client-side tools, credentials, filesystem paths, and network destinations
   available to the agent to the minimum needed for the workflow.
+- Keeping all Symphony capability and MCP auto-approval allowlists empty unless the workflow has an
+  explicit, reviewed need for the exact identity.
 
 The correct controls are deployment-specific, but implementations SHOULD document them clearly and
 treat harness hardening as part of the core safety model rather than an optional afterthought.
@@ -2089,6 +2117,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - For stdio-based transports, diagnostic stderr handling is kept separate from the protocol stream
 - Command/file-change approvals are handled according to the implementation's documented policy
 - Unsupported dynamic tool calls are rejected without stalling the session
+- Supported but non-allowlisted dynamic tool calls are denied without invoking the executor
+- Only allowlisted dynamic tool specs are advertised at thread startup
+- MCP tool and elicitation auto-approvals require exact allowlist matches even under `never`
 - User input requests are handled according to the implementation's documented policy and do not
   stall indefinitely
 - Usage and rate-limit telemetry exposed by the targeted protocol is extracted

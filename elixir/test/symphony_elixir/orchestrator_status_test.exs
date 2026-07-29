@@ -1494,6 +1494,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       }
     }
 
+    denied = %{
+      event: :capability_denied,
+      message: %{
+        payload: %{"method" => "item/tool/call", "params" => %{"tool" => "linear_graphql"}}
+      }
+    }
+
     assert StatusDashboard.humanize_codex_message(completed) =~
              "dynamic tool call completed (linear_graphql)"
 
@@ -1502,6 +1509,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert StatusDashboard.humanize_codex_message(unsupported) =~
              "unsupported dynamic tool call rejected (unknown_tool)"
+
+    assert StatusDashboard.humanize_codex_message(denied) =~
+             "capability denied by Symphony policy (linear_graphql)"
   end
 
   test "status dashboard unwraps nested codex payload envelopes" do

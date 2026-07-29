@@ -1471,6 +1471,7 @@ defmodule SymphonyElixir.Orchestrator do
     {:reply,
      %{
        runner_generation: state.runner_generation,
+       capabilities: capability_snapshot(),
        running: running,
        retrying: retrying,
        parked: parked,
@@ -1497,6 +1498,16 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  defp capability_snapshot do
+    codex = Config.settings!().codex
+
+    %{
+      dynamic_tools: codex.dynamic_tool_allowlist,
+      mcp_tool_auto_approve: codex.mcp_tool_auto_approve_allowlist,
+      mcp_elicitation_auto_approve: codex.mcp_elicitation_auto_approve_allowlist
+    }
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
