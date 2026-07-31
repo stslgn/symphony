@@ -6,7 +6,10 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.Linear.Webhook
   alias SymphonyElixirWeb.{Endpoint, Presenter}
+  alias SymphonyElixirWeb.RawBodyReader
 
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
@@ -37,6 +40,20 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec linear_webhook(Conn.t(), map()) :: Conn.t()
+  def linear_webhook(conn, params) do
+    with {:ok, secret} <- configured_webhook_secret(),
+         {:ok, raw_body} <- RawBodyReader.fetch_raw_body(conn) do
+      verify_linear_webhook(conn, params, raw_body, secret)
+    else
+      {:error, :webhook_not_configured} ->
+        error_response(conn, 503, "webhook_not_configured", "Webhook is not configured")
+
+      {:error, :raw_body_unavailable} ->
+        error_response(conn, 400, "invalid_webhook", "Invalid webhook")
+    end
+  end
+
   @spec method_not_allowed(Conn.t(), map()) :: Conn.t()
   def method_not_allowed(conn, _params) do
     error_response(conn, 405, "method_not_allowed", "Method not allowed")
@@ -52,6 +69,52 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     |> put_status(status)
     |> json(%{error: %{code: code, message: message}})
   end
+
+  defp verify_linear_webhook(conn, params, raw_body, secret) do
+    verification =
+      Webhook.verify(
+        raw_body,
+        request_header(conn, "linear-signature"),
+        request_header(conn, "linear-delivery"),
+        request_header(conn, "linear-event"),
+        params,
+        secret,
+        System.system_time(:millisecond)
+      )
+
+    case verification do
+      {:ok, _event} ->
+        wake_from_linear_webhook(conn)
+
+      {:ignore, :unsupported_event} ->
+        json(conn, %{accepted: true, ignored: true, reason: "unsupported_event"})
+
+      {:error, _reason} ->
+        error_response(conn, 401, "invalid_webhook", "Invalid webhook")
+    end
+  end
+
+  defp wake_from_linear_webhook(conn) do
+    case Presenter.refresh_payload(orchestrator()) do
+      {:ok, payload} ->
+        json(conn, Map.merge(payload, %{accepted: true, source: "linear_webhook"}))
+
+      {:error, :unavailable} ->
+        error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+    end
+  end
+
+  defp configured_webhook_secret do
+    case Config.settings() do
+      {:ok, %{tracker: %{webhook_secret: secret}}} when is_binary(secret) and byte_size(secret) > 0 ->
+        {:ok, secret}
+
+      _other ->
+        {:error, :webhook_not_configured}
+    end
+  end
+
+  defp request_header(conn, name), do: conn |> Conn.get_req_header(name) |> List.first()
 
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator

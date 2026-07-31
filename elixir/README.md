@@ -13,7 +13,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls Linear for candidate work
+1. Polls Linear for candidate work and can accept verified Linear webhooks as immediate wake-up hints
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
@@ -111,6 +111,7 @@ Minimal example:
 ---
 tracker:
   kind: linear
+  webhook_secret: $LINEAR_WEBHOOK_SECRET
   project_slug: "..."
 workspace:
   root: ~/code/workspaces
@@ -162,6 +163,9 @@ Notes:
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+- `tracker.webhook_secret` accepts only an environment reference such as
+  `$LINEAR_WEBHOOK_SECRET`. When omitted, it reads the canonical `LINEAR_WEBHOOK_SECRET`; without a
+  resolved value the webhook endpoint fails closed.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -170,6 +174,7 @@ Notes:
 ```yaml
 tracker:
   api_key: $LINEAR_API_KEY
+  webhook_secret: $LINEAR_WEBHOOK_SECRET
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:
@@ -195,7 +200,20 @@ codex:
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, `/api/v1/refresh`, and
+  `/api/v1/webhooks/linear`.
+
+### Linear webhook wake-up
+
+When both the HTTP server and `tracker.webhook_secret` are configured, point a Linear Issue webhook
+at `https://<public-host>/api/v1/webhooks/linear`. Linear requires a public HTTPS URL; place Symphony
+behind an HTTPS reverse proxy rather than exposing the local observability server directly.
+
+The endpoint verifies the HMAC-SHA256 signature over the exact raw body, delivery UUID, event
+identity, and a 60-second timestamp window. A valid Issue event only queues the normal serialized
+poll/reconcile cycle. Symphony then re-fetches Linear and uses existing running, claimed, parked,
+concurrency, and dispatch-revalidation guards. Duplicate or out-of-order deliveries therefore do not
+directly create transitions, and fixed polling remains the fallback for lost webhook delivery.
 
 ## Web dashboard
 

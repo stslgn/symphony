@@ -46,6 +46,8 @@ Important boundary:
 ### 2.1 Goals
 
 - Poll the issue tracker on a fixed cadence and dispatch work with bounded concurrency.
+- Optionally accept authenticated tracker webhooks as low-latency wake-up hints while retaining
+  fixed polling as the recovery path.
 - Maintain a single authoritative orchestrator state for dispatch, retries, and reconciliation.
 - Create deterministic per-issue workspaces and preserve them across runs.
 - Stop active runs when issue state changes make them ineligible.
@@ -394,6 +396,11 @@ Fields:
   - MAY be a literal token or `$VAR_NAME`.
   - Canonical environment variable for `tracker.kind == "linear"`: `LINEAR_API_KEY`.
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
+- `webhook_secret` (string, OPTIONAL)
+  - MUST be `$VAR_NAME`; when omitted, the canonical environment variable is
+    `LINEAR_WEBHOOK_SECRET`.
+  - Enables authenticated Linear webhook wake-up when the HTTP server is also enabled.
+  - MUST NOT be exposed in logs, status, ledger events, or API responses.
 - `project_slug` (string)
   - REQUIRED for dispatch when `tracker.kind == "linear"`.
 - `active_states` (list of strings)
@@ -634,6 +641,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.kind`: string, REQUIRED, currently `linear`
 - `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
 - `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
+- `tracker.webhook_secret`: optional `$VAR`; when omitted, canonical env `LINEAR_WEBHOOK_SECRET`
 - `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
@@ -795,6 +803,12 @@ Tick sequence:
 
 If per-tick validation fails, dispatch is skipped for that tick, but reconciliation still happens
 first.
+
+Webhook wake-up is an optional latency optimization. A verified webhook MUST only queue or coalesce
+this same poll/reconcile cycle. Payload fields MUST NOT directly dispatch, stop, retry, park, release,
+or otherwise mutate orchestrator state. Canonical tracker state is re-fetched before any transition,
+so duplicate or out-of-order deliveries remain safe. Fixed polling remains enabled to recover from
+lost deliveries.
 
 ### 8.2 Candidate Selection Rules
 
@@ -1636,6 +1650,18 @@ Minimum endpoints:
       "operations": ["poll", "reconcile"]
     }
     ```
+
+- `POST /api/v1/webhooks/linear`
+  - Requires `tracker.webhook_secret` and the standard Linear headers.
+  - Verifies `Linear-Signature` as hex HMAC-SHA256 over the exact raw body using a constant-time
+    comparison.
+  - Requires a UUID `Linear-Delivery`, matching body/header event identity, and a signed
+    `webhookTimestamp` within 60 seconds of local time.
+  - A verified `Issue` delivery queues or coalesces the same poll/reconcile cycle as `/refresh` and
+    responds `200 OK` without echoing the request body.
+  - A verified non-Issue delivery is acknowledged with `200 OK` and ignored.
+  - Missing configuration returns `503`; missing, malformed, stale, or invalid authentication fails
+    closed and MUST NOT wake the orchestrator.
 
 API design notes:
 

@@ -6,6 +6,7 @@ defmodule SymphonyElixir.CoreTest do
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
+      tracker_webhook_secret: nil,
       tracker_project_slug: nil,
       poll_interval_ms: nil,
       tracker_active_states: nil,
@@ -21,12 +22,32 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
+    assert config.tracker.webhook_secret == nil
     assert config.agent.max_turns == 20
     assert config.agent.max_run_tokens == nil
     assert config.agent.max_run_seconds == nil
     assert config.codex.dynamic_tool_allowlist == []
     assert config.codex.mcp_tool_auto_approve_allowlist == []
     assert config.codex.mcp_elicitation_auto_approve_allowlist == []
+
+    webhook_env = "SYMPHONY_TEST_LINEAR_WEBHOOK_SECRET"
+    previous_webhook_env = System.get_env(webhook_env)
+    System.put_env(webhook_env, "synthetic-env-webhook-secret")
+    on_exit(fn -> restore_env(webhook_env, previous_webhook_env) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_webhook_secret: "$#{webhook_env}"
+    )
+
+    assert Config.settings!().tracker.webhook_secret == "synthetic-env-webhook-secret"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_webhook_secret: "plaintext-webhook-secret"
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "tracker.webhook_secret"
+    assert message =~ "must be an environment reference"
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -1111,6 +1132,8 @@ defmodule SymphonyElixir.CoreTest do
       poll_check_in_progress: false,
       tick_timer_ref: nil,
       tick_token: stale_tick_token,
+      running: %{"issue-existing" => %{run_id: "run-existing"}},
+      claimed: MapSet.new(["issue-existing"]),
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
       codex_rate_limits: nil
     }
@@ -1122,11 +1145,15 @@ defmodule SymphonyElixir.CoreTest do
     assert is_reference(refreshed_state.tick_token)
     refute refreshed_state.tick_token == stale_tick_token
     assert refreshed_state.next_poll_due_at_ms <= System.monotonic_time(:millisecond)
+    assert refreshed_state.running == state.running
+    assert refreshed_state.claimed == state.claimed
 
     assert {:reply, %{queued: true, coalesced: true}, coalesced_state} =
              Orchestrator.handle_call(:request_refresh, {self(), make_ref()}, refreshed_state)
 
     assert coalesced_state.tick_token == refreshed_state.tick_token
+    assert coalesced_state.running == state.running
+    assert coalesced_state.claimed == state.claimed
     assert {:noreply, ^coalesced_state} = Orchestrator.handle_info({:tick, stale_tick_token}, coalesced_state)
   end
 

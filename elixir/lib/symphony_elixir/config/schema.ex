@@ -48,6 +48,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:kind, :string)
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
       field(:api_key, :string)
+      field(:webhook_secret, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
@@ -59,9 +60,19 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :webhook_secret,
+          :project_slug,
+          :assignee,
+          :active_states,
+          :terminal_states
+        ],
         empty_values: []
       )
+      |> validate_format(:webhook_secret, ~r/^\$[A-Za-z_][A-Za-z0-9_]*$/, message: "must be an environment reference such as $LINEAR_WEBHOOK_SECRET")
     end
   end
 
@@ -437,6 +448,11 @@ defmodule SymphonyElixir.Config.Schema do
     tracker = %{
       settings.tracker
       | api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
+        webhook_secret:
+          resolve_environment_secret(
+            settings.tracker.webhook_secret,
+            System.get_env("LINEAR_WEBHOOK_SECRET")
+          ),
         assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
     }
 
@@ -488,6 +504,14 @@ defmodule SymphonyElixir.Config.Schema do
       resolved when is_binary(resolved) -> normalize_secret_value(resolved)
       resolved -> resolved
     end
+  end
+
+  defp resolve_environment_secret(nil, fallback), do: normalize_secret_value(fallback)
+
+  defp resolve_environment_secret("$" <> env_name, _fallback) do
+    env_name
+    |> System.get_env()
+    |> normalize_secret_value()
   end
 
   defp resolve_path_value(value, default) when is_binary(value) do

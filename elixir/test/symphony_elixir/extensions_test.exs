@@ -73,6 +73,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
 
     def handle_call(:request_refresh, _from, state) do
+      if recipient = Keyword.get(state, :refresh_recipient) do
+        send(recipient, :refresh_requested)
+      end
+
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
   end
@@ -492,6 +496,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert json_response(get(build_conn(), "/api/v1/refresh"), 405) ==
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
+    assert json_response(get(build_conn(), "/api/v1/webhooks/linear"), 405) ==
+             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+
     assert json_response(post(build_conn(), "/", %{}), 405) ==
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
@@ -516,6 +523,117 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "message" => "Orchestrator is unavailable"
                }
              }
+  end
+
+  test "verified Linear Issue webhook wakes reconcile without forwarding payload" do
+    webhook_secret = "synthetic-webhook-secret"
+    configure_webhook_secret(webhook_secret)
+
+    orchestrator_name = Module.concat(__MODULE__, :WebhookOrchestrator)
+
+    refresh = %{
+      queued: true,
+      coalesced: false,
+      requested_at: DateTime.utc_now(),
+      operations: ["poll", "reconcile"]
+    }
+
+    orchestrator_opts = [
+      name: orchestrator_name,
+      snapshot: static_snapshot(),
+      refresh: refresh,
+      refresh_recipient: self()
+    ]
+
+    start_supervised!({StaticOrchestrator, orchestrator_opts})
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    body = linear_webhook_body("Issue", System.system_time(:millisecond), "update")
+    conn = post_linear_webhook(body, webhook_secret, event: "Issue")
+
+    assert %{
+             "accepted" => true,
+             "coalesced" => false,
+             "operations" => ["poll", "reconcile"],
+             "queued" => true,
+             "source" => "linear_webhook"
+           } = json_response(conn, 200)
+
+    assert_receive :refresh_requested
+  end
+
+  test "Linear webhook rejects invalid authentication and stale timestamps before wake-up" do
+    webhook_secret = "synthetic-webhook-secret"
+    configure_webhook_secret(webhook_secret)
+
+    orchestrator_name = Module.concat(__MODULE__, :RejectedWebhookOrchestrator)
+
+    start_supervised!(
+      {StaticOrchestrator,
+       name: orchestrator_name,
+       snapshot: static_snapshot(),
+       refresh: %{
+         queued: true,
+         coalesced: false,
+         requested_at: DateTime.utc_now(),
+         operations: ["poll", "reconcile"]
+       },
+       refresh_recipient: self()}
+    )
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    current_body = linear_webhook_body("Issue", System.system_time(:millisecond), "update")
+    invalid_signature = post_linear_webhook(current_body, "wrong-secret", event: "Issue")
+
+    assert json_response(invalid_signature, 401)["error"]["code"] == "invalid_webhook"
+    refute_receive :refresh_requested
+
+    stale_body = linear_webhook_body("Issue", System.system_time(:millisecond) - 61_000, "update")
+    stale = post_linear_webhook(stale_body, webhook_secret, event: "Issue")
+
+    assert json_response(stale, 401)["error"]["code"] == "invalid_webhook"
+    refute_receive :refresh_requested
+  end
+
+  test "verified non-Issue webhook is acknowledged without wake-up" do
+    webhook_secret = "synthetic-webhook-secret"
+    configure_webhook_secret(webhook_secret)
+
+    orchestrator_name = Module.concat(__MODULE__, :IgnoredWebhookOrchestrator)
+
+    orchestrator_opts = [
+      name: orchestrator_name,
+      snapshot: static_snapshot(),
+      refresh: :unavailable,
+      refresh_recipient: self()
+    ]
+
+    start_supervised!({StaticOrchestrator, orchestrator_opts})
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    body = linear_webhook_body("Comment", System.system_time(:millisecond), "create")
+    conn = post_linear_webhook(body, webhook_secret, event: "Comment")
+
+    assert json_response(conn, 200) == %{
+             "accepted" => true,
+             "ignored" => true,
+             "reason" => "unsupported_event"
+           }
+
+    refute_receive :refresh_requested
+  end
+
+  test "Linear webhook fails closed when its secret is not configured" do
+    configure_webhook_secret(nil)
+    start_test_endpoint(orchestrator: Module.concat(__MODULE__, :UnusedWebhookOrchestrator))
+
+    body = linear_webhook_body("Issue", System.system_time(:millisecond), "update")
+    conn = post_linear_webhook(body, "synthetic-webhook-secret", event: "Issue")
+
+    assert json_response(conn, 503)["error"]["code"] == "webhook_not_configured"
   end
 
   test "phoenix observability api preserves snapshot timeout behavior" do
@@ -807,6 +925,49 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     HttpServer.bound_port()
+  end
+
+  defp configure_webhook_secret(secret) do
+    webhook_env = "SYMPHONY_TEST_LINEAR_WEBHOOK_SECRET"
+    previous_webhook_env = System.get_env(webhook_env)
+    on_exit(fn -> restore_env(webhook_env, previous_webhook_env) end)
+
+    if secret do
+      System.put_env(webhook_env, secret)
+    else
+      System.delete_env(webhook_env)
+    end
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_webhook_secret: "$#{webhook_env}"
+    )
+
+    ensure_workflow_store_running()
+    send(WorkflowStore, :poll)
+
+    assert_eventually(fn ->
+      Config.settings!().tracker.webhook_secret == secret
+    end)
+  end
+
+  defp linear_webhook_body(type, timestamp, action) do
+    Jason.encode!(%{
+      "action" => action,
+      "data" => %{"id" => "issue-webhook"},
+      "type" => type,
+      "webhookTimestamp" => timestamp
+    })
+  end
+
+  defp post_linear_webhook(body, secret, opts) do
+    signature = :crypto.mac(:hmac, :sha256, secret, body) |> Base.encode16(case: :lower)
+
+    build_conn()
+    |> Plug.Conn.put_req_header("content-type", "application/json")
+    |> Plug.Conn.put_req_header("linear-delivery", "234d1a4e-b617-4388-90fe-adc3633d6b72")
+    |> Plug.Conn.put_req_header("linear-event", Keyword.fetch!(opts, :event))
+    |> Plug.Conn.put_req_header("linear-signature", signature)
+    |> post("/api/v1/webhooks/linear", body)
   end
 
   defp assert_eventually(fun, attempts \\ 20)

@@ -1,6 +1,7 @@
 ---
 tracker:
   kind: linear
+  webhook_secret: $LINEAR_WEBHOOK_SECRET
   project_slug: "symphony-0c79b11b75ea"
   active_states:
     - Todo
