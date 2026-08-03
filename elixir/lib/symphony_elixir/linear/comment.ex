@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Linear.Comment do
     :id,
     :body,
     :created_at,
+    :author_id,
     author_is_me: false,
     external_thread_type: nil
   ]
@@ -18,6 +19,7 @@ defmodule SymphonyElixir.Linear.Comment do
           id: String.t(),
           body: String.t() | nil,
           created_at: DateTime.t(),
+          author_id: String.t() | nil,
           author_is_me: boolean(),
           external_thread_type: String.t() | nil
         }

@@ -404,6 +404,11 @@ Fields:
     `LINEAR_WEBHOOK_SECRET`.
   - Enables authenticated Linear webhook wake-up when the HTTP server is also enabled.
   - MUST NOT be exposed in logs, status, ledger events, or API responses.
+- `operator_user_ids` (list of strings, default `[]`)
+  - Exact Linear user IDs authorized to submit bounded operator comment commands.
+  - Empty disables comment commands.
+  - The identity associated with `tracker.api_key` MUST remain rejected even if listed, because a
+    worker can publish comments through the same credential.
 - `project_slug` (string)
   - REQUIRED for dispatch when `tracker.kind == "linear"`.
 - `active_states` (list of strings)
@@ -645,6 +650,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
 - `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
 - `tracker.webhook_secret`: optional `$VAR`; when omitted, canonical env `LINEAR_WEBHOOK_SECRET`
+- `tracker.operator_user_ids`: list of exact Linear user IDs, default `[]`
 - `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
@@ -928,11 +934,17 @@ Part B: Tracker state refresh
 Operator comment input is untrusted. Implementations that support comment commands MUST:
 
 - inspect only comments belonging to currently running or parked issues;
-- accept only native, non-self-authored comments without an external-thread marker;
+- accept only native comments from exact `tracker.operator_user_ids` actors;
+- reject comments authored by the `tracker.api_key` identity even when it appears in the allowlist;
+- reject comments with an external-thread marker;
 - recognize commands only at the beginning of a bounded-size body;
 - ignore free-form text and unsupported or prefix-colliding commands;
 - never persist or log the raw comment body; and
 - process comments in stable creation-time/id order from a durable per-issue cursor.
+
+When upgrading an existing ledger that contains parked waits but no operator cursors, the
+implementation MUST initialize each missing cursor at upgrade/runtime observation time. It MUST NOT
+execute historical comments retroactively.
 
 The bounded vocabulary is:
 
@@ -2232,7 +2244,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Parked issues are excluded from dispatch until a matching wait is resumed
 - Unresolved waits are restored from the run ledger after restart
 - Native operator comments accept only the bounded approve/retry/reject/stop vocabulary
-- Free-form, self-authored, mirrored external-thread, and oversized comments cannot steer the runner
+- Free-form, non-allowlisted, API-key/self-authored, mirrored external-thread, and oversized comments
+  cannot steer the runner
 - Operator command outcomes and per-issue cursors are durable and duplicate-safe without storing
   comment bodies
 - Global pause is durable, idempotent, and blocks candidate/retry dispatch without stopping

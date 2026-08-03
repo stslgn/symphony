@@ -741,6 +741,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.endpoint == "https://api.linear.app/graphql"
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
+    assert config.tracker.operator_user_ids == []
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
@@ -771,6 +772,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.turn_timeout_ms == 3_600_000
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_operator_user_ids: ["operator-1", "operator-2"]
+    )
+
+    assert Config.settings!().tracker.operator_user_ids == ["operator-1", "operator-2"]
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_operator_user_ids: [""])
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "tracker.operator_user_ids"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"

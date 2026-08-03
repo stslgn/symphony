@@ -45,6 +45,7 @@ defmodule SymphonyElixir.LinearCommentClientTest do
 
     assert first.id == "comment-1"
     assert first.body == "$retry"
+    assert first.author_id == "operator-1"
     refute first.author_is_me
     assert second.id == "comment-2"
     assert second.author_is_me
@@ -96,7 +97,7 @@ defmodule SymphonyElixir.LinearCommentClientTest do
       "id" => id,
       "body" => body,
       "createdAt" => created_at,
-      "user" => %{"isMe" => is_me},
+      "user" => %{"id" => "operator-1", "isMe" => is_me},
       "externalThread" => if(is_binary(external_thread), do: %{"type" => external_thread}, else: nil)
     }
   end

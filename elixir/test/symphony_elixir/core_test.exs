@@ -344,6 +344,7 @@ defmodule SymphonyElixir.CoreTest do
 
   test "SymphonyElixir.start_link delegates to the orchestrator" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
     orchestrator_pid = Process.whereis(SymphonyElixir.Orchestrator)
 
@@ -1260,8 +1261,52 @@ defmodule SymphonyElixir.CoreTest do
     assert {:noreply, ^coalesced_state} = Orchestrator.handle_info({:tick, stale_tick_token}, coalesced_state)
   end
 
-  test "Linear retry command resumes a matching wait exactly once while globally paused" do
+  test "empty operator allowlist disables comment reconciliation" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue_id = "issue-operator-disabled"
+
+    assert {:ok, wait} =
+             SymphonyElixir.OperatorWait.new("waiting_secret", %{
+               issue_id: issue_id,
+               identifier: "MT-OPERATOR-DISABLED",
+               run_id: "run-operator-disabled",
+               parked_at: ~U[2026-08-03 10:00:00Z]
+             })
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue_id => [
+        %SymphonyElixir.Linear.Comment{
+          id: "disabled-retry",
+          body: "$retry",
+          created_at: ~U[2026-08-03 10:00:01Z],
+          author_id: "operator-1"
+        }
+      ]
+    })
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: nil,
+      dispatch_paused: true,
+      parked: %{issue_id => wait},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:noreply, reconciled_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    assert reconciled_state.parked[issue_id].wait_id == wait.wait_id
+    assert reconciled_state.operator_comment_cursors == %{}
+
+    if is_reference(reconciled_state.tick_timer_ref),
+      do: Process.cancel_timer(reconciled_state.tick_timer_ref)
+  end
+
+  test "Linear retry command resumes a matching wait exactly once while globally paused" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"]
+    )
 
     ledger_path =
       Path.join(
@@ -1284,7 +1329,8 @@ defmodule SymphonyElixir.CoreTest do
     comment = %SymphonyElixir.Linear.Comment{
       id: "comment-retry",
       body: "$retry after reconnect",
-      created_at: command_at
+      created_at: command_at,
+      author_id: "operator-1"
     }
 
     Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
@@ -1319,8 +1365,73 @@ defmodule SymphonyElixir.CoreTest do
     assert Enum.count(events, &(&1["transition"] == "operator_command_applied")) == 1
   end
 
+  test "first operator cursor does not execute historical comments for recovered waits" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"]
+    )
+
+    ledger_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-operator-migration-#{RunLedger.new_id("test")}/events.jsonl"
+      )
+
+    issue_id = "issue-recovered-operator-wait"
+    parked_at = DateTime.add(DateTime.utc_now(), -3_600, :second)
+    historical_comment_at = DateTime.add(parked_at, 60, :second)
+
+    assert {:ok, wait} =
+             SymphonyElixir.OperatorWait.new("waiting_secret", %{
+               issue_id: issue_id,
+               identifier: "MT-RECOVERED-WAIT",
+               run_id: "run-recovered-wait",
+               parked_at: parked_at
+             })
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue_id => [
+        %SymphonyElixir.Linear.Comment{
+          id: "historical-retry",
+          body: "$retry",
+          created_at: historical_comment_at,
+          author_id: "operator-1"
+        }
+      ]
+    })
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: ledger_path,
+      runner_generation: "runner-operator-migration",
+      dispatch_paused: true,
+      parked: %{issue_id => wait},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:noreply, reconciled_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    assert reconciled_state.parked[issue_id].wait_id == wait.wait_id
+
+    assert %{created_at: cursor_at, comment_ids: comment_ids} =
+             reconciled_state.operator_comment_cursors[issue_id]
+
+    assert DateTime.compare(cursor_at, historical_comment_at) == :gt
+    assert MapSet.size(comment_ids) == 0
+
+    if is_reference(reconciled_state.tick_timer_ref),
+      do: Process.cancel_timer(reconciled_state.tick_timer_ref)
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+    refute Enum.any?(events, &(&1["transition"] == "wait_resumed"))
+    refute Enum.any?(events, &(&1["transition"] == "operator_command_applied"))
+  end
+
   test "Linear stop command durably parks a running issue for operator retry" do
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"]
+    )
 
     ledger_path =
       Path.join(
@@ -1329,7 +1440,8 @@ defmodule SymphonyElixir.CoreTest do
       )
 
     issue_id = "issue-operator-stop"
-    cursor_at = ~U[2026-08-03 10:00:00Z]
+    cursor_at = DateTime.utc_now()
+    command_at = DateTime.add(cursor_at, 1, :second)
 
     issue = %Issue{
       id: issue_id,
@@ -1341,15 +1453,19 @@ defmodule SymphonyElixir.CoreTest do
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
 
+    comment = %SymphonyElixir.Linear.Comment{
+      id: "comment-stop",
+      body: "$stop",
+      created_at: command_at,
+      author_id: "operator-1"
+    }
+
     Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
-      issue_id => [
-        %SymphonyElixir.Linear.Comment{
-          id: "comment-stop",
-          body: "$stop",
-          created_at: ~U[2026-08-03 10:00:01Z]
-        }
-      ]
+      issue_id => [comment]
     })
+
+    assert Config.settings!().tracker.operator_user_ids == ["operator-1"]
+    assert {:ok, [^comment]} = Tracker.fetch_comments_since(issue_id, cursor_at)
 
     agent_pid = spawn(fn -> Process.sleep(:infinity) end)
     on_exit(fn -> if Process.alive?(agent_pid), do: Process.exit(agent_pid, :kill) end)
@@ -1383,6 +1499,10 @@ defmodule SymphonyElixir.CoreTest do
 
     assert {:noreply, stopped_state} = Orchestrator.handle_info(:run_poll_cycle, state)
     refute Map.has_key?(stopped_state.running, issue_id)
+
+    assert Map.has_key?(stopped_state.parked, issue_id),
+           "expected operator stop to park issue; ledger=#{inspect(RunLedger.read_events(ledger_path))}"
+
     assert stopped_state.parked[issue_id].reason == "operator_stopped"
     assert stopped_state.parked[issue_id].allowed_actions == ["retry", "reject"]
     refute Process.alive?(agent_pid)

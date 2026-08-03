@@ -17,14 +17,22 @@ defmodule SymphonyElixir.OperatorCommand do
   @spec actions() :: [String.t()]
   def actions, do: @actions
 
-  @spec parse_comment(Comment.t()) :: {:ok, String.t()} | :ignore
-  def parse_comment(%Comment{author_is_me: true}), do: :ignore
+  @spec parse_comment(Comment.t(), [String.t()]) :: {:ok, String.t()} | :ignore
+  def parse_comment(%Comment{author_is_me: true}, _operator_user_ids), do: :ignore
 
-  def parse_comment(%Comment{external_thread_type: type}) when is_binary(type),
-    do: :ignore
+  def parse_comment(%Comment{external_thread_type: type}, _operator_user_ids)
+      when is_binary(type),
+      do: :ignore
 
-  def parse_comment(%Comment{body: body})
-      when is_binary(body) and byte_size(body) <= @max_body_bytes do
+  def parse_comment(%Comment{author_id: author_id} = comment, operator_user_ids)
+      when is_binary(author_id) and is_list(operator_user_ids) do
+    if author_id in operator_user_ids, do: parse_body(comment), else: :ignore
+  end
+
+  def parse_comment(_comment, _operator_user_ids), do: :ignore
+
+  defp parse_body(%Comment{body: body})
+       when is_binary(body) and byte_size(body) <= @max_body_bytes do
     body = String.trim(body)
 
     cond do
@@ -40,5 +48,5 @@ defmodule SymphonyElixir.OperatorCommand do
     end
   end
 
-  def parse_comment(_comment), do: :ignore
+  defp parse_body(_comment), do: :ignore
 end

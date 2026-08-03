@@ -51,6 +51,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:webhook_secret, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
+      field(:operator_user_ids, {:array, :string}, default: [])
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
@@ -67,12 +68,20 @@ defmodule SymphonyElixir.Config.Schema do
           :webhook_secret,
           :project_slug,
           :assignee,
+          :operator_user_ids,
           :active_states,
           :terminal_states
         ],
         empty_values: []
       )
       |> validate_format(:webhook_secret, ~r/^\$[A-Za-z_][A-Za-z0-9_]*$/, message: "must be an environment reference such as $LINEAR_WEBHOOK_SECRET")
+      |> validate_change(:operator_user_ids, fn :operator_user_ids, user_ids ->
+        if Enum.all?(user_ids, &(is_binary(&1) and String.trim(&1) != "")) do
+          []
+        else
+          [operator_user_ids: "must contain only non-blank Linear user ids"]
+        end
+      end)
     end
   end
 

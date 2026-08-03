@@ -1941,14 +1941,25 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp process_operator_comments(%State{} = state) do
+    process_operator_comments(state, operator_user_ids())
+  end
+
+  defp process_operator_comments(%State{} = state, []), do: state
+
+  defp process_operator_comments(%State{} = state, operator_user_ids) do
     state
-    |> operator_command_contexts()
-    |> Enum.reduce(state, fn {issue_id, baseline}, state_acc ->
-      state_acc = ensure_operator_cursor(state_acc, issue_id, baseline)
+    |> operator_command_issue_ids()
+    |> Enum.reduce(state, fn issue_id, state_acc ->
+      state_acc = ensure_operator_cursor(state_acc, issue_id)
 
       case Map.get(state_acc.operator_comment_cursors, issue_id) do
         %{created_at: %DateTime{} = cursor} ->
-          process_issue_operator_comments(state_acc, issue_id, cursor)
+          process_issue_operator_comments(
+            state_acc,
+            issue_id,
+            cursor,
+            operator_user_ids
+          )
 
         _cursor ->
           state_acc
@@ -1956,43 +1967,43 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp operator_command_contexts(%State{} = state) do
-    running =
-      Map.new(state.running, fn {issue_id, running_entry} ->
-        {issue_id, Map.get(running_entry, :started_at)}
-      end)
-
-    parked =
-      Map.new(state.parked, fn {issue_id, wait} ->
-        {issue_id, Map.get(wait, :parked_at)}
-      end)
-
-    Map.merge(running, parked)
+  defp operator_command_issue_ids(%State{} = state) do
+    state.running
+    |> Map.keys()
+    |> Enum.concat(Map.keys(state.parked))
+    |> MapSet.new()
   end
 
-  defp ensure_operator_cursor(%State{} = state, issue_id, %DateTime{} = baseline) do
+  defp ensure_operator_cursor(%State{} = state, issue_id) do
     if Map.has_key?(state.operator_comment_cursors, issue_id) do
       state
     else
-      persist_operator_cursor(state, "operator_cursor_initialized", issue_id, baseline, nil)
+      persist_operator_cursor(
+        state,
+        "operator_cursor_initialized",
+        issue_id,
+        DateTime.utc_now(),
+        nil
+      )
     end
-  end
-
-  defp ensure_operator_cursor(%State{} = state, issue_id, _baseline) do
-    ensure_operator_cursor(state, issue_id, DateTime.utc_now())
   end
 
   defp initialize_operator_cursor(%State{} = state, issue_id, %DateTime{} = baseline) do
     persist_operator_cursor(state, "operator_cursor_initialized", issue_id, baseline, nil)
   end
 
-  defp process_issue_operator_comments(%State{} = state, issue_id, cursor) do
+  defp process_issue_operator_comments(
+         %State{} = state,
+         issue_id,
+         cursor,
+         operator_user_ids
+       ) do
     case Tracker.fetch_comments_since(issue_id, cursor) do
       {:ok, comments} ->
         comments
         |> Enum.sort_by(&operator_comment_sort_key/1)
         |> Enum.reduce(state, fn comment, state_acc ->
-          process_operator_comment(state_acc, issue_id, comment)
+          process_operator_comment(state_acc, issue_id, comment, operator_user_ids)
         end)
 
       {:error, reason} ->
@@ -2011,14 +2022,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp process_operator_comment(
          %State{} = state,
          issue_id,
-         %{id: comment_id, created_at: %DateTime{} = created_at} = comment
+         %{id: comment_id, created_at: %DateTime{} = created_at} = comment,
+         operator_user_ids
        )
        when is_binary(comment_id) do
     if operator_comment_seen_at_cursor?(state, issue_id, comment) do
       state
     else
       state
-      |> maybe_apply_operator_comment(issue_id, comment)
+      |> maybe_apply_operator_comment(issue_id, comment, operator_user_ids)
       |> persist_operator_cursor(
         "operator_cursor_advanced",
         issue_id,
@@ -2028,7 +2040,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp process_operator_comment(state, _issue_id, _comment), do: state
+  defp process_operator_comment(state, _issue_id, _comment, _operator_user_ids), do: state
 
   defp operator_comment_seen_at_cursor?(state, issue_id, comment) do
     case Map.get(state.operator_comment_cursors, issue_id) do
@@ -2041,19 +2053,28 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp maybe_apply_operator_comment(%State{} = state, issue_id, comment) do
+  defp maybe_apply_operator_comment(
+         %State{} = state,
+         issue_id,
+         comment,
+         operator_user_ids
+       ) do
     if MapSet.member?(state.processed_operator_comment_ids, comment.id) do
       state
     else
-      parse_and_apply_operator_comment(state, issue_id, comment)
+      parse_and_apply_operator_comment(state, issue_id, comment, operator_user_ids)
     end
   end
 
-  defp parse_and_apply_operator_comment(state, issue_id, comment) do
-    case OperatorCommand.parse_comment(comment) do
+  defp parse_and_apply_operator_comment(state, issue_id, comment, operator_user_ids) do
+    case OperatorCommand.parse_comment(comment, operator_user_ids) do
       {:ok, action} -> apply_operator_comment(state, issue_id, comment, action)
       :ignore -> state
     end
+  end
+
+  defp operator_user_ids do
+    Config.settings!().tracker.operator_user_ids || []
   end
 
   defp apply_operator_comment(state, issue_id, comment, "stop") do

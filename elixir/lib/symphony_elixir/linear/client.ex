@@ -110,6 +110,7 @@ defmodule SymphonyElixir.Linear.Client do
           body
           createdAt
           user {
+            id
             isMe
           }
           externalThread {
@@ -590,6 +591,7 @@ defmodule SymphonyElixir.Linear.Client do
         id: id,
         body: comment["body"],
         created_at: created_at,
+        author_id: get_in(comment, ["user", "id"]),
         author_is_me: get_in(comment, ["user", "isMe"]) == true,
         external_thread_type: get_in(comment, ["externalThread", "type"])
       }
