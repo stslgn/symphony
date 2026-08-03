@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{
     AgentRunner,
     Config,
+    OperatorCommand,
     OperatorWait,
     RunBudget,
     RunLedger,
@@ -45,12 +46,15 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       :run_ledger_path,
       :runner_generation,
+      dispatch_paused: false,
       running: %{},
       parked: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       recovered_attempts: %{},
       retry_attempts: %{},
+      processed_operator_comment_ids: MapSet.new(),
+      operator_comment_cursors: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -70,7 +74,7 @@ defmodule SymphonyElixir.Orchestrator do
     runner_generation = RunLedger.new_id("runner")
 
     case RunLedger.reconcile_startup(run_ledger_path, runner_generation) do
-      {:ok, %{recovered_attempts: recovered_attempts, parked: parked_events}} ->
+      {:ok, recovery} ->
         state = %State{
           poll_interval_ms: config.polling.interval_ms,
           max_concurrent_agents: config.agent.max_concurrent_agents,
@@ -80,8 +84,11 @@ defmodule SymphonyElixir.Orchestrator do
           tick_token: nil,
           run_ledger_path: run_ledger_path,
           runner_generation: runner_generation,
-          recovered_attempts: recovered_attempts,
-          parked: restore_parked_waits(parked_events),
+          dispatch_paused: recovery.dispatch_paused,
+          recovered_attempts: recovery.recovered_attempts,
+          parked: restore_parked_waits(recovery.parked),
+          processed_operator_comment_ids: recovery.processed_operator_comment_ids,
+          operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
@@ -277,9 +284,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
-      case pop_retry_attempt_state(state, issue_id, retry_token) do
-        {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
-        :missing -> {:noreply, state}
+      if state.dispatch_paused do
+        {:noreply, defer_retry_while_paused(state, issue_id, retry_token)}
+      else
+        case pop_retry_attempt_state(state, issue_id, retry_token) do
+          {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
+          :missing -> {:noreply, state}
+        end
       end
 
     notify_dashboard()
@@ -298,8 +309,10 @@ defmodule SymphonyElixir.Orchestrator do
       state
       |> reconcile_running_issues()
       |> reconcile_parked_issues()
+      |> process_operator_comments()
 
-    with :ok <- Config.validate!(),
+    with false <- state.dispatch_paused,
+         :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
       choose_issues(issues, state)
@@ -343,6 +356,9 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       false ->
+        state
+
+      true ->
         state
     end
   end
@@ -793,7 +809,8 @@ defmodule SymphonyElixir.Orchestrator do
          active_states,
          terminal_states
        ) do
-    candidate_issue?(issue, active_states, terminal_states) and
+    !state.dispatch_paused and
+      candidate_issue?(issue, active_states, terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
@@ -1028,6 +1045,7 @@ defmodule SymphonyElixir.Orchestrator do
                 recovered_attempts: Map.delete(state.recovered_attempts, issue.id),
                 retry_attempts: Map.delete(state.retry_attempts, issue.id)
             }
+            |> initialize_operator_cursor(issue.id, running_entry.started_at)
 
           {:error, reason} ->
             Logger.error("Unable to record durable run start for #{issue_context(issue)}: #{inspect(reason)}")
@@ -1161,6 +1179,56 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         :missing
     end
+  end
+
+  defp defer_retry_while_paused(%State{} = state, issue_id, retry_token)
+       when is_binary(issue_id) and is_reference(retry_token) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{retry_token: ^retry_token} = retry ->
+        delay_ms = max(state.poll_interval_ms || 1_000, 1_000)
+        next_retry_token = make_ref()
+
+        updated_retry = %{
+          retry
+          | timer_ref:
+              Process.send_after(
+                self(),
+                {:retry_issue, issue_id, next_retry_token},
+                delay_ms
+              ),
+            retry_token: next_retry_token,
+            due_at_ms: System.monotonic_time(:millisecond) + delay_ms
+        }
+
+        %{state | retry_attempts: Map.put(state.retry_attempts, issue_id, updated_retry)}
+
+      _retry ->
+        state
+    end
+  end
+
+  defp defer_retry_while_paused(state, _issue_id, _retry_token), do: state
+
+  defp wake_paused_retries(%State{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    retry_attempts =
+      Map.new(state.retry_attempts, fn {issue_id, retry} ->
+        if is_reference(retry.timer_ref), do: Process.cancel_timer(retry.timer_ref)
+        retry_token = make_ref()
+
+        {
+          issue_id,
+          %{
+            retry
+            | timer_ref: Process.send_after(self(), {:retry_issue, issue_id, retry_token}, 0),
+              retry_token: retry_token,
+              due_at_ms: now_ms
+          }
+        }
+      end)
+
+    %{state | retry_attempts: retry_attempts}
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
@@ -1423,6 +1491,22 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec set_dispatch_paused(boolean()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def set_dispatch_paused(paused) when is_boolean(paused) do
+    set_dispatch_paused(__MODULE__, paused)
+  end
+
+  @spec set_dispatch_paused(GenServer.server(), boolean()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def set_dispatch_paused(server, paused) when is_boolean(paused) do
+    if GenServer.whereis(server) do
+      GenServer.call(server, {:set_dispatch_paused, paused})
+    else
+      :unavailable
+    end
+  end
+
   @spec park_issue(String.t(), String.t()) ::
           {:ok, map()} | {:error, term()} | :unavailable
   def park_issue(issue_id, reason), do: park_issue(__MODULE__, issue_id, reason)
@@ -1498,6 +1582,21 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_call({:set_dispatch_paused, paused}, _from, state)
+      when is_boolean(paused) do
+    if state.dispatch_paused == paused do
+      {:reply,
+       {:ok,
+        %{
+          dispatch_paused: paused,
+          changed: false,
+          requested_at: DateTime.utc_now()
+        }}, state}
+    else
+      persist_dispatch_pause(state, paused)
+    end
+  end
+
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
@@ -1568,6 +1667,9 @@ defmodule SymphonyElixir.Orchestrator do
     {:reply,
      %{
        runner_generation: state.runner_generation,
+       control: %{
+         dispatch_paused: state.dispatch_paused
+       },
        capabilities: capability_snapshot(),
        running: running,
        retrying: retrying,
@@ -1761,6 +1863,35 @@ defmodule SymphonyElixir.Orchestrator do
     RunLedger.append(state.run_ledger_path, event)
   end
 
+  defp persist_dispatch_pause(%State{} = state, paused) when is_boolean(paused) do
+    transition = if paused, do: "dispatch_paused", else: "dispatch_resumed"
+
+    case append_run_event(state, %{transition: transition, stage: "operator"}) do
+      :ok ->
+        state = state |> Map.put(:dispatch_paused, paused) |> after_dispatch_control_change(paused)
+        notify_dashboard()
+
+        {:reply,
+         {:ok,
+          %{
+            dispatch_paused: paused,
+            changed: true,
+            requested_at: DateTime.utc_now()
+          }}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, {:ledger_write_failed, reason}}, state}
+    end
+  end
+
+  defp after_dispatch_control_change(state, true), do: state
+
+  defp after_dispatch_control_change(state, false) do
+    state
+    |> wake_paused_retries()
+    |> schedule_tick(0)
+  end
+
   defp operator_wait_event(wait, transition) do
     %{
       transition: transition,
@@ -1778,13 +1909,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp resolve_operator_wait(state, wait, action) do
+    case apply_operator_wait_action(state, wait, action) do
+      {:ok, payload, state} -> {:reply, {:ok, payload}, state}
+      {:error, reason, state} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp apply_operator_wait_action(state, wait, action) do
     if OperatorWait.action_allowed?(wait, action) do
       transition = if action == "reject", do: "wait_rejected", else: "wait_resumed"
       event = operator_wait_event(wait, transition)
 
       case append_run_event(state, event) do
         :ok when action == "reject" ->
-          {:reply, {:ok, %{wait: wait, action: action, resumed: false}}, state}
+          {:ok, %{wait: wait, action: action, resumed: false}, state}
 
         :ok ->
           state =
@@ -1792,15 +1930,319 @@ defmodule SymphonyElixir.Orchestrator do
             |> Map.update!(:parked, &Map.delete(&1, wait.issue_id))
             |> schedule_tick(0)
 
-          {:reply, {:ok, %{wait: wait, action: action, resumed: true}}, state}
+          {:ok, %{wait: wait, action: action, resumed: true}, state}
 
         {:error, reason} ->
-          {:reply, {:error, {:ledger_write_failed, reason}}, state}
+          {:error, {:ledger_write_failed, reason}, state}
       end
     else
-      {:reply, {:error, :action_not_allowed}, state}
+      {:error, :action_not_allowed, state}
     end
   end
+
+  defp process_operator_comments(%State{} = state) do
+    state
+    |> operator_command_contexts()
+    |> Enum.reduce(state, fn {issue_id, baseline}, state_acc ->
+      state_acc = ensure_operator_cursor(state_acc, issue_id, baseline)
+
+      case Map.get(state_acc.operator_comment_cursors, issue_id) do
+        %{created_at: %DateTime{} = cursor} ->
+          process_issue_operator_comments(state_acc, issue_id, cursor)
+
+        _cursor ->
+          state_acc
+      end
+    end)
+  end
+
+  defp operator_command_contexts(%State{} = state) do
+    running =
+      Map.new(state.running, fn {issue_id, running_entry} ->
+        {issue_id, Map.get(running_entry, :started_at)}
+      end)
+
+    parked =
+      Map.new(state.parked, fn {issue_id, wait} ->
+        {issue_id, Map.get(wait, :parked_at)}
+      end)
+
+    Map.merge(running, parked)
+  end
+
+  defp ensure_operator_cursor(%State{} = state, issue_id, %DateTime{} = baseline) do
+    if Map.has_key?(state.operator_comment_cursors, issue_id) do
+      state
+    else
+      persist_operator_cursor(state, "operator_cursor_initialized", issue_id, baseline, nil)
+    end
+  end
+
+  defp ensure_operator_cursor(%State{} = state, issue_id, _baseline) do
+    ensure_operator_cursor(state, issue_id, DateTime.utc_now())
+  end
+
+  defp initialize_operator_cursor(%State{} = state, issue_id, %DateTime{} = baseline) do
+    persist_operator_cursor(state, "operator_cursor_initialized", issue_id, baseline, nil)
+  end
+
+  defp process_issue_operator_comments(%State{} = state, issue_id, cursor) do
+    case Tracker.fetch_comments_since(issue_id, cursor) do
+      {:ok, comments} ->
+        comments
+        |> Enum.sort_by(&operator_comment_sort_key/1)
+        |> Enum.reduce(state, fn comment, state_acc ->
+          process_operator_comment(state_acc, issue_id, comment)
+        end)
+
+      {:error, reason} ->
+        Logger.debug("Failed to fetch operator comments issue_id=#{issue_id}: #{inspect(reason)}")
+
+        state
+    end
+  end
+
+  defp operator_comment_sort_key(%{created_at: %DateTime{} = created_at, id: id}) do
+    {DateTime.to_unix(created_at, :microsecond), id}
+  end
+
+  defp operator_comment_sort_key(comment), do: {0, inspect(comment)}
+
+  defp process_operator_comment(
+         %State{} = state,
+         issue_id,
+         %{id: comment_id, created_at: %DateTime{} = created_at} = comment
+       )
+       when is_binary(comment_id) do
+    if operator_comment_seen_at_cursor?(state, issue_id, comment) do
+      state
+    else
+      state
+      |> maybe_apply_operator_comment(issue_id, comment)
+      |> persist_operator_cursor(
+        "operator_cursor_advanced",
+        issue_id,
+        created_at,
+        comment_id
+      )
+    end
+  end
+
+  defp process_operator_comment(state, _issue_id, _comment), do: state
+
+  defp operator_comment_seen_at_cursor?(state, issue_id, comment) do
+    case Map.get(state.operator_comment_cursors, issue_id) do
+      %{created_at: %DateTime{} = cursor_at, comment_ids: comment_ids} ->
+        DateTime.compare(comment.created_at, cursor_at) == :eq and
+          MapSet.member?(comment_ids, comment.id)
+
+      _cursor ->
+        false
+    end
+  end
+
+  defp maybe_apply_operator_comment(%State{} = state, issue_id, comment) do
+    if MapSet.member?(state.processed_operator_comment_ids, comment.id) do
+      state
+    else
+      parse_and_apply_operator_comment(state, issue_id, comment)
+    end
+  end
+
+  defp parse_and_apply_operator_comment(state, issue_id, comment) do
+    case OperatorCommand.parse_comment(comment) do
+      {:ok, action} -> apply_operator_comment(state, issue_id, comment, action)
+      :ignore -> state
+    end
+  end
+
+  defp apply_operator_comment(state, issue_id, comment, "stop") do
+    case Map.get(state.running, issue_id) do
+      %{issue: %Issue{} = issue} ->
+        updated_state =
+          park_running_issue(state, issue, "operator_stopped", terminal_reason: "operator_stop")
+
+        if Map.has_key?(updated_state.parked, issue_id) do
+          record_operator_command_outcome(
+            updated_state,
+            issue_id,
+            comment,
+            "stop",
+            "operator_command_applied"
+          )
+        else
+          record_operator_command_outcome(
+            state,
+            issue_id,
+            comment,
+            "stop",
+            "operator_command_rejected"
+          )
+        end
+
+      _running ->
+        record_operator_command_outcome(
+          state,
+          issue_id,
+          comment,
+          "stop",
+          "operator_command_rejected"
+        )
+    end
+  end
+
+  defp apply_operator_comment(state, issue_id, comment, action) do
+    case Map.get(state.parked, issue_id) do
+      nil ->
+        record_operator_command_outcome(
+          state,
+          issue_id,
+          comment,
+          action,
+          "operator_command_rejected"
+        )
+
+      wait ->
+        case apply_operator_wait_action(state, wait, action) do
+          {:ok, _payload, updated_state} ->
+            record_operator_command_outcome(
+              updated_state,
+              issue_id,
+              comment,
+              action,
+              "operator_command_applied"
+            )
+
+          {:error, _reason, unchanged_state} ->
+            record_operator_command_outcome(
+              unchanged_state,
+              issue_id,
+              comment,
+              action,
+              "operator_command_rejected"
+            )
+        end
+    end
+  end
+
+  defp record_operator_command_outcome(
+         %State{} = state,
+         issue_id,
+         comment,
+         action,
+         transition
+       ) do
+    event = %{
+      transition: transition,
+      stage: "operator",
+      issue_id: issue_id,
+      comment_id: comment.id,
+      comment_created_at: DateTime.to_iso8601(comment.created_at),
+      operator_command: action
+    }
+
+    case append_run_event(state, event) do
+      :ok ->
+        Logger.info("Operator command #{action} #{operator_outcome_label(transition)} issue_id=#{issue_id} comment_id=#{comment.id}")
+
+        %{
+          state
+          | processed_operator_comment_ids: MapSet.put(state.processed_operator_comment_ids, comment.id)
+        }
+
+      {:error, reason} ->
+        Logger.error("Failed to record operator command issue_id=#{issue_id} comment_id=#{comment.id}: #{inspect(reason)}")
+
+        state
+    end
+  end
+
+  defp operator_outcome_label("operator_command_applied"), do: "applied"
+  defp operator_outcome_label(_transition), do: "rejected"
+
+  defp persist_operator_cursor(
+         %State{} = state,
+         transition,
+         issue_id,
+         %DateTime{} = created_at,
+         comment_id
+       ) do
+    event = %{
+      transition: transition,
+      stage: "operator",
+      issue_id: issue_id,
+      comment_id: comment_id,
+      comment_created_at: DateTime.to_iso8601(created_at)
+    }
+
+    case append_run_event(state, event) do
+      :ok ->
+        cursor = advance_operator_cursor(state, issue_id, created_at, comment_id)
+
+        %{
+          state
+          | operator_comment_cursors: Map.put(state.operator_comment_cursors, issue_id, cursor)
+        }
+
+      {:error, reason} ->
+        Logger.error("Failed to persist operator comment cursor issue_id=#{issue_id}: #{inspect(reason)}")
+
+        state
+    end
+  end
+
+  defp advance_operator_cursor(state, issue_id, created_at, comment_id) do
+    case Map.get(state.operator_comment_cursors, issue_id) do
+      %{created_at: %DateTime{} = current_at, comment_ids: comment_ids}
+      when created_at == current_at ->
+        %{
+          created_at: created_at,
+          comment_ids: maybe_put_operator_comment_id(comment_ids, comment_id)
+        }
+
+      %{created_at: %DateTime{} = current_at} = current_cursor ->
+        case DateTime.compare(created_at, current_at) do
+          :lt -> current_cursor
+          _ -> new_operator_cursor(created_at, comment_id)
+        end
+
+      _cursor ->
+        new_operator_cursor(created_at, comment_id)
+    end
+  end
+
+  defp new_operator_cursor(created_at, comment_id) do
+    %{
+      created_at: created_at,
+      comment_ids: maybe_put_operator_comment_id(MapSet.new(), comment_id)
+    }
+  end
+
+  defp maybe_put_operator_comment_id(comment_ids, comment_id) when is_binary(comment_id),
+    do: MapSet.put(comment_ids, comment_id)
+
+  defp maybe_put_operator_comment_id(comment_ids, _comment_id), do: comment_ids
+
+  defp restore_operator_comment_cursors(cursors) when is_map(cursors) do
+    Enum.reduce(cursors, %{}, fn
+      {issue_id, %{created_at: timestamp, comment_ids: comment_ids}}, restored ->
+        case DateTime.from_iso8601(timestamp) do
+          {:ok, created_at, _offset} ->
+            Map.put(restored, issue_id, %{
+              created_at: created_at,
+              comment_ids: comment_ids
+            })
+
+          {:error, _reason} ->
+            restored
+        end
+
+      {_issue_id, _cursor}, restored ->
+        restored
+    end)
+  end
+
+  defp restore_operator_comment_cursors(_cursors), do: %{}
 
   defp restore_parked_waits(events) when is_map(events) do
     Enum.reduce(events, %{}, fn {issue_id, event}, restored ->

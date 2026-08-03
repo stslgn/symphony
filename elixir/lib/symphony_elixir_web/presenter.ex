@@ -23,6 +23,7 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           parked: Enum.map(parked, &parked_entry_payload/1),
+          control: Map.get(snapshot, :control, %{dispatch_paused: false}),
           capabilities:
             Map.get(snapshot, :capabilities, %{
               dynamic_tools: [],
@@ -68,6 +69,36 @@ defmodule SymphonyElixirWeb.Presenter do
 
       payload ->
         {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
+    end
+  end
+
+  @spec pause_payload(GenServer.name(), timeout()) ::
+          {:ok, map()} | {:error, :timeout | :unavailable}
+  def pause_payload(orchestrator, snapshot_timeout_ms) do
+    case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
+      %{} = snapshot ->
+        {:ok, Map.get(snapshot, :control, %{dispatch_paused: false})}
+
+      :timeout ->
+        {:error, :timeout}
+
+      :unavailable ->
+        {:error, :unavailable}
+    end
+  end
+
+  @spec set_pause_payload(GenServer.name(), boolean()) ::
+          {:ok, map()} | {:error, term()}
+  def set_pause_payload(orchestrator, paused) when is_boolean(paused) do
+    case Orchestrator.set_dispatch_paused(orchestrator, paused) do
+      {:ok, payload} ->
+        {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
+
+      :unavailable ->
+        {:error, :unavailable}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

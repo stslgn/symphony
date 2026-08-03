@@ -91,15 +91,30 @@ defmodule SymphonyElixir.LinearWebhookTest do
     end
   end
 
-  test "acknowledges a verified non-Issue event without requesting a wake-up" do
+  test "accepts a fresh Comment create event as an operator-command wake-up" do
     body = body("Comment", @now_ms)
+
+    assert {:ok, %{delivery_id: @delivery_id, event: "Comment"}} =
+             Webhook.verify(
+               body,
+               signature(body),
+               @delivery_id,
+               "Comment",
+               Jason.decode!(body),
+               @secret,
+               @now_ms
+             )
+  end
+
+  test "acknowledges unsupported verified events without requesting a wake-up" do
+    body = body("Project", @now_ms)
 
     assert {:ignore, :unsupported_event} =
              Webhook.verify(
                body,
                signature(body),
                @delivery_id,
-               "Comment",
+               "Project",
                Jason.decode!(body),
                @secret,
                @now_ms
@@ -123,7 +138,7 @@ defmodule SymphonyElixir.LinearWebhookTest do
 
   defp body(type, timestamp) do
     Jason.encode!(%{
-      "action" => "update",
+      "action" => if(type == "Comment", do: "create", else: "update"),
       "data" => %{"id" => "issue-webhook"},
       "type" => type,
       "webhookTimestamp" => timestamp

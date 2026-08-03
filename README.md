@@ -14,6 +14,10 @@ Symphony can bound each autonomous run by turns, observed Codex tokens, and
 wall-clock time. Reaching a configured budget parks the run for explicit
 operator resolution instead of silently starting another attempt.
 
+The Elixir implementation also supports durable operator commands and a global
+dispatch pause so operators can stop or resume work without losing restart
+reconciliation or bypassing normal eligibility checks.
+
 ## Running Symphony
 
 ### Requirements

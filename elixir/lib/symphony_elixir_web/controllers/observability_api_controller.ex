@@ -40,6 +40,52 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec pause_state(Conn.t(), map()) :: Conn.t()
+  def pause_state(conn, _params) do
+    if local_operator_request?(conn) do
+      case Presenter.pause_payload(orchestrator(), snapshot_timeout_ms()) do
+        {:ok, payload} ->
+          json(conn, payload)
+
+        {:error, :timeout} ->
+          error_response(conn, 503, "snapshot_timeout", "Snapshot timed out")
+
+        {:error, :unavailable} ->
+          error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+      end
+    else
+      error_response(conn, 403, "operator_access_denied", "Operator controls require loopback access")
+    end
+  end
+
+  @spec set_pause(Conn.t(), map()) :: Conn.t()
+  def set_pause(conn, params) do
+    if local_operator_request?(conn) do
+      do_set_pause(conn, params)
+    else
+      error_response(conn, 403, "operator_access_denied", "Operator controls require loopback access")
+    end
+  end
+
+  defp do_set_pause(conn, %{"paused" => paused}) when is_boolean(paused) do
+    case Presenter.set_pause_payload(orchestrator(), paused) do
+      {:ok, payload} ->
+        conn
+        |> put_status(202)
+        |> json(payload)
+
+      {:error, :unavailable} ->
+        error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+
+      {:error, _reason} ->
+        error_response(conn, 503, "operator_control_unavailable", "Operator control is unavailable")
+    end
+  end
+
+  defp do_set_pause(conn, _params) do
+    error_response(conn, 422, "invalid_pause_request", "paused must be a boolean")
+  end
+
   @spec linear_webhook(Conn.t(), map()) :: Conn.t()
   def linear_webhook(conn, params) do
     with {:ok, secret} <- configured_webhook_secret(),
@@ -115,6 +161,10 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   end
 
   defp request_header(conn, name), do: conn |> Conn.get_req_header(name) |> List.first()
+
+  defp local_operator_request?(%Conn{remote_ip: {127, _b, _c, _d}}), do: true
+  defp local_operator_request?(%Conn{remote_ip: {0, 0, 0, 0, 0, 0, 0, 1}}), do: true
+  defp local_operator_request?(_conn), do: false
 
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator

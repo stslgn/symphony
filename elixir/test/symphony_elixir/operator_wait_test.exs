@@ -6,6 +6,7 @@ defmodule SymphonyElixir.OperatorWaitTest do
   test "defines the complete typed reason set and actions" do
     assert OperatorWait.reasons() == [
              "auth_reconnect_required",
+             "operator_stopped",
              "review_cap_reached",
              "run_budget_exhausted",
              "waiting_infrastructure",
@@ -19,6 +20,7 @@ defmodule SymphonyElixir.OperatorWaitTest do
     refute OperatorWait.valid_reason?("unknown")
     assert OperatorWait.allowed_actions("waiting_secret") == ["retry", "reject"]
     assert OperatorWait.allowed_actions("run_budget_exhausted") == ["retry", "reject"]
+    assert OperatorWait.allowed_actions("operator_stopped") == ["retry", "reject"]
     assert OperatorWait.allowed_actions("unknown") == []
   end
 

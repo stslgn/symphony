@@ -1,6 +1,7 @@
 ```text
 ╭─ SYMPHONY STATUS
 │ Agents: 0/10
+│ Dispatch: running
 │ Throughput: 0 tps
 │ Runtime: 0m 0s
 │ Tokens: in 0 | out 0 | total 0

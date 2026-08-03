@@ -317,6 +317,7 @@ defmodule SymphonyElixir.StatusDashboard do
              retrying: retrying,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
+             control: Map.get(snapshot, :control, %{dispatch_paused: false}),
              polling: Map.get(snapshot, :polling)
            }},
           update_token_samples(token_samples, now_ms, total_tokens)
@@ -336,6 +337,7 @@ defmodule SymphonyElixir.StatusDashboard do
         rate_limits = Map.get(snapshot, :rate_limits)
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
+        dispatch_line = format_dispatch_line(Map.get(snapshot, :control))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
         codex_output_tokens = Map.get(codex_totals, :output_tokens, 0)
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
@@ -353,6 +355,7 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize("#{agent_count}", @ansi_green) <>
              colorize("/", @ansi_gray) <>
              colorize("#{max_agents}", @ansi_gray),
+           dispatch_line,
            colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
            colorize("│ Runtime: ", @ansi_bold) <>
              colorize(format_runtime_seconds(codex_seconds_running), @ansi_magenta),
@@ -425,6 +428,14 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_project_refresh_line(_) do
     colorize("│ Next refresh: ", @ansi_bold) <> colorize("n/a", @ansi_gray)
+  end
+
+  defp format_dispatch_line(%{dispatch_paused: true}) do
+    colorize("│ Dispatch: ", @ansi_bold) <> colorize("paused", @ansi_yellow)
+  end
+
+  defp format_dispatch_line(_control) do
+    colorize("│ Dispatch: ", @ansi_bold) <> colorize("running", @ansi_green)
   end
 
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"

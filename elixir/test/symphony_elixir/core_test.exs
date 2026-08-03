@@ -524,6 +524,109 @@ defmodule SymphonyElixir.CoreTest do
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
+  test "global pause is durable, idempotent, and blocks new dispatch" do
+    ledger_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-global-pause-#{RunLedger.new_id("test")}/events.jsonl"
+      )
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: ledger_path,
+      runner_generation: "runner-pause",
+      running: %{},
+      parked: %{},
+      claimed: MapSet.new(),
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    issue = %Issue{
+      id: "issue-paused",
+      identifier: "MT-PAUSED",
+      state: "Todo",
+      title: "Do not dispatch",
+      assigned_to_worker: true
+    }
+
+    assert {:reply, {:ok, %{dispatch_paused: true, changed: true}}, paused_state} =
+             Orchestrator.handle_call(
+               {:set_dispatch_paused, true},
+               {self(), make_ref()},
+               state
+             )
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, paused_state)
+
+    assert {:reply, {:ok, %{dispatch_paused: true, changed: false}}, same_state} =
+             Orchestrator.handle_call(
+               {:set_dispatch_paused, true},
+               {self(), make_ref()},
+               paused_state
+             )
+
+    assert {:reply, {:ok, %{dispatch_paused: false, changed: true}}, resumed_state} =
+             Orchestrator.handle_call(
+               {:set_dispatch_paused, false},
+               {self(), make_ref()},
+               same_state
+             )
+
+    refute resumed_state.dispatch_paused
+    assert is_reference(resumed_state.tick_timer_ref)
+    Process.cancel_timer(resumed_state.tick_timer_ref)
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(events, &(&1["transition"] == "dispatch_paused")) == 1
+    assert Enum.count(events, &(&1["transition"] == "dispatch_resumed")) == 1
+  end
+
+  test "global pause defers queued retries without consuming their attempt" do
+    issue_id = "issue-paused-retry"
+    retry_token = make_ref()
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      dispatch_paused: true,
+      retry_attempts: %{
+        issue_id => %{
+          attempt: 3,
+          timer_ref: nil,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond),
+          identifier: "MT-PAUSED-RETRY",
+          error: "agent exited: :boom"
+        }
+      }
+    }
+
+    assert {:noreply, deferred_state} =
+             Orchestrator.handle_info({:retry_issue, issue_id, retry_token}, state)
+
+    deferred_retry = deferred_state.retry_attempts[issue_id]
+    assert deferred_retry.attempt == 3
+    refute deferred_retry.retry_token == retry_token
+    assert is_reference(deferred_retry.timer_ref)
+
+    assert {:reply, {:ok, %{dispatch_paused: false, changed: true}}, resumed_state} =
+             Orchestrator.handle_call(
+               {:set_dispatch_paused, false},
+               {self(), make_ref()},
+               %{deferred_state | run_ledger_path: nil}
+             )
+
+    resumed_retry = resumed_state.retry_attempts[issue_id]
+    assert resumed_retry.attempt == 3
+    assert resumed_retry.due_at_ms <= System.monotonic_time(:millisecond)
+    assert is_reference(resumed_retry.timer_ref)
+    assert is_reference(resumed_state.tick_timer_ref)
+
+    Process.cancel_timer(resumed_retry.timer_ref)
+    Process.cancel_timer(resumed_state.tick_timer_ref)
+  end
+
   test "typed waits require matching ids and allowed actions before resume" do
     issue_id = "issue-secret-wait"
 
@@ -1155,6 +1258,141 @@ defmodule SymphonyElixir.CoreTest do
     assert coalesced_state.running == state.running
     assert coalesced_state.claimed == state.claimed
     assert {:noreply, ^coalesced_state} = Orchestrator.handle_info({:tick, stale_tick_token}, coalesced_state)
+  end
+
+  test "Linear retry command resumes a matching wait exactly once while globally paused" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    ledger_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-operator-retry-#{RunLedger.new_id("test")}/events.jsonl"
+      )
+
+    issue_id = "issue-operator-retry"
+    cursor_at = ~U[2026-08-03 10:00:00Z]
+    command_at = ~U[2026-08-03 10:00:01Z]
+
+    assert {:ok, wait} =
+             SymphonyElixir.OperatorWait.new("waiting_secret", %{
+               issue_id: issue_id,
+               identifier: "MT-OPERATOR-RETRY",
+               run_id: "run-operator-retry",
+               parked_at: cursor_at
+             })
+
+    comment = %SymphonyElixir.Linear.Comment{
+      id: "comment-retry",
+      body: "$retry after reconnect",
+      created_at: command_at
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue_id => [comment, :invalid_comment]
+    })
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: ledger_path,
+      runner_generation: "runner-operator-retry",
+      dispatch_paused: true,
+      parked: %{issue_id => wait},
+      operator_comment_cursors: %{
+        issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:noreply, resumed_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    refute Map.has_key?(resumed_state.parked, issue_id)
+    assert MapSet.member?(resumed_state.processed_operator_comment_ids, comment.id)
+
+    assert {:noreply, repeated_state} =
+             Orchestrator.handle_info(:run_poll_cycle, resumed_state)
+
+    if is_reference(repeated_state.tick_timer_ref),
+      do: Process.cancel_timer(repeated_state.tick_timer_ref)
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(events, &(&1["transition"] == "wait_resumed")) == 1
+    assert Enum.count(events, &(&1["transition"] == "operator_command_applied")) == 1
+  end
+
+  test "Linear stop command durably parks a running issue for operator retry" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    ledger_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-operator-stop-#{RunLedger.new_id("test")}/events.jsonl"
+      )
+
+    issue_id = "issue-operator-stop"
+    cursor_at = ~U[2026-08-03 10:00:00Z]
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-OPERATOR-STOP",
+      state: "In Progress",
+      title: "Stop this worker",
+      assigned_to_worker: true
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue_id => [
+        %SymphonyElixir.Linear.Comment{
+          id: "comment-stop",
+          body: "$stop",
+          created_at: ~U[2026-08-03 10:00:01Z]
+        }
+      ]
+    })
+
+    agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(agent_pid), do: Process.exit(agent_pid, :kill) end)
+
+    running_entry = %{
+      pid: agent_pid,
+      ref: nil,
+      run_id: "run-operator-stop",
+      retry_attempt: 0,
+      identifier: issue.identifier,
+      issue: issue,
+      started_at: cursor_at,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0
+    }
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: ledger_path,
+      runner_generation: "runner-operator-stop",
+      dispatch_paused: true,
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      operator_comment_cursors: %{
+        issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:noreply, stopped_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    refute Map.has_key?(stopped_state.running, issue_id)
+    assert stopped_state.parked[issue_id].reason == "operator_stopped"
+    assert stopped_state.parked[issue_id].allowed_actions == ["retry", "reject"]
+    refute Process.alive?(agent_pid)
+
+    if is_reference(stopped_state.tick_timer_ref),
+      do: Process.cancel_timer(stopped_state.tick_timer_ref)
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(events, &(&1["transition"] == "run_parked")) == 1
+    assert Enum.count(events, &(&1["transition"] == "operator_command_applied")) == 1
   end
 
   test "select_worker_host_for_test skips full ssh hosts under the shared per-host cap" do
