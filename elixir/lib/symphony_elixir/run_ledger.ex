@@ -14,6 +14,83 @@ defmodule SymphonyElixir.RunLedger do
                           "run_parked",
                           "run_stopped"
                         ])
+  @transition_schemas %{
+    "runner_started" => %{required_strings: ~w(stage runner_generation)},
+    "run_claimed" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier),
+      required_attempt: true
+    },
+    "run_started" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier),
+      required_attempt: true
+    },
+    "run_runtime_ready" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier),
+      required_attempt: true
+    },
+    "model_resolved" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier resolved_model),
+      required_attempt: true
+    },
+    "run_completed" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier terminal_reason),
+      required_attempt: true
+    },
+    "run_failed" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier terminal_reason),
+      required_attempt: true
+    },
+    "run_interrupted" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier terminal_reason),
+      required_attempt: true
+    },
+    "run_parked" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason),
+      required_attempt: true,
+      typed_wait: true
+    },
+    "run_stopped" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier terminal_reason),
+      required_attempt: true
+    },
+    "retry_scheduled" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier),
+      required_attempt: true
+    },
+    "wait_resumed" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason),
+      required_attempt: true,
+      typed_wait: true
+    },
+    "wait_rejected" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason),
+      required_attempt: true,
+      typed_wait: true
+    },
+    "wait_released" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason terminal_reason),
+      required_attempt: true,
+      typed_wait: true
+    },
+    "dispatch_paused" => %{required_strings: ~w(stage runner_generation)},
+    "dispatch_resumed" => %{required_strings: ~w(stage runner_generation)},
+    "operator_cursor_initialized" => %{
+      required_strings: ~w(stage issue_id comment_created_at runner_generation),
+      timestamp_field: "comment_created_at"
+    },
+    "operator_cursor_advanced" => %{
+      required_strings: ~w(stage issue_id comment_id comment_created_at runner_generation),
+      timestamp_field: "comment_created_at"
+    },
+    "operator_command_applied" => %{
+      required_strings: ~w(stage issue_id comment_id comment_created_at operator_command runner_generation),
+      timestamp_field: "comment_created_at"
+    },
+    "operator_command_rejected" => %{
+      required_strings: ~w(stage issue_id comment_id comment_created_at operator_command runner_generation),
+      timestamp_field: "comment_created_at"
+    }
+  }
   @allowed_fields MapSet.new([
                     :allowed_actions,
                     :attempt,
@@ -63,9 +140,13 @@ defmodule SymphonyElixir.RunLedger do
       |> Map.take(MapSet.to_list(@allowed_fields))
       |> Map.put(:schema_version, @schema_version)
       |> Map.put(:event_id, new_id("evt"))
-      |> Map.put(:occurred_at, DateTime.utc_now() |> DateTime.truncate(:millisecond))
+      |> Map.put(
+        :occurred_at,
+        DateTime.utc_now() |> DateTime.truncate(:millisecond) |> DateTime.to_iso8601()
+      )
 
-    with :ok <- File.mkdir_p(Path.dirname(path)),
+    with :ok <- validate_event_payload(stringify_keys(payload)),
+         :ok <- File.mkdir_p(Path.dirname(path)),
          :ok <- ensure_private_file(path),
          {:ok, encoded} <- Jason.encode(payload) do
       append_synced(path, encoded <> "\n")
@@ -363,17 +444,90 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp validate_event(event, line_number) do
+    with :ok <- validate_event_payload(event) do
+      {:ok, event}
+    else
+      {:error, reason} -> {:error, {:invalid_ledger_record, line_number, reason}}
+    end
+  end
+
+  defp validate_event_payload(event) do
     with :ok <- validate_event_fields(event),
          :ok <- validate_schema_version(event),
          :ok <- validate_required_string(event, "event_id"),
          :ok <- validate_occurred_at(event),
          :ok <- validate_required_string(event, "transition"),
+         {:ok, transition_schema} <- transition_schema(event),
          :ok <- validate_optional_attempt(event),
          :ok <- validate_optional_actions(event),
-         :ok <- validate_optional_strings(event) do
-      {:ok, event}
-    else
-      {:error, reason} -> {:error, {:invalid_ledger_record, line_number, reason}}
+         :ok <- validate_optional_strings(event),
+         :ok <- validate_transition_fields(event, transition_schema) do
+      :ok
+    end
+  end
+
+  defp stringify_keys(event) do
+    Map.new(event, fn {key, value} -> {to_string(key), value} end)
+  end
+
+  defp transition_schema(%{"transition" => transition}) do
+    case Map.fetch(@transition_schemas, transition) do
+      {:ok, schema} -> {:ok, schema}
+      :error -> {:error, {:unknown_transition, transition}}
+    end
+  end
+
+  defp validate_transition_fields(event, schema) do
+    with :ok <- validate_required_strings(event, Map.get(schema, :required_strings, [])),
+         :ok <- validate_required_attempt(event, Map.get(schema, :required_attempt, false)),
+         :ok <- validate_typed_wait(event, Map.get(schema, :typed_wait, false)),
+         :ok <- validate_timestamp_field(event, Map.get(schema, :timestamp_field)) do
+      :ok
+    end
+  end
+
+  defp validate_required_strings(event, fields) do
+    Enum.reduce_while(fields, :ok, fn field, :ok ->
+      case validate_required_string(event, field) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp validate_required_attempt(_event, false), do: :ok
+
+  defp validate_required_attempt(event, true) do
+    case Map.fetch(event, "attempt") do
+      {:ok, attempt} when is_integer(attempt) and attempt >= 0 -> :ok
+      _other -> {:error, {:invalid_field, "attempt"}}
+    end
+  end
+
+  defp validate_typed_wait(_event, false), do: :ok
+
+  defp validate_typed_wait(event, true) do
+    reason = event["parked_reason"]
+    expected_actions = SymphonyElixir.OperatorWait.allowed_actions(reason)
+
+    cond do
+      not SymphonyElixir.OperatorWait.valid_reason?(reason) ->
+        {:error, {:invalid_field, "parked_reason"}}
+
+      event["allowed_actions"] != expected_actions ->
+        {:error, {:invalid_field, "allowed_actions"}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_timestamp_field(_event, nil), do: :ok
+
+  defp validate_timestamp_field(event, field) do
+    case DateTime.from_iso8601(event[field]) do
+      {:ok, _datetime, _offset} -> :ok
+      _other -> {:error, {:invalid_field, field}}
     end
   end
 

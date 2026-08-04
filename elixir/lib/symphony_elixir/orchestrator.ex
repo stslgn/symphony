@@ -74,31 +74,38 @@ defmodule SymphonyElixir.Orchestrator do
     config = Config.settings!()
     run_ledger_path = Keyword.get(opts, :run_ledger_path, RunLedger.default_path())
     runner_generation = RunLedger.new_id("runner")
+    restore_parked_waits_fn = Keyword.get(opts, :restore_parked_waits_fn, &restore_parked_waits/1)
 
     case RunLedger.reconcile_startup(run_ledger_path, runner_generation) do
       {:ok, recovery} ->
-        state = %State{
-          poll_interval_ms: config.polling.interval_ms,
-          max_concurrent_agents: config.agent.max_concurrent_agents,
-          next_poll_due_at_ms: now_ms,
-          poll_check_in_progress: false,
-          tick_timer_ref: nil,
-          tick_token: nil,
-          run_ledger_path: run_ledger_path,
-          runner_generation: runner_generation,
-          dispatch_paused: recovery.dispatch_paused,
-          recovered_attempts: recovery.recovered_attempts,
-          parked: restore_parked_waits(recovery.parked),
-          processed_operator_comment_ids: recovery.processed_operator_comment_ids,
-          operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
-          codex_totals: @empty_codex_totals,
-          codex_rate_limits: nil
-        }
+        case restore_parked_waits_fn.(recovery.parked) do
+          {:ok, parked} ->
+            state = %State{
+              poll_interval_ms: config.polling.interval_ms,
+              max_concurrent_agents: config.agent.max_concurrent_agents,
+              next_poll_due_at_ms: now_ms,
+              poll_check_in_progress: false,
+              tick_timer_ref: nil,
+              tick_token: nil,
+              run_ledger_path: run_ledger_path,
+              runner_generation: runner_generation,
+              dispatch_paused: recovery.dispatch_paused,
+              recovered_attempts: recovery.recovered_attempts,
+              parked: parked,
+              processed_operator_comment_ids: recovery.processed_operator_comment_ids,
+              operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
+              codex_totals: @empty_codex_totals,
+              codex_rate_limits: nil
+            }
 
-        run_terminal_workspace_cleanup()
-        state = schedule_tick(state, 0)
+            run_terminal_workspace_cleanup()
+            state = schedule_tick(state, 0)
 
-        {:ok, state}
+            {:ok, state}
+
+          {:error, reason} ->
+            {:stop, {:operator_wait_restore_failed, reason}}
+        end
 
       {:error, reason} ->
         {:stop, {:run_ledger_unavailable, reason}}
@@ -2533,17 +2540,18 @@ defmodule SymphonyElixir.Orchestrator do
   defp restore_operator_comment_cursors(_cursors), do: %{}
 
   defp restore_parked_waits(events) when is_map(events) do
-    Enum.reduce(events, %{}, fn {issue_id, event}, restored ->
+    Enum.reduce_while(events, {:ok, %{}}, fn {issue_id, event}, {:ok, restored} ->
       case OperatorWait.from_ledger_event(event) do
         {:ok, wait} ->
-          Map.put(restored, issue_id, wait)
+          {:cont, {:ok, Map.put(restored, issue_id, wait)}}
 
         {:error, reason} ->
-          Logger.warning("Ignoring invalid parked wait issue_id=#{issue_id}: #{inspect(reason)}")
-          restored
+          {:halt, {:error, {:invalid_parked_wait, issue_id, reason}}}
       end
     end)
   end
+
+  defp restore_parked_waits(_events), do: {:error, :invalid_parked_wait_collection}
 
   defp log_run_event_result(:ok, _issue_id), do: :ok
 

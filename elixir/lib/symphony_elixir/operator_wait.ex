@@ -67,27 +67,72 @@ defmodule SymphonyElixir.OperatorWait do
 
   def new(_reason, _attrs), do: {:error, :invalid_wait_reason}
 
-  @spec from_ledger_event(map()) :: {:ok, map()} | {:error, :invalid_wait_reason}
+  @spec from_ledger_event(map()) ::
+          {:ok, map()} | {:error, :invalid_wait_reason | {:invalid_wait_field, String.t()}}
   def from_ledger_event(event) when is_map(event) do
-    new(event["parked_reason"], %{
-      wait_id: event["wait_id"],
-      issue_id: event["issue_id"],
-      identifier: event["issue_identifier"],
-      run_id: event["run_id"],
-      attempt: event["attempt"],
-      stage: event["stage"],
-      tracker_state: event["tracker_state"],
-      terminal_reason: event["terminal_reason"],
-      parked_at: parse_timestamp(event["occurred_at"])
-    })
+    with :ok <- validate_ledger_identity(event),
+         :ok <- validate_ledger_actions(event),
+         {:ok, parked_at} <- parse_timestamp(event["occurred_at"]) do
+      new(event["parked_reason"], %{
+        wait_id: event["wait_id"],
+        issue_id: event["issue_id"],
+        identifier: event["issue_identifier"],
+        run_id: event["run_id"],
+        attempt: event["attempt"],
+        stage: event["stage"],
+        tracker_state: event["tracker_state"],
+        terminal_reason: event["terminal_reason"],
+        parked_at: parked_at
+      })
+    end
+  end
+
+  def from_ledger_event(_event), do: {:error, {:invalid_wait_field, "event"}}
+
+  defp validate_ledger_identity(event) do
+    with :ok <- validate_required_string(event, "wait_id"),
+         :ok <- validate_required_string(event, "issue_id"),
+         :ok <- validate_required_string(event, "issue_identifier"),
+         :ok <- validate_required_string(event, "run_id"),
+         :ok <- validate_required_attempt(event) do
+      :ok
+    end
+  end
+
+  defp validate_required_string(event, field) do
+    case Map.fetch(event, field) do
+      {:ok, value} when is_binary(value) and value != "" -> :ok
+      _other -> {:error, {:invalid_wait_field, field}}
+    end
+  end
+
+  defp validate_required_attempt(%{"attempt" => attempt})
+       when is_integer(attempt) and attempt >= 0,
+       do: :ok
+
+  defp validate_required_attempt(_event), do: {:error, {:invalid_wait_field, "attempt"}}
+
+  defp validate_ledger_actions(event) do
+    reason = event["parked_reason"]
+
+    cond do
+      not valid_reason?(reason) ->
+        {:error, :invalid_wait_reason}
+
+      event["allowed_actions"] != allowed_actions(reason) ->
+        {:error, {:invalid_wait_field, "allowed_actions"}}
+
+      true ->
+        :ok
+    end
   end
 
   defp parse_timestamp(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do
-      {:ok, timestamp, _offset} -> timestamp
-      {:error, _reason} -> DateTime.utc_now()
+      {:ok, timestamp, _offset} -> {:ok, timestamp}
+      {:error, _reason} -> {:error, {:invalid_wait_field, "occurred_at"}}
     end
   end
 
-  defp parse_timestamp(_value), do: DateTime.utc_now()
+  defp parse_timestamp(_value), do: {:error, {:invalid_wait_field, "occurred_at"}}
 end

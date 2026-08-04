@@ -55,7 +55,7 @@ defmodule SymphonyElixir.OperatorWaitTest do
     assert {:error, :invalid_wait_reason} = OperatorWait.new(nil, %{})
   end
 
-  test "restores ledger timestamps and tolerates malformed timestamps" do
+  test "restores only complete ledger waits with valid timestamps" do
     event = %{
       "parked_reason" => "waiting_owner",
       "wait_id" => "wait-1",
@@ -66,6 +66,7 @@ defmodule SymphonyElixir.OperatorWaitTest do
       "stage" => "human_review",
       "tracker_state" => "Human Review",
       "terminal_reason" => "turn_budget_exhausted",
+      "allowed_actions" => ["approve", "reject"],
       "occurred_at" => "2026-07-29T10:00:00.000Z"
     }
 
@@ -73,14 +74,13 @@ defmodule SymphonyElixir.OperatorWaitTest do
     assert wait.parked_at == ~U[2026-07-29 10:00:00.000Z]
     assert wait.terminal_reason == "turn_budget_exhausted"
 
-    assert {:ok, fallback_wait} =
+    assert {:error, {:invalid_wait_field, "occurred_at"}} =
              OperatorWait.from_ledger_event(%{event | "occurred_at" => "bad"})
 
-    assert %DateTime{} = fallback_wait.parked_at
+    assert {:error, {:invalid_wait_field, "run_id"}} =
+             OperatorWait.from_ledger_event(Map.delete(event, "run_id"))
 
-    assert {:ok, missing_wait} =
-             OperatorWait.from_ledger_event(Map.delete(event, "occurred_at"))
-
-    assert %DateTime{} = missing_wait.parked_at
+    assert {:error, {:invalid_wait_field, "allowed_actions"}} =
+             OperatorWait.from_ledger_event(%{event | "allowed_actions" => ["retry"]})
   end
 end

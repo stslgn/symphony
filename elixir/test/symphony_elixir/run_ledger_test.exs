@@ -79,8 +79,10 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert :ok =
              RunLedger.append(path, %{
                transition: "run_started",
+               stage: "running",
                run_id: "run-parked-tail",
                issue_id: "issue-parked-tail",
+               issue_identifier: "DUD-PARKED-TAIL",
                attempt: 2
              })
 
@@ -91,7 +93,10 @@ defmodule SymphonyElixir.RunLedgerTest do
                issue_id: "issue-parked-tail",
                attempt: 2,
                wait_id: "wait-parked-tail",
-               parked_reason: "operator_wait"
+               issue_identifier: "DUD-PARKED-TAIL",
+               stage: "parked",
+               parked_reason: "waiting_owner",
+               allowed_actions: ["approve", "reject"]
              })
 
     corrupt_last_record!(path)
@@ -106,17 +111,22 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert :ok =
              RunLedger.append(path, %{
                transition: "run_started",
+               stage: "running",
                run_id: "run-terminal-tail",
                issue_id: "issue-terminal-tail",
+               issue_identifier: "DUD-TERMINAL-TAIL",
                attempt: 1
              })
 
     assert :ok =
              RunLedger.append(path, %{
                transition: "run_completed",
+               stage: "released",
                run_id: "run-terminal-tail",
                issue_id: "issue-terminal-tail",
-               attempt: 1
+               issue_identifier: "DUD-TERMINAL-TAIL",
+               attempt: 1,
+               terminal_reason: "worker_completed"
              })
 
     corrupt_last_record!(path)
@@ -128,9 +138,21 @@ defmodule SymphonyElixir.RunLedgerTest do
   test "fails startup closed on corruption in the middle of the ledger" do
     path = ledger_path()
 
-    assert :ok = RunLedger.append(path, %{transition: "dispatch_paused"})
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "dispatch_paused",
+               stage: "operator",
+               runner_generation: "runner-old"
+             })
+
     File.write!(path, "not-json\n", [:append])
-    assert :ok = RunLedger.append(path, %{transition: "dispatch_resumed"})
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "dispatch_resumed",
+               stage: "operator",
+               runner_generation: "runner-old"
+             })
 
     assert {:error, {:invalid_ledger_record, 2, :malformed_json}} =
              RunLedger.reconcile_startup(path, "runner-new")
@@ -149,8 +171,10 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert :ok =
              RunLedger.append(invalid_attempt_path, %{
                transition: "run_started",
+               stage: "running",
                run_id: "run-invalid-attempt",
                issue_id: "issue-invalid-attempt",
+               issue_identifier: "DUD-INVALID-ATTEMPT",
                attempt: 1
              })
 
@@ -159,6 +183,54 @@ defmodule SymphonyElixir.RunLedgerTest do
 
     assert {:error, {:invalid_ledger_record, 1, {:invalid_field, "attempt"}}} =
              RunLedger.reconcile_startup(invalid_attempt_path, "runner-new")
+  end
+
+  test "rejects valid JSON semantic corruption at the tail" do
+    path = ledger_path()
+
+    append_complete_run!(path, "run-semantic-tail", "issue-semantic-tail")
+    [started, completed] = valid_records(path)
+
+    File.write!(
+      path,
+      Enum.map_join([started, Map.delete(completed, "run_id")], "\n", &Jason.encode!/1) <> "\n"
+    )
+
+    assert {:error, {:invalid_ledger_record, 2, {:invalid_field, "run_id"}}} =
+             RunLedger.reconcile_startup(path, "runner-new")
+  end
+
+  test "rejects valid JSON semantic corruption in the middle" do
+    path = ledger_path()
+
+    append_parked_run!(path, "run-semantic-middle", "issue-semantic-middle")
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "dispatch_paused",
+               stage: "operator",
+               runner_generation: "runner-old"
+             })
+
+    [parked, paused] = valid_records(path)
+
+    File.write!(
+      path,
+      Enum.map_join([%{parked | "parked_reason" => "not-a-wait-reason"}, paused], "\n", &Jason.encode!/1) <>
+        "\n"
+    )
+
+    assert {:error, {:invalid_ledger_record, 1, {:invalid_field, "parked_reason"}}} =
+             RunLedger.reconcile_startup(path, "runner-new")
+  end
+
+  test "rejects transitions outside the closed vocabulary" do
+    path = ledger_path()
+
+    assert {:error, {:unknown_transition, "run_maybe"}} =
+             RunLedger.append(path, %{transition: "run_maybe"})
+
+    refute File.exists?(path)
   end
 
   test "startup reconciliation restores parked waits until they are resumed" do
@@ -188,27 +260,38 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert :ok =
              RunLedger.append(path, %{
                transition: "wait_resumed",
-               stage: "released",
+               stage: "parked",
+               run_id: "run-parked",
                issue_id: "issue-parked",
-               wait_id: "wait-parked"
+               issue_identifier: "DUD-3",
+               attempt: 2,
+               wait_id: "wait-parked",
+               parked_reason: "waiting_owner",
+               allowed_actions: ["approve", "reject"]
              })
 
     assert {:ok, next_recovery} = RunLedger.reconcile_startup(path, "runner-next")
-    assert next_recovery.recovered_attempts == %{}
+    assert next_recovery.recovered_attempts == %{"issue-parked" => 2}
     assert next_recovery.parked == %{}
   end
 
   test "startup reconciliation restores global pause and operator command cursors" do
     path = ledger_path()
 
-    assert :ok = RunLedger.append(path, %{transition: "dispatch_paused", stage: "operator"})
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "dispatch_paused",
+               stage: "operator",
+               runner_generation: "runner-old"
+             })
 
     assert :ok =
              RunLedger.append(path, %{
                transition: "operator_cursor_initialized",
                stage: "operator",
                issue_id: "issue-1",
-               comment_created_at: "2026-08-03T09:59:59.000Z"
+               comment_created_at: "2026-08-03T09:59:59.000Z",
+               runner_generation: "runner-old"
              })
 
     assert :ok =
@@ -217,7 +300,8 @@ defmodule SymphonyElixir.RunLedgerTest do
                stage: "operator",
                issue_id: "issue-1",
                comment_id: "comment-1",
-               comment_created_at: "2026-08-03T10:00:00.000Z"
+               comment_created_at: "2026-08-03T10:00:00.000Z",
+               runner_generation: "runner-old"
              })
 
     assert :ok =
@@ -226,7 +310,8 @@ defmodule SymphonyElixir.RunLedgerTest do
                stage: "operator",
                issue_id: "issue-1",
                comment_id: "comment-2",
-               comment_created_at: "2026-08-03T10:00:00.000Z"
+               comment_created_at: "2026-08-03T10:00:00.000Z",
+               runner_generation: "runner-old"
              })
 
     assert :ok =
@@ -235,7 +320,8 @@ defmodule SymphonyElixir.RunLedgerTest do
                stage: "operator",
                issue_id: "issue-1",
                comment_id: "comment-old",
-               comment_created_at: "2026-08-03T09:59:58.000Z"
+               comment_created_at: "2026-08-03T09:59:58.000Z",
+               runner_generation: "runner-old"
              })
 
     assert :ok =
@@ -244,7 +330,9 @@ defmodule SymphonyElixir.RunLedgerTest do
                stage: "operator",
                issue_id: "issue-1",
                comment_id: "comment-1",
-               operator_command: "retry"
+               comment_created_at: "2026-08-03T10:00:00.000Z",
+               operator_command: "retry",
+               runner_generation: "runner-old"
              })
 
     assert {:ok, paused_recovery} = RunLedger.reconcile_startup(path, "runner-paused")
@@ -258,7 +346,13 @@ defmodule SymphonyElixir.RunLedgerTest do
              }
            }
 
-    assert :ok = RunLedger.append(path, %{transition: "dispatch_resumed", stage: "operator"})
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "dispatch_resumed",
+               stage: "operator",
+               runner_generation: "runner-old"
+             })
+
     assert {:ok, resumed_recovery} = RunLedger.reconcile_startup(path, "runner-resumed")
     refute resumed_recovery.dispatch_paused
   end
@@ -291,8 +385,10 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert :ok =
              RunLedger.append(path, %{
                transition: "run_started",
+               stage: "running",
                run_id: "run-stale",
                issue_id: "issue-stale",
+               issue_identifier: "DUD-STALE",
                attempt: 1
              })
 
@@ -328,5 +424,45 @@ defmodule SymphonyElixir.RunLedgerTest do
     |> File.read!()
     |> String.split("\n", trim: true)
     |> Enum.map(&Jason.decode!/1)
+  end
+
+  defp append_complete_run!(path, run_id, issue_id) do
+    issue_identifier = "DUD-SEMANTIC-TAIL"
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_started",
+               stage: "running",
+               run_id: run_id,
+               issue_id: issue_id,
+               issue_identifier: issue_identifier,
+               attempt: 1
+             })
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_completed",
+               stage: "released",
+               run_id: run_id,
+               issue_id: issue_id,
+               issue_identifier: issue_identifier,
+               attempt: 1,
+               terminal_reason: "worker_completed"
+             })
+  end
+
+  defp append_parked_run!(path, run_id, issue_id) do
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_parked",
+               stage: "parked",
+               run_id: run_id,
+               issue_id: issue_id,
+               issue_identifier: "DUD-SEMANTIC-MIDDLE",
+               attempt: 1,
+               wait_id: "wait-semantic-middle",
+               parked_reason: "waiting_owner",
+               allowed_actions: ["approve", "reject"]
+             })
   end
 end

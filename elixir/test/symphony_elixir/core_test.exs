@@ -455,6 +455,16 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, []} = Client.fetch_issue_states_by_ids([])
   end
 
+  test "orchestrator startup aborts when a parked wait cannot be restored" do
+    ledger_path = ledger_path("restore-wait-failure")
+
+    assert {:stop, {:operator_wait_restore_failed, :forced_restore_failure}} =
+             Orchestrator.init(
+               run_ledger_path: ledger_path,
+               restore_parked_waits_fn: fn _parked -> {:error, :forced_restore_failure} end
+             )
+  end
+
   test "non-active issue state stops running agent without cleaning workspace" do
     test_root =
       Path.join(
@@ -1170,6 +1180,8 @@ defmodule SymphonyElixir.CoreTest do
       running_entry = %{
         pid: agent_pid,
         ref: nil,
+        run_id: "run-missing",
+        retry_attempt: 0,
         identifier: issue_identifier,
         issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
         started_at: DateTime.utc_now()
@@ -1299,6 +1311,8 @@ defmodule SymphonyElixir.CoreTest do
     running_entry = %{
       pid: self(),
       ref: ref,
+      run_id: "run-resume",
+      retry_attempt: 0,
       identifier: "MT-558",
       issue: %Issue{id: issue_id, identifier: "MT-558", state: "In Progress"},
       started_at: DateTime.utc_now()
@@ -1340,6 +1354,7 @@ defmodule SymphonyElixir.CoreTest do
     running_entry = %{
       pid: self(),
       ref: ref,
+      run_id: "run-crash",
       identifier: "MT-559",
       retry_attempt: 2,
       issue: %Issue{id: issue_id, identifier: "MT-559", state: "In Progress"},
@@ -1381,6 +1396,8 @@ defmodule SymphonyElixir.CoreTest do
     running_entry = %{
       pid: self(),
       ref: ref,
+      run_id: "run-crash-initial",
+      retry_attempt: 0,
       identifier: "MT-560",
       issue: %Issue{id: issue_id, identifier: "MT-560", state: "In Progress"},
       started_at: DateTime.utc_now()
