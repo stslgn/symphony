@@ -1232,6 +1232,65 @@ defmodule SymphonyElixir.CoreTest do
     Process.cancel_timer(recovered_state.retry_attempts[issue_id].timer_ref)
   end
 
+  test "retry append failure retains a claimed durable-retry pending state" do
+    issue_id = "issue-retry-durability"
+    ref = make_ref()
+    path = ledger_path("retry-durability")
+    state = terminal_transition_state(issue_id, ref, path, retry_attempt: 3)
+    seed_running_ledger!(path, state.running[issue_id])
+
+    append_fn = fn ledger_path, event ->
+      if event.transition == "retry_scheduled" do
+        {:error, :forced_retry_append_failure}
+      else
+        RunLedger.append(ledger_path, event)
+      end
+    end
+
+    state = %{state | run_ledger_append_fn: append_fn}
+
+    assert {:noreply, pending_state} =
+             Orchestrator.handle_info({:DOWN, ref, :process, self(), :worker_crashed}, state)
+
+    refute Map.has_key?(pending_state.running, issue_id)
+    assert MapSet.member?(pending_state.claimed, issue_id)
+
+    assert %{
+             attempt: 4,
+             status: :durability_pending,
+             timer_ref: nil,
+             retry_token: nil,
+             persistence_error: :forced_retry_append_failure
+           } = pending_state.retry_attempts[issue_id]
+
+    candidate = %Issue{
+      id: issue_id,
+      identifier: "MT-TERMINAL",
+      title: "Retry durability",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(candidate, pending_state)
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-retry-durability")
+    assert recovery.recovered_attempts[issue_id] == 4
+
+    scheduled_state =
+      pending_state
+      |> Map.put(:run_ledger_append_fn, &RunLedger.append/2)
+      |> Orchestrator.retry_pending_durable_retries_for_test()
+
+    assert scheduled_state.retry_attempts[issue_id].status == :scheduled
+    assert is_reference(scheduled_state.retry_attempts[issue_id].timer_ref)
+    assert MapSet.member?(scheduled_state.claimed, issue_id)
+
+    assert {:ok, events} = RunLedger.read_events(path)
+    assert Enum.count(events, &(&1["transition"] == "retry_scheduled")) == 1
+
+    Process.cancel_timer(scheduled_state.retry_attempts[issue_id].timer_ref)
+  end
+
   test "tracker terminal ledger failure blocks worker stop cleanup and claim release" do
     test_root =
       Path.join(

@@ -150,6 +150,7 @@ defmodule SymphonyElixir.RunLedger do
                     :operator_command,
                     :parked_reason,
                     :model_catalog_source,
+                    :next_action,
                     :next_attempt,
                     :reasoning_effort,
                     :resolved_model,
@@ -404,6 +405,35 @@ defmodule SymphonyElixir.RunLedger do
 
   defp update_recovered_dispatch_state(
          %{
+           "transition" => transition,
+           "next_action" => next_action,
+           "next_attempt" => next_attempt,
+           "issue_id" => issue_id
+         } = event,
+         acc
+       )
+       when transition in ["run_completed", "run_failed", "run_stopped"] and
+              next_action in ["continuation", "retry"] and is_integer(next_attempt) and
+              next_attempt >= 1 and is_binary(issue_id) do
+    dispatch = recovered_next_action_dispatch(event, next_attempt)
+    Map.update(acc, issue_id, dispatch, &prefer_recovered_dispatch(&1, dispatch))
+  end
+
+  defp update_recovered_dispatch_state(
+         %{
+           "transition" => "retry_scheduled",
+           "next_attempt" => next_attempt,
+           "issue_id" => issue_id
+         } = event,
+         acc
+       )
+       when is_integer(next_attempt) and next_attempt >= 1 and is_binary(issue_id) do
+    dispatch = recovered_next_action_dispatch(event, next_attempt)
+    Map.update(acc, issue_id, dispatch, &prefer_recovered_dispatch(&1, dispatch))
+  end
+
+  defp update_recovered_dispatch_state(
+         %{
            "transition" => "run_interrupted",
            "terminal_reason" => "runner_restarted",
            "issue_id" => issue_id
@@ -450,6 +480,17 @@ defmodule SymphonyElixir.RunLedger do
       worker_host: event["worker_host"],
       workspace_path: event["workspace_path"],
       stage: "recovery_queued"
+    }
+  end
+
+  defp recovered_next_action_dispatch(event, attempt) do
+    %{
+      attempt: attempt,
+      previous_run_id: event["run_id"],
+      identifier: event["issue_identifier"],
+      worker_host: event["worker_host"],
+      workspace_path: event["workspace_path"],
+      stage: "retry_queued"
     }
   end
 
@@ -520,6 +561,8 @@ defmodule SymphonyElixir.RunLedger do
         transition: "run_interrupted",
         stage: "released",
         terminal_reason: "runner_restarted",
+        next_action: "retry",
+        next_attempt: integer_value(event["attempt"], 0) + 1,
         runner_generation: runner_generation,
         run_id: run_id,
         issue_id: event["issue_id"],
@@ -599,8 +642,9 @@ defmodule SymphonyElixir.RunLedger do
          :ok <- validate_required_next_attempt(event, Map.get(schema, :required_next_attempt, false)),
          :ok <- validate_typed_wait(event, Map.get(schema, :typed_wait, false)),
          :ok <- validate_timestamp_field(event, Map.get(schema, :timestamp_field)),
-         :ok <- validate_transition_stage(event) do
-      validate_terminal_reason(event)
+         :ok <- validate_transition_stage(event),
+         :ok <- validate_terminal_reason(event) do
+      validate_next_action(event)
     end
   end
 
@@ -682,6 +726,41 @@ defmodule SymphonyElixir.RunLedger do
       :error ->
         if is_nil(event["terminal_reason"]), do: :ok, else: {:error, {:invalid_field, "terminal_reason"}}
     end
+  end
+
+  defp validate_next_action(%{"transition" => transition} = event)
+       when transition in ["run_completed", "run_failed", "run_interrupted", "run_stopped"] do
+    action = event["next_action"]
+    next_attempt = event["next_attempt"]
+
+    allowed_actions =
+      case transition do
+        "run_completed" -> ["continuation"]
+        "run_failed" -> ["retry"]
+        "run_interrupted" -> ["retry"]
+        "run_stopped" -> ["none", "retry"]
+      end
+
+    cond do
+      is_nil(action) ->
+        :ok
+
+      action not in allowed_actions ->
+        {:error, {:invalid_field, "next_action"}}
+
+      action == "none" and not is_nil(next_attempt) ->
+        {:error, {:invalid_field, "next_attempt"}}
+
+      action != "none" and not (is_integer(next_attempt) and next_attempt >= 1) ->
+        {:error, {:invalid_field, "next_attempt"}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_next_action(event) do
+    if is_nil(event["next_action"]), do: :ok, else: {:error, {:invalid_field, "next_action"}}
   end
 
   defp validate_event_fields(event) do
@@ -829,10 +908,15 @@ defmodule SymphonyElixir.RunLedger do
          {:ok, run} <- merge_run_affinity(run, event) do
       next_state = put_run(state, event["run_id"], %{run | phase: :terminal, terminal: transition})
 
-      if transition == "run_interrupted" and event["terminal_reason"] == "runner_restarted" do
-        {:ok, put_dispatch(next_state, event, event["attempt"] + 1)}
-      else
-        {:ok, next_state}
+      cond do
+        event["next_action"] in ["continuation", "retry"] ->
+          {:ok, put_dispatch(next_state, event, event["next_attempt"])}
+
+        transition == "run_interrupted" and event["terminal_reason"] == "runner_restarted" ->
+          {:ok, put_dispatch(next_state, event, event["attempt"] + 1)}
+
+        true ->
+          {:ok, next_state}
       end
     end
   end

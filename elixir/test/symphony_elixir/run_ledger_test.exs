@@ -471,6 +471,58 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert recovery.recovered_attempts == %{"issue-resume-claim" => 3}
   end
 
+  test "startup recovers terminal next-attempt intent before retry scheduling completes" do
+    path = ledger_path()
+    run_id = "run-terminal-retry-intent"
+    issue_id = "issue-terminal-retry-intent"
+    identifier = "DUD-RETRY-INTENT"
+
+    assert :ok = append_claim!(path, run_id, issue_id, identifier, 3)
+    assert :ok = append_started!(path, run_id, issue_id, identifier, 3)
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_failed",
+               stage: "released",
+               run_id: run_id,
+               issue_id: issue_id,
+               issue_identifier: identifier,
+               attempt: 3,
+               terminal_reason: "worker_exit",
+               next_action: "retry",
+               next_attempt: 4,
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/DUD-RETRY-INTENT"
+             })
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-retry-recovery")
+
+    assert recovery.recovered_dispatches[issue_id] == %{
+             attempt: 4,
+             previous_run_id: run_id,
+             identifier: identifier,
+             worker_host: "worker-a",
+             workspace_path: "/srv/symphony/DUD-RETRY-INTENT",
+             stage: "retry_queued"
+           }
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "retry_scheduled",
+               stage: "retry_queued",
+               run_id: run_id,
+               issue_id: issue_id,
+               issue_identifier: identifier,
+               attempt: 3,
+               next_attempt: 4,
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/DUD-RETRY-INTENT"
+             })
+
+    assert {:ok, next_recovery} = RunLedger.reconcile_startup(path, "runner-retry-next")
+    assert next_recovery.recovered_attempts[issue_id] == 4
+  end
+
   test "startup reconciliation restores global pause and operator command cursors" do
     path = ledger_path()
 
