@@ -391,6 +391,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
                  "session_title" => nil,
+                 "model" => %{
+                   "resolved" => nil,
+                   "reasoning_effort" => nil,
+                   "catalog_source" => nil
+                 },
+                 "model_catalog" => nil,
                  "turn_count" => 7,
                  "last_event" => "notification",
                  "last_message" => "rendered",
@@ -461,6 +467,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                "workspace_path" => nil,
                "session_id" => "thread-http",
                "session_title" => nil,
+               "model" => %{
+                 "resolved" => nil,
+                 "reasoning_effort" => nil,
+                 "catalog_source" => nil
+               },
+               "model_catalog" => nil,
                "turn_count" => 7,
                "state" => "In Progress",
                "started_at" => issue_payload["running"]["started_at"],

@@ -1599,6 +1599,98 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server discovers and validates the live model before the first turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-model-catalog-#{System.unique_integer([:positive])}"
+      )
+
+    previous_discovery =
+      Application.get_env(:symphony_elixir, :codex_model_discovery_enabled)
+
+    on_exit(fn ->
+      if is_nil(previous_discovery) do
+        Application.delete_env(:symphony_elixir, :codex_model_discovery_enabled)
+      else
+        Application.put_env(
+          :symphony_elixir,
+          :codex_model_discovery_enabled,
+          previous_discovery
+        )
+      end
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-MODEL")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"initialized"'*)
+            ;;
+          *'"method":"model/list"'*)
+            printf '%s\n' '{"id":10000,"result":{"data":[{"model":"gpt-live","isDefault":true,"defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"medium"},{"reasoningEffort":"high"}]}],"nextCursor":null}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-model"},"model":"gpt-live","modelProvider":"openai","reasoningEffort":"high"}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-model"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-model"}}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      Application.put_env(:symphony_elixir, :codex_model_discovery_enabled, true)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-model",
+        identifier: "MT-MODEL",
+        title: "Discover Codex model",
+        description: "Validate model discovery before turn startup",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-MODEL",
+        labels: ["backend"]
+      }
+
+      recipient = self()
+
+      assert {:ok, result} =
+               AppServer.run(workspace, "Discover model", issue, on_message: fn message -> send(recipient, {:codex_message, message}) end)
+
+      assert result.resolved_model == "gpt-live"
+      assert result.reasoning_effort == "high"
+      assert result.model_catalog.source == "live"
+      assert result.model_catalog.default_model == "gpt-live"
+
+      assert_receive {:codex_message,
+                      %{
+                        event: :session_started,
+                        resolved_model: "gpt-live",
+                        reasoning_effort: "high",
+                        model_catalog_source: "live",
+                        model_catalog: %{source: "live"}
+                      }}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server launches over ssh for remote workers" do
     test_root =
       Path.join(

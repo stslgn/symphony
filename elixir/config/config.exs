@@ -2,6 +2,9 @@ import Config
 
 config :phoenix, :json_library, Jason
 
+config :symphony_elixir,
+  codex_model_discovery_enabled: config_env() != :test
+
 config :symphony_elixir, SymphonyElixirWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
   url: [host: "localhost"],

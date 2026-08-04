@@ -1116,7 +1116,17 @@ client to:
 
 - Start the app-server subprocess in the per-issue workspace.
 - Initialize the app-server session using the targeted Codex app-server protocol.
+- After initialization, implementations SHOULD discover the authenticated model catalog using the
+  targeted protocol's model-list operation when available. Discovery MUST use the same authenticated
+  app-server session and MUST NOT inspect broad effective-config responses that may contain
+  credentials.
 - Create or resume a coding-agent thread according to the targeted protocol.
+- Capture the resolved model and reasoning effort returned by thread creation when the targeted
+  protocol exposes them.
+- When a fresh live catalog is available, validate the resolved model/effort pair before starting
+  the first turn. A missing, malformed, or unsupported catalog operation SHOULD degrade to explicit
+  `unavailable` observability for compatibility with older app-server versions; it MUST NOT silently
+  convert a live incompatibility into a fallback.
 - Supply the absolute per-issue workspace path as the thread/turn working directory wherever the
   targeted protocol accepts cwd.
 - Start the first turn with the rendered issue prompt.
@@ -1134,6 +1144,11 @@ Session identifiers:
 - Extract `turn_id` from each turn identity returned by the targeted Codex app-server protocol.
 - Emit `session_id = "<thread_id>-<turn_id>"`
 - Reuse the same `thread_id` for all continuation turns inside one worker run
+
+Model catalog observability MUST be credential-safe and bounded. It MAY expose model identifiers,
+default and upgrade metadata, supported reasoning efforts, fetch time, and a stable failure code. It
+MUST NOT expose raw discovery errors, effective config, environment values, credentials, or MCP
+configuration.
 
 ### 10.3 Streaming Turn Processing
 
@@ -1170,6 +1185,7 @@ include:
 - `timestamp` (UTC timestamp)
 - `codex_app_server_pid` (if available)
 - OPTIONAL `usage` map (token counts)
+- OPTIONAL resolved `model`, `reasoning_effort`, and credential-safe model catalog metadata
 - payload fields as needed
 
 Important emitted events include, for example:
@@ -1464,6 +1480,8 @@ SHOULD return:
 
 - `running` (list of running session rows)
 - each running row SHOULD include `turn_count`
+- each running row SHOULD include the resolved model, reasoning effort, and model-catalog source when
+  available; any exposed catalog MUST follow the credential-safe bounded contract in Section 10.2
 - `retrying` (list of retry queue rows)
 - `parked` (list of typed operator waits)
 - `control`
@@ -2272,6 +2290,11 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Policy-related startup payloads use the implementation's documented approval/sandbox settings
 - Thread and turn identities exposed by the targeted protocol are extracted and used to emit
   `session_started`
+- A supported live model catalog is discovered after initialization and before the first turn
+- The resolved model/reasoning pair is validated against a fresh live catalog before prompt delivery
+- Missing or unsupported catalog discovery degrades explicitly without breaking older app-server
+  versions
+- Model catalog observability excludes raw errors, effective config, MCP config, and credentials
 - Request/response read timeout is enforced
 - Turn timeout is enforced
 - Transport framing required by the targeted protocol is handled correctly

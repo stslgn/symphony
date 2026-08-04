@@ -148,6 +148,8 @@ defmodule SymphonyElixirWeb.Presenter do
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
       session_title: Map.get(entry, :session_title),
+      model: model_payload(entry),
+      model_catalog: Map.get(entry, :model_catalog),
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
@@ -196,6 +198,8 @@ defmodule SymphonyElixirWeb.Presenter do
       workspace_path: Map.get(running, :workspace_path),
       session_id: running.session_id,
       session_title: Map.get(running, :session_title),
+      model: model_payload(running),
+      model_catalog: Map.get(running, :model_catalog),
       turn_count: Map.get(running, :turn_count, 0),
       state: running.state,
       started_at: iso8601(running.started_at),
@@ -218,6 +222,14 @@ defmodule SymphonyElixirWeb.Presenter do
       error: retry.error,
       worker_host: Map.get(retry, :worker_host),
       workspace_path: Map.get(retry, :workspace_path)
+    }
+  end
+
+  defp model_payload(entry) do
+    %{
+      resolved: Map.get(entry, :resolved_model),
+      reasoning_effort: Map.get(entry, :reasoning_effort),
+      catalog_source: Map.get(entry, :model_catalog_source)
     }
   end
 
