@@ -858,6 +858,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   end
 
   test "orchestrator restart exposes a durable queued resume in status" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"]
+    )
+
     root =
       Path.join(
         System.tmp_dir!(),
@@ -877,7 +881,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                attempt: 3,
                wait_id: "wait-status-resume",
                parked_reason: "waiting_infrastructure",
-               allowed_actions: ["retry", "reject"]
+               allowed_actions: ["retry", "reject"],
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-RESUME-STATUS"
              })
 
     assert :ok =
@@ -890,7 +896,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                attempt: 4,
                wait_id: "wait-status-resume",
                parked_reason: "waiting_infrastructure",
-               allowed_actions: ["retry", "reject"]
+               allowed_actions: ["retry", "reject"],
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-RESUME-STATUS"
              })
 
     assert :ok =
@@ -920,6 +928,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                wait_id: "wait-status-resume",
                attempt: 4,
                stage: "resume_queued",
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-RESUME-STATUS",
                due_in_ms: 0
              }
            ] = snapshot.retrying
@@ -939,6 +949,84 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert rendered =~ "MT-RESUME-STATUS"
     assert rendered =~ "attempt=4"
     assert rendered =~ "resume queued"
+  end
+
+  test "orchestrator restart keeps stale remote recovery affinity visible and durable" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"]
+    )
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-recovery-affinity-status-#{System.unique_integer([:positive])}"
+      )
+
+    ledger_path = Path.join(root, "run-ledger.jsonl")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "run_runtime_ready",
+               stage: "running",
+               run_id: "run-stale-affinity",
+               issue_id: "issue-stale-affinity",
+               issue_identifier: "MT-STALE-AFFINITY",
+               attempt: 2,
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-STALE-AFFINITY"
+             })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "run_started",
+               stage: "running",
+               run_id: "run-stale-affinity",
+               issue_id: "issue-stale-affinity",
+               issue_identifier: "MT-STALE-AFFINITY",
+               attempt: 2,
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-STALE-AFFINITY"
+             })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "dispatch_paused",
+               stage: "operator",
+               runner_generation: "runner-stale-affinity"
+             })
+
+    orchestrator_name = Module.concat(__MODULE__, :RecoveryAffinityOrchestrator)
+
+    assert {:ok, pid} =
+             Orchestrator.start_link(name: orchestrator_name, run_ledger_path: ledger_path)
+
+    snapshot = GenServer.call(pid, :snapshot)
+
+    assert [
+             %{
+               issue_id: "issue-stale-affinity",
+               identifier: "MT-STALE-AFFINITY",
+               run_id: "run-stale-affinity",
+               attempt: 3,
+               stage: "recovery_queued",
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-STALE-AFFINITY",
+               error: nil
+             }
+           ] = snapshot.retrying
+
+    GenServer.stop(pid)
+
+    second_name = Module.concat(__MODULE__, :SecondRecoveryAffinityOrchestrator)
+
+    assert {:ok, second_pid} =
+             Orchestrator.start_link(name: second_name, run_ledger_path: ledger_path)
+
+    on_exit(fn -> if Process.alive?(second_pid), do: Process.exit(second_pid, :normal) end)
+
+    assert [%{worker_host: "worker-a", workspace_path: "/srv/symphony/MT-STALE-AFFINITY"}] =
+             GenServer.call(second_pid, :snapshot).retrying
   end
 
   test "orchestrator snapshot includes poll countdown and checking status" do

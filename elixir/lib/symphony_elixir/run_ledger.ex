@@ -179,16 +179,21 @@ defmodule SymphonyElixir.RunLedger do
              stage: "startup",
              runner_generation: runner_generation
            }) do
+      recovered_dispatches =
+        recovery.recovered_dispatches
+        |> Map.merge(recovered_dispatches_from_stale_runs(stale_runs), fn _issue_id, left, right ->
+          if left.attempt >= right.attempt, do: left, else: right
+        end)
+
       recovered_attempts =
-        Enum.reduce(stale_runs, %{}, fn {_run_id, event}, acc ->
-          issue_id = event["issue_id"]
-          next_attempt = max(integer_value(event["attempt"], 0) + 1, 1)
-          Map.update(acc, issue_id, next_attempt, &max(&1, next_attempt))
+        Map.new(recovered_dispatches, fn {issue_id, dispatch} ->
+          {issue_id, dispatch.attempt}
         end)
 
       {:ok,
        %{
          recovered_attempts: recovered_attempts,
+         recovered_dispatches: recovered_dispatches,
          queued_resumes: recovery.queued_resumes,
          parked: parked,
          dispatch_paused: recovery.dispatch_paused,
@@ -268,6 +273,8 @@ defmodule SymphonyElixir.RunLedger do
 
       queued_resumes = Enum.reduce(events, %{}, &update_queued_resume_state/2)
 
+      recovered_dispatches = Enum.reduce(events, %{}, &update_recovered_dispatch_state/2)
+
       dispatch_paused = Enum.reduce(events, false, &update_dispatch_pause_state/2)
 
       processed_operator_comment_ids =
@@ -281,6 +288,7 @@ defmodule SymphonyElixir.RunLedger do
          stale_runs: unfinished,
          parked: parked,
          queued_resumes: queued_resumes,
+         recovered_dispatches: recovered_dispatches,
          dispatch_paused: dispatch_paused,
          processed_operator_comment_ids: processed_operator_comment_ids,
          operator_comment_cursors: operator_comment_cursors
@@ -340,6 +348,57 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp update_queued_resume_state(_event, acc), do: acc
+
+  defp update_recovered_dispatch_state(
+         %{
+           "transition" => "run_interrupted",
+           "terminal_reason" => "runner_restarted",
+           "issue_id" => issue_id
+         } = event,
+         acc
+       )
+       when is_binary(issue_id) do
+    dispatch = recovered_dispatch(event)
+
+    Map.update(acc, issue_id, dispatch, fn current ->
+      if current.attempt >= dispatch.attempt, do: current, else: dispatch
+    end)
+  end
+
+  defp update_recovered_dispatch_state(
+         %{"transition" => transition, "issue_id" => issue_id},
+         acc
+       )
+       when transition in ["run_claimed", "run_started", "run_parked", "wait_released"] and
+              is_binary(issue_id) do
+    Map.delete(acc, issue_id)
+  end
+
+  defp update_recovered_dispatch_state(_event, acc), do: acc
+
+  defp recovered_dispatches_from_stale_runs(stale_runs) do
+    Enum.reduce(stale_runs, %{}, fn {_run_id, event}, acc ->
+      issue_id = event["issue_id"]
+      dispatch = recovered_dispatch(event)
+
+      Map.update(acc, issue_id, dispatch, &prefer_recovered_dispatch(&1, dispatch))
+    end)
+  end
+
+  defp prefer_recovered_dispatch(current, candidate) do
+    if current.attempt >= candidate.attempt, do: current, else: candidate
+  end
+
+  defp recovered_dispatch(event) do
+    %{
+      attempt: max(integer_value(event["attempt"], 0) + 1, 1),
+      previous_run_id: event["run_id"],
+      identifier: event["issue_identifier"],
+      worker_host: event["worker_host"],
+      workspace_path: event["workspace_path"],
+      stage: "recovery_queued"
+    }
+  end
 
   defp update_dispatch_pause_state(%{"transition" => "dispatch_paused"}, _paused),
     do: true
@@ -450,9 +509,8 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp validate_event(event, line_number) do
-    with :ok <- validate_event_payload(event) do
-      {:ok, event}
-    else
+    case validate_event_payload(event) do
+      :ok -> {:ok, event}
       {:error, reason} -> {:error, {:invalid_ledger_record, line_number, reason}}
     end
   end
@@ -466,9 +524,8 @@ defmodule SymphonyElixir.RunLedger do
          {:ok, transition_schema} <- transition_schema(event),
          :ok <- validate_optional_attempt(event),
          :ok <- validate_optional_actions(event),
-         :ok <- validate_optional_strings(event),
-         :ok <- validate_transition_fields(event, transition_schema) do
-      :ok
+         :ok <- validate_optional_strings(event) do
+      validate_transition_fields(event, transition_schema)
     end
   end
 
@@ -486,9 +543,8 @@ defmodule SymphonyElixir.RunLedger do
   defp validate_transition_fields(event, schema) do
     with :ok <- validate_required_strings(event, Map.get(schema, :required_strings, [])),
          :ok <- validate_required_attempt(event, Map.get(schema, :required_attempt, false)),
-         :ok <- validate_typed_wait(event, Map.get(schema, :typed_wait, false)),
-         :ok <- validate_timestamp_field(event, Map.get(schema, :timestamp_field)) do
-      :ok
+         :ok <- validate_typed_wait(event, Map.get(schema, :typed_wait, false)) do
+      validate_timestamp_field(event, Map.get(schema, :timestamp_field))
     end
   end
 

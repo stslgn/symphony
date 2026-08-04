@@ -109,7 +109,7 @@ defmodule SymphonyElixirWeb.Presenter do
       status: issue_status(running, retry, parked),
       workspace: %{
         path: workspace_path(issue_identifier, running, retry, parked),
-        host: workspace_host(running, retry)
+        host: workspace_host(running, retry, parked)
       },
       attempts: %{
         restart_count: restart_count(retry),
@@ -136,6 +136,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp issue_status(_running, _retry, parked) when not is_nil(parked), do: "parked"
   defp issue_status(nil, %{stage: "resume_queued"}, nil), do: "resume_queued"
+  defp issue_status(nil, %{stage: "recovery_queued"}, nil), do: "recovery_queued"
   defp issue_status(_running, nil, nil), do: "running"
   defp issue_status(nil, _retry, nil), do: "retrying"
   defp issue_status(_running, _retry, nil), do: "running"
@@ -174,7 +175,7 @@ defmodule SymphonyElixirWeb.Presenter do
       workspace_path: Map.get(entry, :workspace_path)
     }
 
-    maybe_add_resume_queue_metadata(payload, entry)
+    maybe_add_durable_queue_metadata(payload, entry)
   end
 
   defp parked_entry_payload(entry) do
@@ -189,6 +190,8 @@ defmodule SymphonyElixirWeb.Presenter do
       attempt: entry.attempt,
       stage: entry.stage,
       terminal_reason: Map.get(entry, :terminal_reason),
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
       parked_at: iso8601(entry.parked_at)
     }
   end
@@ -223,18 +226,19 @@ defmodule SymphonyElixirWeb.Presenter do
       workspace_path: Map.get(retry, :workspace_path)
     }
 
-    maybe_add_resume_queue_metadata(payload, retry)
+    maybe_add_durable_queue_metadata(payload, retry)
   end
 
-  defp maybe_add_resume_queue_metadata(payload, %{stage: "resume_queued"} = entry) do
+  defp maybe_add_durable_queue_metadata(payload, %{stage: stage} = entry)
+       when stage in ["resume_queued", "recovery_queued"] do
     Map.merge(payload, %{
-      stage: "resume_queued",
+      stage: stage,
       run_id: Map.get(entry, :run_id),
       wait_id: Map.get(entry, :wait_id)
     })
   end
 
-  defp maybe_add_resume_queue_metadata(payload, _entry), do: payload
+  defp maybe_add_durable_queue_metadata(payload, _entry), do: payload
 
   defp model_payload(entry) do
     %{
@@ -254,6 +258,8 @@ defmodule SymphonyElixirWeb.Presenter do
       attempt: parked.attempt,
       stage: parked.stage,
       terminal_reason: Map.get(parked, :terminal_reason),
+      worker_host: Map.get(parked, :worker_host),
+      workspace_path: Map.get(parked, :workspace_path),
       parked_at: iso8601(parked.parked_at)
     }
   end
@@ -265,8 +271,10 @@ defmodule SymphonyElixirWeb.Presenter do
       Path.join(Config.settings!().workspace.root, issue_identifier)
   end
 
-  defp workspace_host(running, retry) do
-    (running && Map.get(running, :worker_host)) || (retry && Map.get(retry, :worker_host))
+  defp workspace_host(running, retry, parked) do
+    (running && Map.get(running, :worker_host)) ||
+      (retry && Map.get(retry, :worker_host)) ||
+      (parked && Map.get(parked, :worker_host))
   end
 
   defp recent_events_payload(running) do

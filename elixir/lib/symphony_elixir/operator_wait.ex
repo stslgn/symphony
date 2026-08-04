@@ -58,6 +58,8 @@ defmodule SymphonyElixir.OperatorWait do
          stage: Map.get(attrs, :stage, "parked"),
          tracker_state: Map.get(attrs, :tracker_state),
          terminal_reason: Map.get(attrs, :terminal_reason),
+         worker_host: Map.get(attrs, :worker_host),
+         workspace_path: Map.get(attrs, :workspace_path),
          parked_at: Map.get(attrs, :parked_at) || DateTime.utc_now()
        }}
     else
@@ -82,6 +84,8 @@ defmodule SymphonyElixir.OperatorWait do
         stage: event["stage"],
         tracker_state: event["tracker_state"],
         terminal_reason: event["terminal_reason"],
+        worker_host: event["worker_host"],
+        workspace_path: event["workspace_path"],
         parked_at: parked_at
       })
     end
@@ -93,9 +97,8 @@ defmodule SymphonyElixir.OperatorWait do
     with :ok <- validate_required_string(event, "wait_id"),
          :ok <- validate_required_string(event, "issue_id"),
          :ok <- validate_required_string(event, "issue_identifier"),
-         :ok <- validate_required_string(event, "run_id"),
-         :ok <- validate_required_attempt(event) do
-      :ok
+         :ok <- validate_required_string(event, "run_id") do
+      validate_required_attempt(event)
     end
   end
 

@@ -41,12 +41,16 @@ defmodule SymphonyElixir.OperatorWaitTest do
                run_id: "run-1",
                attempt: 2,
                tracker_state: "Human Clarification",
-               terminal_reason: "time_budget_exhausted"
+               terminal_reason: "time_budget_exhausted",
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/DUD-1"
              })
 
     assert wait.wait_id == "wait-fixed"
     assert wait.stage == "parked"
     assert wait.terminal_reason == "time_budget_exhausted"
+    assert wait.worker_host == "worker-a"
+    assert wait.workspace_path == "/srv/symphony/DUD-1"
     assert OperatorWait.action_allowed?(wait, "retry")
     refute OperatorWait.action_allowed?(wait, "approve")
     refute OperatorWait.action_allowed?(wait, :retry)
@@ -66,6 +70,8 @@ defmodule SymphonyElixir.OperatorWaitTest do
       "stage" => "human_review",
       "tracker_state" => "Human Review",
       "terminal_reason" => "turn_budget_exhausted",
+      "worker_host" => "worker-a",
+      "workspace_path" => "/srv/symphony/DUD-1",
       "allowed_actions" => ["approve", "reject"],
       "occurred_at" => "2026-07-29T10:00:00.000Z"
     }
@@ -73,6 +79,8 @@ defmodule SymphonyElixir.OperatorWaitTest do
     assert {:ok, wait} = OperatorWait.from_ledger_event(event)
     assert wait.parked_at == ~U[2026-07-29 10:00:00.000Z]
     assert wait.terminal_reason == "turn_budget_exhausted"
+    assert wait.worker_host == "worker-a"
+    assert wait.workspace_path == "/srv/symphony/DUD-1"
 
     assert {:error, {:invalid_wait_field, "occurred_at"}} =
              OperatorWait.from_ledger_event(%{event | "occurred_at" => "bad"})

@@ -674,21 +674,34 @@ defmodule SymphonyElixir.StatusDashboard do
     due_in_ms = retry_entry.due_in_ms || 0
     error = format_retry_error(retry_entry.error)
 
-    if Map.get(retry_entry, :stage) == "resume_queued" do
-      "│  #{colorize("→", @ansi_orange)} " <>
-        colorize("#{identifier}", @ansi_red) <>
-        " " <>
-        colorize("attempt=#{attempt}", @ansi_yellow) <>
-        colorize(" resume queued", @ansi_dim)
-    else
-      "│  #{colorize("↻", @ansi_orange)} " <>
-        colorize("#{identifier}", @ansi_red) <>
-        " " <>
-        colorize("attempt=#{attempt}", @ansi_yellow) <>
-        colorize(" in ", @ansi_dim) <>
-        colorize(next_in_words(due_in_ms), @ansi_cyan) <>
-        error
+    case Map.get(retry_entry, :stage) do
+      "resume_queued" ->
+        format_durable_queue_summary(retry_entry, identifier, attempt, "resume queued", error)
+
+      "recovery_queued" ->
+        format_durable_queue_summary(retry_entry, identifier, attempt, "recovery queued", error)
+
+      _stage ->
+        "│  #{colorize("↻", @ansi_orange)} " <>
+          colorize("#{identifier}", @ansi_red) <>
+          " " <>
+          colorize("attempt=#{attempt}", @ansi_yellow) <>
+          colorize(" in ", @ansi_dim) <>
+          colorize(next_in_words(due_in_ms), @ansi_cyan) <>
+          error
     end
+  end
+
+  defp format_durable_queue_summary(retry_entry, identifier, attempt, label, error) do
+    worker_host = Map.get(retry_entry, :worker_host) || "local"
+    workspace_path = Map.get(retry_entry, :workspace_path) || "missing"
+
+    "│  #{colorize("→", @ansi_orange)} " <>
+      colorize("#{identifier}", @ansi_red) <>
+      " " <>
+      colorize("attempt=#{attempt}", @ansi_yellow) <>
+      colorize(" #{label} host=#{worker_host} workspace=#{workspace_path}", @ansi_dim) <>
+      error
   end
 
   defp next_in_words(due_in_ms) when is_integer(due_in_ms) do

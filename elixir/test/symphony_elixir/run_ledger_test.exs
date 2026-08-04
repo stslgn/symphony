@@ -45,11 +45,22 @@ defmodule SymphonyElixir.RunLedgerTest do
                issue_id: "issue-stale",
                issue_identifier: "DUD-2",
                attempt: 2,
+               worker_host: "worker-a",
                workspace_path: "/tmp/workspaces/DUD-2"
              })
 
     assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-new")
     assert recovery.recovered_attempts == %{"issue-stale" => 3}
+
+    assert recovery.recovered_dispatches["issue-stale"] == %{
+             attempt: 3,
+             previous_run_id: "run-stale",
+             identifier: "DUD-2",
+             stage: "recovery_queued",
+             worker_host: "worker-a",
+             workspace_path: "/tmp/workspaces/DUD-2"
+           }
+
     assert recovery.parked == %{}
     refute recovery.dispatch_paused
     assert recovery.processed_operator_comment_ids == MapSet.new()
@@ -69,7 +80,8 @@ defmodule SymphonyElixir.RunLedgerTest do
            end)
 
     assert {:ok, next_recovery} = RunLedger.reconcile_startup(path, "runner-next")
-    assert next_recovery.recovered_attempts == %{}
+    assert next_recovery.recovered_attempts == %{"issue-stale" => 3}
+    assert next_recovery.recovered_dispatches == recovery.recovered_dispatches
     assert next_recovery.parked == %{}
   end
 

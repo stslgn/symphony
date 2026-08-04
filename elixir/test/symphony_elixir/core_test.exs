@@ -722,7 +722,7 @@ defmodule SymphonyElixir.CoreTest do
     Process.cancel_timer(resumed_state.tick_timer_ref)
   end
 
-  test "queued resumes stay visible while pause, capacity, or tracker preflight blocks dispatch" do
+  test "queued resumes stay visible while pause, capacity, tracker, or legacy affinity blocks dispatch" do
     issue_id = "issue-blocked-resume"
 
     queued_resumes = %{
@@ -819,6 +819,25 @@ defmodule SymphonyElixir.CoreTest do
 
     if is_reference(tracker_blocked_state.tick_timer_ref),
       do: Process.cancel_timer(tracker_blocked_state.tick_timer_ref)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [resumed_issue])
+
+    assert {:noreply, affinity_blocked_state} =
+             Orchestrator.handle_info(:run_poll_cycle, base_state)
+
+    assert affinity_blocked_state.queued_resumes == queued_resumes
+    assert affinity_blocked_state.running == %{}
+    assert affinity_blocked_state.claimed == MapSet.new()
+
+    assert {:reply, affinity_snapshot, ^affinity_blocked_state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, affinity_blocked_state)
+
+    assert [%{stage: "resume_queued", error: "workspace_affinity_missing"}] =
+             affinity_snapshot.retrying
+
+    if is_reference(affinity_blocked_state.tick_timer_ref),
+      do: Process.cancel_timer(affinity_blocked_state.tick_timer_ref)
   end
 
   test "typed waits require matching ids and allowed actions before resume" do
@@ -843,6 +862,8 @@ defmodule SymphonyElixir.CoreTest do
           retry_attempt: 1,
           identifier: "MT-SECRET",
           issue: %Issue{id: issue_id, identifier: "MT-SECRET", state: "In Progress"},
+          worker_host: "worker-a",
+          workspace_path: "/srv/symphony/MT-SECRET",
           started_at: DateTime.utc_now()
         }
       },
@@ -859,6 +880,8 @@ defmodule SymphonyElixir.CoreTest do
 
     assert wait.reason == "waiting_secret"
     assert wait.allowed_actions == ["retry", "reject"]
+    assert wait.worker_host == "worker-a"
+    assert wait.workspace_path == "/srv/symphony/MT-SECRET"
 
     assert {:reply, {:error, :wait_id_mismatch}, ^parked_state} =
              Orchestrator.handle_call(
@@ -896,7 +919,9 @@ defmodule SymphonyElixir.CoreTest do
              attempt: 2,
              stage: "resume_queued",
              run_id: "run-secret",
-             wait_id: wait_id
+             wait_id: wait_id,
+             worker_host: "worker-a",
+             workspace_path: "/srv/symphony/MT-SECRET"
            } = resumed_state.queued_resumes[issue_id]
 
     assert wait_id == wait.wait_id
@@ -912,11 +937,15 @@ defmodule SymphonyElixir.CoreTest do
     assert Enum.count(events, &(&1["transition"] == "resume_queued")) == 1
 
     assert Enum.any?(events, fn event ->
-             event["transition"] == "resume_queued" and event["attempt"] == 2
+             event["transition"] == "resume_queued" and event["attempt"] == 2 and
+               event["worker_host"] == "worker-a" and
+               event["workspace_path"] == "/srv/symphony/MT-SECRET"
            end)
 
     assert {:ok, recovery} = RunLedger.reconcile_startup(ledger_path, "runner-after-resume")
     assert recovery.queued_resumes[issue_id]["attempt"] == 2
+    assert recovery.queued_resumes[issue_id]["worker_host"] == "worker-a"
+    assert recovery.queued_resumes[issue_id]["workspace_path"] == "/srv/symphony/MT-SECRET"
 
     if is_reference(snapshotted_state.tick_timer_ref),
       do: Process.cancel_timer(snapshotted_state.tick_timer_ref)
@@ -1930,6 +1959,64 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
+  end
+
+  test "strict workspace affinity never hops to another ssh host" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    state = %Orchestrator.State{
+      running: %{
+        "issue-1" => %{worker_host: "worker-a"}
+      }
+    }
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-b"
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", true) ==
+             :no_worker_capacity
+
+    assert Orchestrator.select_worker_host_for_test(state, "retired-worker", true) ==
+             :affinity_unavailable
+  end
+
+  test "local workspace affinity is validated before after-create hooks" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-workspace-affinity-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    hook_marker = Path.join(test_root, "after-create-ran")
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_after_create: "touch #{hook_marker}"
+    )
+
+    issue = %Issue{id: "issue-affinity", identifier: "MT-AFFINITY", state: "In Progress"}
+    expected_workspace = Path.join(workspace_root, issue.identifier)
+
+    assert {:ok, actual_workspace} =
+             Workspace.create_for_issue(issue, nil, expected_workspace_path: expected_workspace)
+
+    assert {:ok, canonical_expected_workspace} =
+             SymphonyElixir.PathSafety.canonicalize(expected_workspace)
+
+    assert actual_workspace == canonical_expected_workspace
+
+    File.rm_rf!(actual_workspace)
+    File.rm(hook_marker)
+
+    assert {:error, {:workspace_affinity_mismatch, _expected, ^actual_workspace, nil}} =
+             Workspace.create_for_issue(issue, nil, expected_workspace_path: Path.join(workspace_root, "MT-OTHER"))
+
+    refute File.exists?(hook_marker)
   end
 
   defp assert_scheduled_delay(due_at_ms, scheduled_from_ms, expected_delay_ms) do

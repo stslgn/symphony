@@ -228,6 +228,7 @@ Fields (logical):
 - `issue_id`
 - `issue_identifier`
 - `attempt` (integer or null, `null` for first run, `>=1` for retries/continuation)
+- `worker_host` (string for SSH execution, null for local execution)
 - `workspace_path`
 - `started_at`
 - `status`
@@ -273,6 +274,7 @@ Fields:
 - `due_at_ms` (monotonic clock timestamp)
 - `timer_handle` (runtime-specific timer reference)
 - `error` (string or null)
+- `worker_host` and `workspace_path` (preserved affinity when the retry continues an existing workspace)
 
 #### 4.1.8 Orchestrator Runtime State
 
@@ -287,6 +289,7 @@ Fields:
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `queued_resumes` (map `issue_id ->` durable queued-resume entry, consumed by the next claim)
+- `recovered_dispatches` (map `issue_id ->` durable restart-recovery attempt plus workspace affinity)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
@@ -307,6 +310,7 @@ Fields:
 - `allowed_actions` (bounded list derived from the reason)
 - `issue_id`, `identifier`, `run_id`, and `attempt`
 - `stage`, `tracker_state`, `terminal_reason`, and `parked_at`
+- `worker_host` and canonical `workspace_path` for safe resume on the same execution host
 
 Operator waits MUST NOT contain prompts, agent output, secrets, private data, or tracker comments.
 
@@ -817,6 +821,9 @@ Distinct terminal reasons are important because retry logic and logs differ.
   `interrupted_by_restart` before scheduling the first poll.
 - Startup reconciliation restores unresolved operator waits before dispatch.
 - Startup reconciliation restores durable queued resumes, including their next attempt.
+- Startup reconciliation restores the worker host and canonical workspace path for interrupted runs
+  and queued resumes. A recovered dispatch MUST target that host exclusively; it MUST remain blocked
+  and visible when the host or path affinity is missing or unavailable rather than hopping hosts.
 - Startup reconciliation restores global dispatch pause and per-issue operator comment cursors.
 - A parked issue is excluded from automatic retry and pickup even when its tracker state is active.
 - Resuming a wait atomically replaces the runner-side park with a durable `resume_queued` entry;
@@ -1022,7 +1029,9 @@ Algorithm summary:
 3. Ensure the workspace path exists as a directory.
 4. Mark `created_now=true` only if the directory was created during this call; otherwise
    `created_now=false`.
-5. If `created_now=true`, run `after_create` hook if configured.
+5. When resuming or recovering an existing attempt, verify the prepared canonical path equals the
+   persisted expected workspace path.
+6. If `created_now=true`, run `after_create` hook if configured.
 
 Notes:
 
@@ -1078,6 +1087,8 @@ Invariant 1: Run the coding agent only in the per-issue workspace path.
 
 - Before launching the coding-agent subprocess, validate:
   - `cwd == workspace_path`
+- For resume/restart recovery, validate the prepared path against the persisted path before any
+  workspace hook or coding-agent process starts.
 
 Invariant 2: Workspace path MUST stay inside workspace root.
 
@@ -1872,9 +1883,12 @@ agent sessions do not survive process restart.
 After restart:
 
 - No retry timers are restored from prior process memory; an interrupted active issue is eligible
-  for one new attempt after normal tracker reconciliation.
+  for one new attempt after normal tracker reconciliation. Its durable recovery entry retains the
+  previous worker host and canonical workspace path across repeated runner restarts until claimed.
 - No running sessions are assumed recoverable.
 - Unresolved parked waits are restored and remain ineligible for automatic pickup.
+- Resumed waits and interrupted attempts redispatch only on their persisted worker host and path;
+  missing or unavailable affinity remains status-visible and blocks dispatch.
 - Service recovers by:
   - startup terminal workspace cleanup
   - fresh polling of active issues

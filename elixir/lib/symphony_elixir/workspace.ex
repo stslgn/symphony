@@ -12,8 +12,14 @@ defmodule SymphonyElixir.Workspace do
 
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
-  def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+  def create_for_issue(issue_or_identifier, worker_host \\ nil),
+    do: create_for_issue(issue_or_identifier, worker_host, [])
+
+  @spec create_for_issue(map() | String.t() | nil, worker_host(), keyword()) ::
+          {:ok, Path.t()} | {:error, term()}
+  def create_for_issue(issue_or_identifier, worker_host, opts) when is_list(opts) do
     issue_context = issue_context(issue_or_identifier)
+    expected_workspace_path = Keyword.get(opts, :expected_workspace_path)
 
     try do
       safe_id = safe_identifier(issue_context.issue_identifier)
@@ -21,6 +27,7 @@ defmodule SymphonyElixir.Workspace do
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
+           :ok <- validate_expected_workspace_path(workspace, expected_workspace_path, worker_host),
            :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
         {:ok, workspace}
       end
@@ -395,6 +402,33 @@ defmodule SymphonyElixir.Workspace do
       true ->
         :ok
     end
+  end
+
+  defp validate_expected_workspace_path(_workspace, nil, _worker_host), do: :ok
+
+  defp validate_expected_workspace_path(workspace, expected, nil)
+       when is_binary(workspace) and is_binary(expected) do
+    with {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace),
+         {:ok, canonical_expected} <- PathSafety.canonicalize(expected) do
+      if canonical_workspace == canonical_expected do
+        :ok
+      else
+        {:error, {:workspace_affinity_mismatch, canonical_expected, canonical_workspace, nil}}
+      end
+    end
+  end
+
+  defp validate_expected_workspace_path(workspace, expected, worker_host)
+       when is_binary(workspace) and is_binary(expected) and is_binary(worker_host) do
+    if workspace == expected do
+      :ok
+    else
+      {:error, {:workspace_affinity_mismatch, expected, workspace, worker_host}}
+    end
+  end
+
+  defp validate_expected_workspace_path(workspace, expected, worker_host) do
+    {:error, {:workspace_affinity_mismatch, expected, workspace, worker_host}}
   end
 
   defp remote_shell_assign(variable_name, raw_path)

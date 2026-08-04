@@ -437,6 +437,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "attempt" => 1,
                  "stage" => "parked",
                  "terminal_reason" => "turn_budget_exhausted",
+                 "worker_host" => nil,
+                 "workspace_path" => nil,
                  "parked_at" => state_payload["parked"] |> List.first() |> Map.fetch!("parked_at")
                }
              ],
