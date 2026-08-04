@@ -1444,29 +1444,7 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
-  defp humanize_codex_method("turn/completed", payload) do
-    status =
-      map_path(payload, ["params", "turn", "status"]) ||
-        map_path(payload, [:params, :turn, :status]) ||
-        "completed"
-
-    status = if status in ["completed", "failed", "cancelled"], do: status, else: "completed"
-
-    usage =
-      map_path(payload, ["params", "usage"]) ||
-        map_path(payload, [:params, :usage]) ||
-        map_path(payload, ["params", "tokenUsage"]) ||
-        map_path(payload, [:params, :tokenUsage]) ||
-        map_value(payload, ["usage", :usage])
-
-    usage_suffix =
-      case format_usage_counts(usage) do
-        nil -> ""
-        usage_text -> " (#{usage_text})"
-      end
-
-    "turn completed (#{status})#{usage_suffix}"
-  end
+  defp humanize_codex_method("turn/completed", payload), do: humanize_completed_turn(payload)
 
   defp humanize_codex_method("turn/failed", _payload), do: "turn failed"
 
@@ -1597,6 +1575,36 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp humanize_codex_method(method, _payload) do
     if ObservabilitySanitizer.protocol_method(method), do: method, else: "codex notification"
+  end
+
+  defp humanize_completed_turn(payload) do
+    status = completed_turn_status(payload)
+    usage = completed_turn_usage(payload)
+
+    usage_suffix =
+      case format_usage_counts(usage) do
+        nil -> ""
+        usage_text -> " (#{usage_text})"
+      end
+
+    "turn completed (#{status})#{usage_suffix}"
+  end
+
+  defp completed_turn_status(payload) do
+    status =
+      map_path(payload, ["params", "turn", "status"]) ||
+        map_path(payload, [:params, :turn, :status]) ||
+        "completed"
+
+    if status in ["completed", "failed", "cancelled"], do: status, else: "completed"
+  end
+
+  defp completed_turn_usage(payload) do
+    map_path(payload, ["params", "usage"]) ||
+      map_path(payload, [:params, :usage]) ||
+      map_path(payload, ["params", "tokenUsage"]) ||
+      map_path(payload, [:params, :tokenUsage]) ||
+      map_value(payload, ["usage", :usage])
   end
 
   defp humanize_dynamic_tool_event(base, payload) do
