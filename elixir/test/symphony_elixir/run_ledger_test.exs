@@ -67,7 +67,8 @@ defmodule SymphonyElixir.RunLedgerTest do
              identifier: "DUD-2",
              stage: "recovery_queued",
              worker_host: "worker-a",
-             workspace_path: "/tmp/workspaces/DUD-2"
+             workspace_path: "/tmp/workspaces/DUD-2",
+             workspace_root: nil
            }
 
     assert recovery.parked == %{}
@@ -503,6 +504,7 @@ defmodule SymphonyElixir.RunLedgerTest do
              identifier: identifier,
              worker_host: "worker-a",
              workspace_path: "/srv/symphony/DUD-RETRY-INTENT",
+             workspace_root: nil,
              stage: "retry_queued"
            }
 

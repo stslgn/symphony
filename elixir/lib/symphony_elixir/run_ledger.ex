@@ -162,7 +162,8 @@ defmodule SymphonyElixir.RunLedger do
                     :transition,
                     :wait_id,
                     :worker_host,
-                    :workspace_path
+                    :workspace_path,
+                    :workspace_root
                   ])
   @persisted_fields MapSet.union(
                       MapSet.new(Enum.map(@allowed_fields, &Atom.to_string/1)),
@@ -479,6 +480,7 @@ defmodule SymphonyElixir.RunLedger do
       identifier: event["issue_identifier"],
       worker_host: event["worker_host"],
       workspace_path: event["workspace_path"],
+      workspace_root: event["workspace_root"],
       stage: "recovery_queued"
     }
   end
@@ -490,6 +492,7 @@ defmodule SymphonyElixir.RunLedger do
       identifier: event["issue_identifier"],
       worker_host: event["worker_host"],
       workspace_path: event["workspace_path"],
+      workspace_root: event["workspace_root"],
       stage: "retry_queued"
     }
   end
@@ -569,7 +572,8 @@ defmodule SymphonyElixir.RunLedger do
         issue_identifier: event["issue_identifier"],
         attempt: integer_value(event["attempt"], 0),
         worker_host: event["worker_host"],
-        workspace_path: event["workspace_path"]
+        workspace_path: event["workspace_path"],
+        workspace_root: event["workspace_root"]
       }
 
       case append_fn.(path, recovery_event) do
@@ -975,7 +979,8 @@ defmodule SymphonyElixir.RunLedger do
       issue_identifier: event["issue_identifier"],
       attempt: event["attempt"],
       worker_host: event["worker_host"],
-      workspace_path: event["workspace_path"]
+      workspace_path: event["workspace_path"],
+      workspace_root: event["workspace_root"]
     }
   end
 
@@ -989,14 +994,22 @@ defmodule SymphonyElixir.RunLedger do
       parked_reason: event["parked_reason"],
       terminal_reason: event["terminal_reason"],
       worker_host: event["worker_host"],
-      workspace_path: event["workspace_path"]
+      workspace_path: event["workspace_path"],
+      workspace_root: event["workspace_root"]
     }
   end
 
   defp merge_run_affinity(run, event) do
     with {:ok, worker_host} <- merge_identity_value(run.worker_host, event["worker_host"]),
-         {:ok, workspace_path} <- merge_identity_value(run.workspace_path, event["workspace_path"]) do
-      {:ok, %{run | worker_host: worker_host, workspace_path: workspace_path}}
+         {:ok, workspace_path} <- merge_identity_value(run.workspace_path, event["workspace_path"]),
+         {:ok, workspace_root} <- merge_identity_value(run.workspace_root, event["workspace_root"]) do
+      {:ok,
+       %{
+         run
+         | worker_host: worker_host,
+           workspace_path: workspace_path,
+           workspace_root: workspace_root
+       }}
     end
   end
 
@@ -1073,7 +1086,8 @@ defmodule SymphonyElixir.RunLedger do
           dispatch.attempt == event["attempt"] and
             dispatch.issue_identifier == event["issue_identifier"] and
             identity_value_matches?(dispatch.worker_host, event["worker_host"]) and
-            identity_value_matches?(dispatch.workspace_path, event["workspace_path"])
+            identity_value_matches?(dispatch.workspace_path, event["workspace_path"]) and
+            identity_value_matches?(dispatch.workspace_root, event["workspace_root"])
 
         if fields_match?, do: :ok, else: {:error, :dispatch_identity_mismatch}
     end
@@ -1088,7 +1102,8 @@ defmodule SymphonyElixir.RunLedger do
       attempt: attempt,
       issue_identifier: event["issue_identifier"],
       worker_host: event["worker_host"],
-      workspace_path: event["workspace_path"]
+      workspace_path: event["workspace_path"],
+      workspace_root: event["workspace_root"]
     }
 
     %{state | dispatches: Map.put(state.dispatches, event["issue_id"], dispatch)}

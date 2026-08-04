@@ -9,6 +9,39 @@ defmodule SymphonyElixir.Workspace do
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
   @type worker_host :: String.t() | nil
+  @type prepared_workspace :: %{
+          path: Path.t(),
+          root: Path.t(),
+          created?: boolean()
+        }
+
+  @spec prepare_for_issue(map() | String.t() | nil, worker_host()) ::
+          {:ok, prepared_workspace()} | {:error, term()}
+  def prepare_for_issue(issue_or_identifier, worker_host \\ nil),
+    do: prepare_for_issue(issue_or_identifier, worker_host, [])
+
+  @spec prepare_for_issue(map() | String.t() | nil, worker_host(), keyword()) ::
+          {:ok, prepared_workspace()} | {:error, term()}
+  def prepare_for_issue(issue_or_identifier, worker_host, opts) when is_list(opts) do
+    issue_context = issue_context(issue_or_identifier)
+    expected_workspace_path = Keyword.get(opts, :expected_workspace_path)
+
+    try do
+      safe_id = safe_identifier(issue_context.issue_identifier)
+
+      with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
+           :ok <- validate_workspace_path(workspace, worker_host),
+           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
+           :ok <- validate_expected_workspace_path(workspace, expected_workspace_path, worker_host) do
+        {:ok, %{path: workspace, root: Path.dirname(workspace), created?: created?}}
+      end
+    rescue
+      error in [ArgumentError, ErlangError, File.Error] ->
+        Logger.error("Workspace preparation failed #{issue_log_context(issue_context)} worker_host=#{worker_host_for_log(worker_host)} error=#{Exception.message(error)}")
+
+        {:error, error}
+    end
+  end
 
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
@@ -19,23 +52,36 @@ defmodule SymphonyElixir.Workspace do
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host, opts) when is_list(opts) do
     issue_context = issue_context(issue_or_identifier)
-    expected_workspace_path = Keyword.get(opts, :expected_workspace_path)
 
-    try do
-      safe_id = safe_identifier(issue_context.issue_identifier)
-
-      with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
-           :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
-           :ok <- validate_expected_workspace_path(workspace, expected_workspace_path, worker_host),
-           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-        {:ok, workspace}
-      end
-    rescue
-      error in [ArgumentError, ErlangError, File.Error] ->
-        Logger.error("Workspace creation failed #{issue_log_context(issue_context)} worker_host=#{worker_host_for_log(worker_host)} error=#{Exception.message(error)}")
-        {:error, error}
+    with {:ok, prepared} <- prepare_for_issue(issue_or_identifier, worker_host, opts),
+         :ok <- run_after_create_hook(prepared.path, issue_context, prepared.created?, worker_host) do
+      {:ok, prepared.path}
     end
+  end
+
+  @spec validate_prepared_workspace(prepared_workspace(), worker_host()) ::
+          {:ok, prepared_workspace()} | {:error, term()}
+  def validate_prepared_workspace(
+        %{path: workspace, root: root, created?: created?} = prepared,
+        worker_host
+      )
+      when is_binary(workspace) and is_binary(root) and is_boolean(created?) do
+    with :ok <- validate_path_against_root(workspace, root),
+         :ok <- validate_prepared_workspace_exists(workspace, worker_host) do
+      {:ok, prepared}
+    end
+  end
+
+  def validate_prepared_workspace(_prepared, _worker_host),
+    do: {:error, :invalid_prepared_workspace}
+
+  @spec run_after_create_hook(Path.t(), map() | String.t() | nil, boolean(), worker_host()) ::
+          :ok | {:error, term()}
+  def run_after_create_hook(workspace, issue_or_identifier, created?, worker_host \\ nil)
+      when is_binary(workspace) and is_boolean(created?) do
+    issue_or_identifier
+    |> issue_context()
+    |> then(&maybe_run_after_create_hook(workspace, &1, created?, worker_host))
   end
 
   defp ensure_workspace(workspace, nil) do
@@ -429,6 +475,37 @@ defmodule SymphonyElixir.Workspace do
 
   defp validate_expected_workspace_path(workspace, expected, worker_host) do
     {:error, {:workspace_affinity_mismatch, expected, workspace, worker_host}}
+  end
+
+  defp validate_path_against_root(workspace, root)
+       when is_binary(workspace) and is_binary(root) do
+    with {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace),
+         {:ok, canonical_root} <- PathSafety.canonicalize(root) do
+      root_prefix = canonical_root <> "/"
+
+      cond do
+        canonical_workspace == canonical_root ->
+          {:error, {:workspace_equals_root, canonical_workspace, canonical_root}}
+
+        String.starts_with?(canonical_workspace <> "/", root_prefix) ->
+          :ok
+
+        true ->
+          {:error, {:workspace_outside_root, canonical_workspace, canonical_root}}
+      end
+    end
+  end
+
+  defp validate_prepared_workspace_exists(workspace, nil) do
+    if File.dir?(workspace), do: :ok, else: {:error, {:prepared_workspace_missing, workspace, nil}}
+  end
+
+  defp validate_prepared_workspace_exists(workspace, worker_host) when is_binary(worker_host) do
+    if String.trim(workspace) != "" and not String.contains?(workspace, ["\n", "\r", <<0>>]) do
+      :ok
+    else
+      {:error, {:prepared_workspace_missing, workspace, worker_host}}
+    end
   end
 
   defp remote_shell_assign(variable_name, raw_path)

@@ -60,6 +60,7 @@ defmodule SymphonyElixir.OperatorWait do
          terminal_reason: Map.get(attrs, :terminal_reason),
          worker_host: Map.get(attrs, :worker_host),
          workspace_path: Map.get(attrs, :workspace_path),
+         workspace_root: Map.get(attrs, :workspace_root),
          parked_at: Map.get(attrs, :parked_at) || DateTime.utc_now()
        }}
     else
@@ -86,6 +87,7 @@ defmodule SymphonyElixir.OperatorWait do
         terminal_reason: event["terminal_reason"],
         worker_host: event["worker_host"],
         workspace_path: event["workspace_path"],
+        workspace_root: event["workspace_root"],
         parked_at: parked_at
       })
     end

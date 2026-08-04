@@ -30,20 +30,26 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host, expected_workspace_path: Keyword.get(opts, :expected_workspace_path)) do
-      {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, opts)
-
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
-          end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+    with {:ok, prepared} <- prepared_workspace(issue, worker_host, opts),
+         :ok <- send_worker_runtime_info(codex_update_recipient, issue, worker_host, prepared, opts) do
+      try do
+        with :ok <- Workspace.run_after_create_hook(prepared.path, issue, prepared.created?, worker_host),
+             :ok <- Workspace.run_before_run_hook(prepared.path, issue, worker_host) do
+          run_codex_turns(prepared.path, issue, codex_update_recipient, opts, worker_host)
         end
+      after
+        Workspace.run_after_run_hook(prepared.path, issue, worker_host)
+      end
+    end
+  end
 
-      {:error, reason} ->
-        {:error, reason}
+  defp prepared_workspace(issue, worker_host, opts) do
+    case Keyword.get(opts, :prepared_workspace) do
+      nil ->
+        Workspace.prepare_for_issue(issue, worker_host, expected_workspace_path: Keyword.get(opts, :expected_workspace_path))
+
+      prepared ->
+        Workspace.validate_prepared_workspace(prepared, worker_host)
     end
   end
 
@@ -66,26 +72,36 @@ defmodule SymphonyElixir.AgentRunner do
          recipient,
          %Issue{id: issue_id} = issue,
          worker_host,
-         workspace,
+         prepared,
          opts
        )
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
-    send(
-      recipient,
-      {:worker_runtime_info, issue_id,
-       %{
-         worker_host: worker_host,
-         workspace_path: workspace,
-         run_id: Keyword.get(opts, :run_id),
-         runner_generation: Keyword.get(opts, :runner_generation),
-         session_title: AppServer.session_title(issue)
-       }}
-    )
+       when is_binary(issue_id) and is_pid(recipient) and is_map(prepared) do
+    runtime_info = %{
+      worker_host: worker_host,
+      workspace_path: prepared.path,
+      workspace_root: prepared.root,
+      run_id: Keyword.get(opts, :run_id),
+      runner_generation: Keyword.get(opts, :runner_generation),
+      session_title: AppServer.session_title(issue)
+    }
 
-    :ok
+    if Keyword.get(opts, :runtime_ack_required, false) do
+      acknowledgment_ref = make_ref()
+      send(recipient, {:worker_runtime_info, issue_id, runtime_info, self(), acknowledgment_ref})
+
+      receive do
+        {:worker_runtime_ack, ^acknowledgment_ref, :ok} -> :ok
+        {:worker_runtime_ack, ^acknowledgment_ref, {:error, reason}} -> {:error, reason}
+      after
+        Config.settings!().codex.read_timeout_ms -> {:error, :worker_runtime_ack_timeout}
+      end
+    else
+      send(recipient, {:worker_runtime_info, issue_id, runtime_info})
+      :ok
+    end
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _opts), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _prepared, _opts), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)

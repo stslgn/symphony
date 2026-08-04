@@ -2106,6 +2106,72 @@ defmodule SymphonyElixir.CoreTest do
     refute File.exists?(hook_marker)
   end
 
+  test "prepared affinity is acknowledged before workspace hooks or Codex" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-prepared-affinity-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    after_create_marker = Path.join(workspace_root, "MT-PREPARED/after-create.marker")
+    before_run_marker = Path.join(workspace_root, "MT-PREPARED/before-run.marker")
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_after_create: "touch after-create.marker",
+      hook_before_run: "touch before-run.marker",
+      codex_command: "/usr/bin/false"
+    )
+
+    issue = %Issue{
+      id: "issue-prepared-affinity",
+      identifier: "MT-PREPARED",
+      title: "Prepared affinity",
+      state: "In Progress"
+    }
+
+    assert {:ok, prepared} = Workspace.prepare_for_issue(issue, nil)
+    assert {:ok, canonical_root} = SymphonyElixir.PathSafety.canonicalize(workspace_root)
+    assert prepared.path == Path.join(canonical_root, issue.identifier)
+    assert prepared.root == canonical_root
+    refute File.exists?(after_create_marker)
+    refute File.exists?(before_run_marker)
+
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        try do
+          AgentRunner.run(issue, parent,
+            prepared_workspace: prepared,
+            expected_workspace_path: prepared.path,
+            runtime_ack_required: true,
+            run_id: "run-prepared-affinity"
+          )
+        rescue
+          RuntimeError -> :agent_failed_after_hooks
+        end
+      end)
+
+    assert_receive {:worker_runtime_info, issue_id, runtime_info, worker_pid, acknowledgment_ref},
+                   1_000
+
+    assert issue_id == issue.id
+    assert runtime_info.run_id == "run-prepared-affinity"
+    assert runtime_info.workspace_path == prepared.path
+    assert runtime_info.workspace_root == prepared.root
+    refute File.exists?(after_create_marker)
+    refute File.exists?(before_run_marker)
+
+    send(worker_pid, {:worker_runtime_ack, acknowledgment_ref, :ok})
+    assert Task.await(task, 5_000) == :agent_failed_after_hooks
+    assert File.exists?(after_create_marker)
+    assert File.exists?(before_run_marker)
+  end
+
   defp assert_scheduled_delay(due_at_ms, scheduled_from_ms, expected_delay_ms) do
     scheduled_delay_ms = due_at_ms - scheduled_from_ms
 

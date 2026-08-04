@@ -196,28 +196,21 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  def handle_info({:worker_runtime_info, issue_id, runtime_info}, %{running: running} = state)
-      when is_binary(issue_id) and is_map(runtime_info) do
-    case Map.get(running, issue_id) do
-      nil ->
-        {:noreply, state}
+  def handle_info(
+        {:worker_runtime_info, issue_id, runtime_info, worker_pid, acknowledgment_ref},
+        state
+      )
+      when is_pid(worker_pid) and is_reference(acknowledgment_ref) do
+    {state, result} = accept_worker_runtime_info(state, issue_id, runtime_info)
+    send(worker_pid, {:worker_runtime_ack, acknowledgment_ref, result})
+    notify_dashboard()
+    {:noreply, state}
+  end
 
-      running_entry ->
-        if runtime_info_matches_run?(runtime_info, running_entry) do
-          updated_running_entry =
-            running_entry
-            |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
-            |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
-            |> maybe_put_runtime_value(:session_title, runtime_info[:session_title])
-
-          state = record_run_event(state, updated_running_entry, "run_runtime_ready", "running")
-          notify_dashboard()
-          {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
-        else
-          Logger.warning("Ignoring stale worker runtime info issue_id=#{issue_id} run_id=#{inspect(runtime_info[:run_id])}")
-          {:noreply, state}
-        end
-    end
+  def handle_info({:worker_runtime_info, issue_id, runtime_info}, state) do
+    {state, _result} = accept_worker_runtime_info(state, issue_id, runtime_info)
+    notify_dashboard()
+    {:noreply, state}
   end
 
   def handle_info(
@@ -585,7 +578,8 @@ defmodule SymphonyElixir.Orchestrator do
                  tracker_state: issue.state,
                  terminal_reason: Keyword.get(opts, :terminal_reason),
                  worker_host: Map.get(running_entry, :worker_host),
-                 workspace_path: Map.get(running_entry, :workspace_path)
+                 workspace_path: Map.get(running_entry, :workspace_path),
+                 workspace_root: Map.get(running_entry, :workspace_root)
                }),
              :ok <- append_run_event(state, operator_wait_event(wait, "run_parked")) do
           Logger.info("Issue parked for operator action: #{issue_context(issue)} reason=#{reason} wait_id=#{wait.wait_id}")
@@ -767,7 +761,8 @@ defmodule SymphonyElixir.Orchestrator do
             previous_run_id: Map.get(running_entry, :run_id),
             previous_attempt: Map.get(running_entry, :retry_attempt, 0),
             worker_host: Map.get(running_entry, :worker_host),
-            workspace_path: Map.get(running_entry, :workspace_path)
+            workspace_path: Map.get(running_entry, :workspace_path),
+            workspace_root: Map.get(running_entry, :workspace_root)
           }
         }
       )
@@ -1085,6 +1080,31 @@ defmodule SymphonyElixir.Orchestrator do
          worker_host,
          expected_workspace_path
        ) do
+    case Workspace.prepare_for_issue(issue, worker_host, expected_workspace_path: expected_workspace_path) do
+      {:ok, prepared_workspace} ->
+        claim_prepared_issue(
+          state,
+          issue,
+          attempt,
+          recipient,
+          worker_host,
+          prepared_workspace
+        )
+
+      {:error, reason} ->
+        Logger.error("Workspace preparation blocked claim for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp claim_prepared_issue(
+         state,
+         issue,
+         attempt,
+         recipient,
+         worker_host,
+         prepared_workspace
+       ) do
     run_id = RunLedger.new_id("run")
     normalized_attempt = normalize_retry_attempt(attempt)
 
@@ -1096,7 +1116,8 @@ defmodule SymphonyElixir.Orchestrator do
       issue_identifier: issue.identifier,
       attempt: normalized_attempt,
       worker_host: worker_host,
-      workspace_path: expected_workspace_path
+      workspace_path: prepared_workspace.path,
+      workspace_root: prepared_workspace.root
     }
 
     case append_run_event(state, claim_event) do
@@ -1109,7 +1130,7 @@ defmodule SymphonyElixir.Orchestrator do
           attempt,
           recipient,
           worker_host,
-          expected_workspace_path,
+          prepared_workspace,
           run_id,
           normalized_attempt
         )
@@ -1126,7 +1147,7 @@ defmodule SymphonyElixir.Orchestrator do
          attempt,
          recipient,
          worker_host,
-         expected_workspace_path,
+         prepared_workspace,
          run_id,
          normalized_attempt
        ) do
@@ -1136,7 +1157,9 @@ defmodule SymphonyElixir.Orchestrator do
            AgentRunner.run(issue, recipient,
              attempt: attempt,
              worker_host: worker_host,
-             expected_workspace_path: expected_workspace_path,
+             expected_workspace_path: prepared_workspace.path,
+             prepared_workspace: prepared_workspace,
+             runtime_ack_required: true,
              run_id: run_id,
              runner_generation: state.runner_generation,
              stage: "running",
@@ -1155,7 +1178,8 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: issue.identifier,
           issue: issue,
           worker_host: worker_host,
-          workspace_path: expected_workspace_path,
+          workspace_path: prepared_workspace.path,
+          workspace_root: prepared_workspace.root,
           session_id: nil,
           session_title: nil,
           resolved_model: nil,
@@ -1208,7 +1232,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
-        next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
+        next_attempt = normalized_attempt + 1
 
         failed_entry = %{
           run_id: run_id,
@@ -1217,7 +1241,8 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: issue.identifier,
           issue: issue,
           worker_host: worker_host,
-          workspace_path: expected_workspace_path,
+          workspace_path: prepared_workspace.path,
+          workspace_root: prepared_workspace.root,
           retry_attempt: normalized_attempt,
           started_at: DateTime.utc_now()
         }
@@ -1233,7 +1258,8 @@ defmodule SymphonyElixir.Orchestrator do
                previous_run_id: run_id,
                previous_attempt: normalized_attempt,
                worker_host: worker_host,
-               workspace_path: expected_workspace_path
+               workspace_path: prepared_workspace.path,
+               workspace_root: prepared_workspace.root
              }}
         }
 
@@ -1288,6 +1314,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    workspace_root = pick_retry_workspace_root(previous_retry, metadata)
 
     previous_run_id =
       Map.get(metadata, :previous_run_id) || Map.get(previous_retry, :previous_run_id)
@@ -1304,7 +1331,8 @@ defmodule SymphonyElixir.Orchestrator do
       attempt: previous_attempt,
       next_attempt: next_attempt,
       worker_host: worker_host,
-      workspace_path: workspace_path
+      workspace_path: workspace_path,
+      workspace_root: workspace_root
     }
 
     retry_entry = %{
@@ -1318,6 +1346,7 @@ defmodule SymphonyElixir.Orchestrator do
       previous_attempt: previous_attempt,
       worker_host: worker_host,
       workspace_path: workspace_path,
+      workspace_root: workspace_root,
       pending_event: retry_event,
       status: :durability_pending
     }
@@ -1371,7 +1400,8 @@ defmodule SymphonyElixir.Orchestrator do
           previous_run_id: retry.previous_run_id,
           previous_attempt: retry.previous_attempt,
           worker_host: retry.worker_host,
-          workspace_path: retry.workspace_path
+          workspace_path: retry.workspace_path,
+          workspace_root: retry.workspace_root
         }
 
         state_acc
@@ -1392,7 +1422,8 @@ defmodule SymphonyElixir.Orchestrator do
           previous_run_id: Map.get(retry_entry, :previous_run_id),
           previous_attempt: Map.get(retry_entry, :previous_attempt),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          workspace_root: Map.get(retry_entry, :workspace_root)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1637,10 +1668,56 @@ defmodule SymphonyElixir.Orchestrator do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
   end
 
+  defp pick_retry_workspace_root(previous_retry, metadata) do
+    metadata[:workspace_root] || Map.get(previous_retry, :workspace_root)
+  end
+
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 
   defp maybe_put_runtime_value(running_entry, key, value) when is_map(running_entry) do
     Map.put(running_entry, key, value)
+  end
+
+  defp accept_worker_runtime_info(%{running: running} = state, issue_id, runtime_info)
+       when is_binary(issue_id) and is_map(runtime_info) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {state, {:error, :run_not_active}}
+
+      running_entry ->
+        if runtime_affinity_matches_run?(runtime_info, running_entry) do
+          updated_running_entry =
+            running_entry
+            |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
+            |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+            |> maybe_put_runtime_value(:workspace_root, runtime_info[:workspace_root])
+            |> maybe_put_runtime_value(:session_title, runtime_info[:session_title])
+
+          event = run_event(updated_running_entry, "run_runtime_ready", "running")
+
+          case append_run_event(state, event) do
+            :ok ->
+              {%{state | running: Map.put(running, issue_id, updated_running_entry)}, :ok}
+
+            {:error, reason} ->
+              Logger.error("Failed to durably acknowledge worker runtime issue_id=#{issue_id}: #{inspect(reason)}")
+              {state, {:error, {:ledger_write_failed, reason}}}
+          end
+        else
+          Logger.warning("Rejecting mismatched worker runtime info issue_id=#{issue_id} run_id=#{inspect(runtime_info[:run_id])}")
+          {state, {:error, :workspace_affinity_mismatch}}
+        end
+    end
+  end
+
+  defp accept_worker_runtime_info(state, _issue_id, _runtime_info),
+    do: {state, {:error, :invalid_runtime_info}}
+
+  defp runtime_affinity_matches_run?(runtime_info, running_entry) do
+    runtime_info[:run_id] == running_entry[:run_id] and
+      runtime_info[:worker_host] == running_entry[:worker_host] and
+      runtime_info[:workspace_path] == running_entry[:workspace_path] and
+      runtime_info[:workspace_root] == running_entry[:workspace_root]
   end
 
   defp runtime_info_matches_run?(runtime_info, running_entry) do
@@ -1962,7 +2039,8 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: Map.get(retry, :identifier),
           error: if(pending?, do: "retry_ledger_write_failed", else: Map.get(retry, :error)),
           worker_host: Map.get(retry, :worker_host),
-          workspace_path: Map.get(retry, :workspace_path)
+          workspace_path: Map.get(retry, :workspace_path),
+          workspace_root: Map.get(retry, :workspace_root)
         }
       end)
       |> Enum.concat(recovered_dispatch_snapshot_rows(state.recovered_dispatches))
@@ -2227,7 +2305,8 @@ defmodule SymphonyElixir.Orchestrator do
            previous_run_id: Map.get(running_entry, :run_id),
            previous_attempt: Map.get(running_entry, :retry_attempt, 0),
            worker_host: Map.get(running_entry, :worker_host),
-           workspace_path: Map.get(running_entry, :workspace_path)
+           workspace_path: Map.get(running_entry, :workspace_path),
+           workspace_root: Map.get(running_entry, :workspace_root)
          }}
     }
 
@@ -2250,7 +2329,8 @@ defmodule SymphonyElixir.Orchestrator do
            previous_run_id: Map.get(running_entry, :run_id),
            previous_attempt: Map.get(running_entry, :retry_attempt, 0),
            worker_host: Map.get(running_entry, :worker_host),
-           workspace_path: Map.get(running_entry, :workspace_path)
+           workspace_path: Map.get(running_entry, :workspace_path),
+           workspace_root: Map.get(running_entry, :workspace_root)
          }}
     }
 
@@ -2398,6 +2478,7 @@ defmodule SymphonyElixir.Orchestrator do
       attempt: Map.get(running_entry, :retry_attempt, 0),
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
+      workspace_root: Map.get(running_entry, :workspace_root),
       resolved_model: Map.get(running_entry, :resolved_model),
       reasoning_effort: Map.get(running_entry, :reasoning_effort),
       model_catalog_source: Map.get(running_entry, :model_catalog_source),
@@ -2469,7 +2550,8 @@ defmodule SymphonyElixir.Orchestrator do
       tracker_state: wait.tracker_state,
       terminal_reason: Map.get(wait, :terminal_reason),
       worker_host: Map.get(wait, :worker_host),
-      workspace_path: Map.get(wait, :workspace_path)
+      workspace_path: Map.get(wait, :workspace_path),
+      workspace_root: Map.get(wait, :workspace_root)
     }
   end
 
@@ -2530,6 +2612,7 @@ defmodule SymphonyElixir.Orchestrator do
       stage: "resume_queued",
       worker_host: Map.get(wait, :worker_host),
       workspace_path: Map.get(wait, :workspace_path),
+      workspace_root: Map.get(wait, :workspace_root),
       queued_at: DateTime.utc_now()
     }
   end
@@ -2900,6 +2983,7 @@ defmodule SymphonyElixir.Orchestrator do
            stage: "resume_queued",
            worker_host: event["worker_host"],
            workspace_path: event["workspace_path"],
+           workspace_root: event["workspace_root"],
            queued_at: queued_at
          }}
 
@@ -2921,6 +3005,7 @@ defmodule SymphonyElixir.Orchestrator do
         error: affinity_error(queued),
         worker_host: Map.get(queued, :worker_host),
         workspace_path: Map.get(queued, :workspace_path),
+        workspace_root: Map.get(queued, :workspace_root),
         queued_at: Map.get(queued, :queued_at)
       }
     end)
@@ -2937,7 +3022,8 @@ defmodule SymphonyElixir.Orchestrator do
         identifier: Map.get(dispatch, :identifier),
         error: affinity_error(dispatch),
         worker_host: Map.get(dispatch, :worker_host),
-        workspace_path: Map.get(dispatch, :workspace_path)
+        workspace_path: Map.get(dispatch, :workspace_path),
+        workspace_root: Map.get(dispatch, :workspace_root)
       }
     end)
   end
