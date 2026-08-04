@@ -42,7 +42,8 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
       poll_interval_ms: 60_000,
       max_concurrent_agents: 1,
       max_turns: 1,
-      codex_command: "#{fake.binary} app-server"
+      codex_command: "#{fake.binary} app-server",
+      prompt: "Attempt={{ run.attempt }} Run={{ run.id }}"
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
@@ -80,6 +81,7 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
       assert [wait] = snapshot.parked
       assert wait.reason == "run_budget_exhausted"
       assert wait.terminal_reason == "turn_budget_exhausted"
+      first_run_id = wait.run_id
 
       events = ScenarioHarness.events(harness)
       assert count_transition(events, "run_claimed") == 1
@@ -99,6 +101,35 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
       assert trace =~ ~s("method":"turn/start")
       refute trace =~ ~s("method":"config/read")
 
+      assert {:ok, %{resumed: true}} =
+               Orchestrator.resolve_wait(harness.name, issue.id, wait.wait_id, "retry")
+
+      resumed_snapshot =
+        ScenarioHarness.await_snapshot(harness, fn snapshot ->
+          case snapshot.parked do
+            [%{run_id: run_id, attempt: 1}] when run_id != first_run_id -> true
+            _other -> false
+          end
+        end)
+
+      assert [%{run_id: resumed_run_id, attempt: 1}] = resumed_snapshot.parked
+      refute resumed_run_id == first_run_id
+
+      resumed_events = ScenarioHarness.events(harness)
+      assert count_transition(resumed_events, "run_claimed") == 2
+
+      assert Enum.any?(resumed_events, fn event ->
+               event["transition"] == "wait_resumed" and event["attempt"] == 1
+             end)
+
+      assert Enum.any?(resumed_events, fn event ->
+               event["transition"] == "run_started" and
+                 event["run_id"] == resumed_run_id and event["attempt"] == 1
+             end)
+
+      resumed_trace = File.read!(fake.trace)
+      assert resumed_trace =~ "Attempt=1 Run=#{resumed_run_id}"
+
       assert :ok = ScenarioHarness.assert_consistent!(harness)
     after
       ScenarioHarness.stop(harness)
@@ -117,7 +148,8 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
       assert [wait] = snapshot.parked
       assert wait.reason == "run_budget_exhausted"
       assert wait.terminal_reason == "turn_budget_exhausted"
-      assert count_transition(ScenarioHarness.events(restarted), "run_claimed") == 1
+      assert wait.attempt == 1
+      assert count_transition(ScenarioHarness.events(restarted), "run_claimed") == 2
       assert :ok = ScenarioHarness.assert_consistent!(restarted)
     after
       ScenarioHarness.stop(restarted)

@@ -99,6 +99,9 @@ defmodule SymphonyElixir.RunLedger do
           next_attempt = max(integer_value(event["attempt"], 0) + 1, 1)
           Map.update(acc, issue_id, next_attempt, &max(&1, next_attempt))
         end)
+        |> Map.merge(recovery.resumed_attempts, fn _issue_id, stale_attempt, resumed_attempt ->
+          max(stale_attempt, resumed_attempt)
+        end)
 
       {:ok,
        %{
@@ -179,6 +182,8 @@ defmodule SymphonyElixir.RunLedger do
 
       parked = Enum.reduce(events, %{}, &update_parked_state/2)
 
+      resumed_attempts = Enum.reduce(events, %{}, &update_resumed_attempt_state/2)
+
       dispatch_paused = Enum.reduce(events, false, &update_dispatch_pause_state/2)
 
       processed_operator_comment_ids =
@@ -191,6 +196,7 @@ defmodule SymphonyElixir.RunLedger do
        %{
          stale_runs: unfinished,
          parked: parked,
+         resumed_attempts: resumed_attempts,
          dispatch_paused: dispatch_paused,
          processed_operator_comment_ids: processed_operator_comment_ids,
          operator_comment_cursors: operator_comment_cursors
@@ -228,6 +234,25 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp update_parked_state(_event, acc), do: acc
+
+  defp update_resumed_attempt_state(
+         %{"transition" => "wait_resumed", "issue_id" => issue_id, "attempt" => attempt},
+         acc
+       )
+       when is_binary(issue_id) and is_integer(attempt) and attempt >= 1 do
+    Map.update(acc, issue_id, attempt, &max(&1, attempt))
+  end
+
+  defp update_resumed_attempt_state(
+         %{"transition" => transition, "issue_id" => issue_id},
+         acc
+       )
+       when transition in ["run_claimed", "run_started", "run_parked", "wait_released"] and
+              is_binary(issue_id) do
+    Map.delete(acc, issue_id)
+  end
+
+  defp update_resumed_attempt_state(_event, acc), do: acc
 
   defp update_dispatch_pause_state(%{"transition" => "dispatch_paused"}, _paused),
     do: true

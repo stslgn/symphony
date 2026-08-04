@@ -782,11 +782,19 @@ defmodule SymphonyElixir.CoreTest do
              )
 
     refute Map.has_key?(resumed_state.parked, issue_id)
+    assert resumed_state.recovered_attempts[issue_id] == 2
 
     assert {:ok, events} = RunLedger.read_events(ledger_path)
     assert Enum.count(events, &(&1["transition"] == "run_parked")) == 1
     assert Enum.count(events, &(&1["transition"] == "wait_rejected")) == 1
     assert Enum.count(events, &(&1["transition"] == "wait_resumed")) == 1
+
+    assert Enum.any?(events, fn event ->
+             event["transition"] == "wait_resumed" and event["attempt"] == 2
+           end)
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(ledger_path, "runner-after-resume")
+    assert recovery.recovered_attempts[issue_id] == 2
   end
 
   test "observed token budget exhaustion parks the run without scheduling retry" do

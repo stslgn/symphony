@@ -2174,7 +2174,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp apply_operator_wait_action(state, wait, action) do
     if OperatorWait.action_allowed?(wait, action) do
       transition = if action == "reject", do: "wait_rejected", else: "wait_resumed"
-      event = operator_wait_event(wait, transition)
+      next_attempt = max(wait.attempt + 1, 1)
+
+      event =
+        wait
+        |> operator_wait_event(transition)
+        |> maybe_put_resumed_attempt(action, next_attempt)
 
       case append_run_event(state, event) do
         :ok when action == "reject" ->
@@ -2184,6 +2189,9 @@ defmodule SymphonyElixir.Orchestrator do
           state =
             state
             |> Map.update!(:parked, &Map.delete(&1, wait.issue_id))
+            |> Map.update!(:recovered_attempts, fn attempts ->
+              Map.update(attempts, wait.issue_id, next_attempt, &max(&1, next_attempt))
+            end)
             |> schedule_tick(0)
 
           {:ok, %{wait: wait, action: action, resumed: true}, state}
@@ -2195,6 +2203,9 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, :action_not_allowed, state}
     end
   end
+
+  defp maybe_put_resumed_attempt(event, "reject", _next_attempt), do: event
+  defp maybe_put_resumed_attempt(event, _action, next_attempt), do: Map.put(event, :attempt, next_attempt)
 
   defp process_operator_comments(%State{} = state) do
     process_operator_comments(state, operator_user_ids())
