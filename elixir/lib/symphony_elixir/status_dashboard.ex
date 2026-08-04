@@ -26,6 +26,28 @@ defmodule SymphonyElixir.StatusDashboard do
   @running_row_chrome_width 10
   @default_terminal_columns 115
   @max_parked_rows 5
+  @parked_row_max_columns 160
+  @parked_row_max_bytes 384
+  @parked_identifier_columns 24
+  @parked_wait_id_columns 32
+  @parked_reason_columns 24
+  @parked_attempt_columns 8
+  @parked_host_columns 32
+  @parked_path_columns 64
+  @parked_actions_columns 32
+  @wide_codepoint_ranges [
+    0x1100..0x115F,
+    0x2329..0x232A,
+    0x2E80..0xA4CF,
+    0xAC00..0xD7A3,
+    0xF900..0xFAFF,
+    0xFE10..0xFE19,
+    0xFE30..0xFE6F,
+    0xFF00..0xFF60,
+    0xFFE0..0xFFE6,
+    0x1F300..0x1FAFF,
+    0x20000..0x3FFFD
+  ]
 
   @ansi_reset IO.ANSI.reset()
   @ansi_bold IO.ANSI.bright()
@@ -350,7 +372,12 @@ defmodule SymphonyElixir.StatusDashboard do
         running_rows = format_running_rows(running, running_event_width)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
-        parked_rows = format_parked_rows(Map.get(snapshot, :parked, []))
+
+        parked_rows =
+          format_parked_rows(
+            Map.get(snapshot, :parked, []),
+            terminal_columns_override || terminal_columns()
+          )
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
@@ -698,14 +725,16 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
-  defp format_parked_rows([]), do: []
+  defp format_parked_rows([], _terminal_columns), do: []
 
-  defp format_parked_rows(parked) do
+  defp format_parked_rows(parked, terminal_columns) do
     visible_rows =
       parked
-      |> Enum.sort_by(fn wait -> {Map.get(wait, :identifier), Map.get(wait, :wait_id)} end)
+      |> Enum.sort_by(fn wait ->
+        {parked_field(Map.get(wait, :identifier), @parked_identifier_columns), parked_field(Map.get(wait, :wait_id), @parked_wait_id_columns)}
+      end)
       |> Enum.take(@max_parked_rows)
-      |> Enum.map(&format_parked_summary/1)
+      |> Enum.map(&format_parked_summary(&1, terminal_columns))
 
     overflow_count = max(0, length(parked) - @max_parked_rows)
     overflow_rows = if overflow_count == 0, do: [], else: ["│  ... #{overflow_count} more parked waits"]
@@ -713,18 +742,145 @@ defmodule SymphonyElixir.StatusDashboard do
     ["│", colorize("├─ Parked waits", @ansi_bold), "│"] ++ visible_rows ++ overflow_rows
   end
 
-  defp format_parked_summary(wait) do
-    identifier = Map.get(wait, :identifier) || Map.get(wait, :issue_id) || "unknown"
-    wait_id = Map.get(wait, :wait_id) || "missing"
-    reason = Map.get(wait, :reason) || "unknown"
-    attempt = Map.get(wait, :attempt) || 0
-    worker_host = Map.get(wait, :worker_host) || "local"
-    workspace_path = Map.get(wait, :workspace_path) || "missing"
-    allowed_actions = wait |> Map.get(:allowed_actions, []) |> Enum.join("|")
+  defp format_parked_summary(wait, terminal_columns) do
+    identifier =
+      parked_field(
+        Map.get(wait, :identifier) || Map.get(wait, :issue_id) || "unknown",
+        @parked_identifier_columns
+      )
 
-    "│  #{identifier} wait=#{wait_id} reason=#{reason} attempt=#{attempt} " <>
-      "host=#{worker_host} path=#{workspace_path} actions=#{allowed_actions}"
+    wait_id = parked_field(Map.get(wait, :wait_id) || "missing", @parked_wait_id_columns)
+    reason = parked_field(Map.get(wait, :reason) || "unknown", @parked_reason_columns)
+    attempt = parked_field(Map.get(wait, :attempt) || 0, @parked_attempt_columns)
+    worker_host = parked_field(Map.get(wait, :worker_host) || "local", @parked_host_columns)
+    workspace_path = parked_field(Map.get(wait, :workspace_path) || "missing", @parked_path_columns)
+
+    allowed_actions =
+      wait
+      |> Map.get(:allowed_actions, [])
+      |> parked_actions()
+      |> parked_field(@parked_actions_columns)
+
+    row =
+      "│  #{identifier} wait=#{wait_id} reason=#{reason} attempt=#{attempt} " <>
+        "host=#{worker_host} path=#{workspace_path} actions=#{allowed_actions}"
+
+    truncate_terminal(
+      row,
+      min(terminal_columns, @parked_row_max_columns),
+      @parked_row_max_bytes
+    )
   end
+
+  @doc false
+  @spec format_parked_summary_for_test(map(), pos_integer()) :: String.t()
+  def format_parked_summary_for_test(wait, terminal_columns)
+      when is_map(wait) and is_integer(terminal_columns) and terminal_columns > 0 do
+    format_parked_summary(wait, terminal_columns)
+  end
+
+  @doc false
+  @spec terminal_width_for_test(String.t()) :: non_neg_integer()
+  def terminal_width_for_test(value) when is_binary(value), do: terminal_width(value)
+
+  defp parked_actions(actions) when is_list(actions) do
+    Enum.map_join(actions, "|", &parked_value/1)
+  end
+
+  defp parked_actions(_actions), do: "invalid"
+
+  defp parked_field(value, max_columns) do
+    value
+    |> parked_value()
+    |> escape_terminal_controls()
+    |> truncate_terminal(max_columns, max_columns * 4)
+  end
+
+  defp parked_value(value) when is_binary(value), do: value
+  defp parked_value(value) when is_atom(value) or is_number(value), do: to_string(value)
+  defp parked_value(_value), do: "invalid"
+
+  defp escape_terminal_controls(value) when is_binary(value) do
+    if String.valid?(value) do
+      value
+      |> String.to_charlist()
+      |> Enum.map_join(&escape_terminal_codepoint/1)
+    else
+      "invalid-utf8"
+    end
+  end
+
+  defp escape_terminal_codepoint(?\n), do: "\\n"
+  defp escape_terminal_codepoint(?\r), do: "\\r"
+  defp escape_terminal_codepoint(?\t), do: "\\t"
+  defp escape_terminal_codepoint(0x1B), do: "\\e"
+
+  defp escape_terminal_codepoint(codepoint)
+       when codepoint in 0x00..0x1F or codepoint == 0x7F,
+       do: "\\x" <> codepoint_hex(codepoint, 2)
+
+  defp escape_terminal_codepoint(codepoint) when codepoint in 0x80..0x9F,
+    do: "\\u{" <> codepoint_hex(codepoint, 4) <> "}"
+
+  defp escape_terminal_codepoint(codepoint), do: <<codepoint::utf8>>
+
+  defp codepoint_hex(codepoint, width) do
+    codepoint
+    |> Integer.to_string(16)
+    |> String.upcase()
+    |> String.pad_leading(width, "0")
+  end
+
+  defp truncate_terminal(value, max_columns, max_bytes) do
+    if terminal_width(value) <= max_columns and byte_size(value) <= max_bytes do
+      value
+    else
+      suffix = String.duplicate(".", min(3, min(max_columns, max_bytes)))
+      column_budget = max(0, max_columns - terminal_width(suffix))
+      byte_budget = max(0, max_bytes - byte_size(suffix))
+
+      value
+      |> take_graphemes_within_bounds(column_budget, byte_budget)
+      |> Kernel.<>(suffix)
+    end
+  end
+
+  defp take_graphemes_within_bounds(value, column_budget, byte_budget) do
+    value
+    |> String.graphemes()
+    |> Enum.reduce_while(
+      {[], 0, 0},
+      &take_grapheme_within_bounds(&1, &2, column_budget, byte_budget)
+    )
+    |> elem(0)
+    |> Enum.reverse()
+    |> Enum.join()
+  end
+
+  defp take_grapheme_within_bounds(grapheme, {kept, columns, bytes}, column_budget, byte_budget) do
+    next_columns = columns + grapheme_width(grapheme)
+    next_bytes = bytes + byte_size(grapheme)
+
+    if next_columns <= column_budget and next_bytes <= byte_budget,
+      do: {:cont, {[grapheme | kept], next_columns, next_bytes}},
+      else: {:halt, {kept, columns, bytes}}
+  end
+
+  defp terminal_width(value) do
+    value
+    |> String.graphemes()
+    |> Enum.reduce(0, fn grapheme, width -> width + grapheme_width(grapheme) end)
+  end
+
+  defp grapheme_width(grapheme) do
+    grapheme
+    |> String.to_charlist()
+    |> List.first()
+    |> wide_codepoint?()
+    |> if(do: 2, else: 1)
+  end
+
+  defp wide_codepoint?(codepoint), do: Enum.any?(@wide_codepoint_ranges, &(codepoint in &1))
 
   defp format_durable_queue_summary(retry_entry, identifier, attempt, label, error) do
     worker_host = Map.get(retry_entry, :worker_host) || "local"

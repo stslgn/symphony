@@ -169,6 +169,39 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     )
   end
 
+  test "parked wait rows escape terminal controls and remain bounded" do
+    parked_wait = %{
+      issue_id: "issue-adversarial",
+      identifier: "\n\r\t\e\a\u009B漢🙂",
+      wait_id: "wait-owner-approval",
+      reason: "waiting_owner\nfor approval",
+      attempt: 3,
+      worker_host: "worker-b\e]0;renamed\a",
+      workspace_path: String.duplicate("路", 1_700),
+      allowed_actions: ["approve", "reject\rnow"]
+    }
+
+    row = StatusDashboard.format_parked_summary_for_test(parked_wait, @terminal_columns)
+
+    refute Enum.any?(String.to_charlist(row), &(&1 in 0..31 or &1 in 127..159))
+    assert StatusDashboard.terminal_width_for_test(row) <= @terminal_columns
+    assert byte_size(row) <= 384
+    assert row =~ "\\n\\r\\t\\e\\x07\\u{009B}"
+
+    narrow_row = StatusDashboard.format_parked_summary_for_test(parked_wait, 12)
+    assert StatusDashboard.terminal_width_for_test(narrow_row) <= 12
+
+    invalid_utf8_row =
+      StatusDashboard.format_parked_summary_for_test(%{parked_wait | identifier: <<0xFF>>}, @terminal_columns)
+
+    assert invalid_utf8_row =~ "invalid-utf8"
+
+    Snapshot.assert_snapshot!(
+      "status_dashboard_snapshots/parked_wait_adversarial.snapshot.txt",
+      row
+    )
+  end
+
   test "backoff queue row exposes only a categorical error code" do
     snapshot_data =
       {:ok,
