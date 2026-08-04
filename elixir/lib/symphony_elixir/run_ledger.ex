@@ -58,6 +58,7 @@ defmodule SymphonyElixir.RunLedger do
                            "operator_stop",
                            "time_budget_exhausted",
                            "token_budget_exhausted",
+                           "token_telemetry_integrity_failed",
                            "turn_budget_exhausted"
                          ])
   @transition_schemas %{

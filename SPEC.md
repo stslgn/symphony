@@ -250,9 +250,9 @@ Fields:
 - `codex_input_tokens` (integer)
 - `codex_output_tokens` (integer)
 - `codex_total_tokens` (integer)
-- `last_reported_input_tokens` (integer)
-- `last_reported_output_tokens` (integer)
-- `last_reported_total_tokens` (integer)
+- `token_accounting` (object)
+  - Per input/output/total component: last raw cumulative value, bounded
+    accumulated lifetime, and reset epoch for the current attempt.
 - `turn_count` (integer)
   - Number of coding-agent turns started within the current worker lifetime.
 - `run_budget` (object)
@@ -261,6 +261,10 @@ Fields:
 - `token_telemetry_observed` (boolean)
   - When false, status MUST expose token usage and remaining allowance as
     unknown rather than verified zero.
+- `token_telemetry_integrity` (`unobserved`, `valid`, or `failed`)
+  - Integrity failure is attempt-scoped and permanent. Status exposes the
+    bounded accumulated value as a lower bound with no remaining allowance.
+- `token_telemetry_failure` (bounded categorical value or null)
 
 #### 4.1.7 Retry Entry
 
@@ -481,6 +485,9 @@ Fields:
   - Limits cumulative Codex tokens observed during one run attempt.
   - Missing token telemetry MUST be represented as unobserved, not as a
     verified zero.
+  - Malformed cumulative counters, checked-arithmetic overflow, or an
+    ambiguous non-zero decrease MUST fail a configured token budget closed as
+    `token_telemetry_integrity_failed`.
   - Invalid non-null values fail configuration validation.
 - `max_run_seconds` (positive integer or null)
   - Default: `null` (disabled).
@@ -1568,8 +1575,14 @@ Token accounting rules:
   If explicit and derived totals disagree, use the larger bounded value so the budget fails closed.
 - Treat token telemetry as enforceably observed only when that canonical cumulative total exists.
   A one-sided input or output counter remains visible but MUST NOT claim verified total usage.
-- Track deltas relative to the attempt's monotonic high-water marks. Duplicate or decreasing/reset
-  counters MUST NOT double-count, reduce recorded use, or reopen an exhausted allowance.
+- Track the last raw cumulative counter and bounded accumulated lifetime per
+  attempt and component. A positive-to-zero transition proves a new telemetry
+  epoch; later growth MUST be added to the lifetime retained from prior epochs.
+  Duplicate values add nothing. A non-zero decrease is ambiguous and MUST
+  permanently fail telemetry integrity rather than silently discard usage.
+- A recognized but malformed counter or checked lifetime overflow MUST also
+  permanently fail telemetry integrity. Missing cumulative counters on an
+  unrelated update remain unobserved and are not an integrity failure.
 - Do not treat generic `usage` maps as cumulative totals unless the event type defines them that
   way.
 - Accumulate aggregate totals in orchestrator state.
@@ -1683,7 +1696,9 @@ Minimum endpoints:
               "limit": 250000,
               "used": 2000,
               "remaining": 248000,
-              "telemetry_observed": true
+              "telemetry_observed": true,
+              "telemetry_integrity": "valid",
+              "integrity_error": null
             },
             "time": {"limit": 7200, "used": 287, "remaining": 6913}
           }

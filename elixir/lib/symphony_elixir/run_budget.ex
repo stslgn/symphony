@@ -6,6 +6,7 @@ defmodule SymphonyElixir.RunBudget do
   @terminal_reasons [
     "turn_budget_exhausted",
     "token_budget_exhausted",
+    "token_telemetry_integrity_failed",
     "time_budget_exhausted"
   ]
 
@@ -33,6 +34,7 @@ defmodule SymphonyElixir.RunBudget do
   @spec exhausted_reason(limits(), map()) :: String.t() | nil
   def exhausted_reason(limits, metrics) when is_map(limits) and is_map(metrics) do
     cond do
+      token_integrity_failed?(limits, metrics) -> "token_telemetry_integrity_failed"
       token_exhausted?(limits, metrics) -> "token_budget_exhausted"
       time_exhausted?(limits, metrics) -> "time_budget_exhausted"
       true -> nil
@@ -43,20 +45,31 @@ defmodule SymphonyElixir.RunBudget do
   def snapshot(limits, metrics) when is_map(limits) and is_map(metrics) do
     turns_used = non_negative_integer(Map.get(metrics, :turns))
     seconds_used = non_negative_integer(Map.get(metrics, :seconds))
-    telemetry_observed? = Map.get(metrics, :token_telemetry_observed, false) == true
+    reported_observed? = Map.get(metrics, :token_telemetry_observed, false) == true
     tokens_used = non_negative_integer(Map.get(metrics, :tokens))
     token_limit = Map.get(limits, :max_tokens)
+    telemetry_integrity = telemetry_integrity(metrics, reported_observed?)
+    integrity_failed? = telemetry_integrity == :failed
+    telemetry_observed? = reported_observed? and telemetry_integrity == :valid
 
     %{
       turns: allowance(Map.fetch!(limits, :max_turns), turns_used),
       tokens: %{
         limit: token_limit,
-        used: if(telemetry_observed?, do: tokens_used),
+        used: if(telemetry_observed? or integrity_failed?, do: tokens_used),
         remaining: if(telemetry_observed?, do: remaining(token_limit, tokens_used)),
-        telemetry_observed: telemetry_observed?
+        telemetry_observed: telemetry_observed?,
+        telemetry_integrity: Atom.to_string(telemetry_integrity),
+        integrity_error: integrity_error(metrics, integrity_failed?)
       },
       time: allowance(Map.get(limits, :max_seconds), seconds_used)
     }
+  end
+
+  defp token_integrity_failed?(limits, metrics) do
+    is_integer(Map.get(limits, :max_tokens)) and
+      telemetry_integrity(metrics, Map.get(metrics, :token_telemetry_observed, false) == true) ==
+        :failed
   end
 
   defp token_exhausted?(limits, metrics) do
@@ -71,6 +84,23 @@ defmodule SymphonyElixir.RunBudget do
     used = non_negative_integer(Map.get(metrics, :seconds))
     is_integer(limit) and used >= limit
   end
+
+  defp telemetry_integrity(metrics, observed?) do
+    case Map.get(metrics, :token_telemetry_integrity) do
+      integrity when integrity in [:unobserved, :valid, :failed] -> integrity
+      _other -> if(observed?, do: :valid, else: :unobserved)
+    end
+  end
+
+  defp integrity_error(metrics, true) do
+    case Map.get(metrics, :token_telemetry_failure) do
+      failure when is_atom(failure) -> Atom.to_string(failure)
+      failure when is_binary(failure) -> failure
+      _other -> "unknown_integrity_failure"
+    end
+  end
+
+  defp integrity_error(_metrics, false), do: nil
 
   defp allowance(limit, used) do
     %{limit: limit, used: used, remaining: remaining(limit, used)}

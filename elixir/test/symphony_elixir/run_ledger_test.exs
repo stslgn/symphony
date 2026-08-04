@@ -439,6 +439,33 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert next_recovery.parked == %{}
   end
 
+  test "accepts and restores a token telemetry integrity park" do
+    path = ledger_path()
+    run_id = "run-token-integrity"
+    issue_id = "issue-token-integrity"
+    identifier = "DUD-TOKEN-INTEGRITY"
+
+    assert :ok = append_claim!(path, run_id, issue_id, identifier, 1)
+    assert :ok = append_started!(path, run_id, issue_id, identifier, 1)
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_parked",
+               stage: "parked",
+               run_id: run_id,
+               issue_id: issue_id,
+               issue_identifier: identifier,
+               attempt: 1,
+               wait_id: "wait-token-integrity",
+               parked_reason: "run_budget_exhausted",
+               terminal_reason: "token_telemetry_integrity_failed",
+               allowed_actions: ["retry", "reject"]
+             })
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-token-integrity")
+    assert recovery.parked[issue_id]["terminal_reason"] == "token_telemetry_integrity_failed"
+  end
+
   test "durable claim atomically consumes a queued resume" do
     path = ledger_path()
 

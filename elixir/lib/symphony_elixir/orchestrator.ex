@@ -1545,7 +1545,11 @@ defmodule SymphonyElixir.Orchestrator do
           codex_last_reported_input_tokens: 0,
           codex_last_reported_output_tokens: 0,
           codex_last_reported_total_tokens: 0,
+          codex_token_accounting: new_token_accounting(),
           codex_token_telemetry_observed: false,
+          codex_token_telemetry_integrity: :unobserved,
+          codex_token_telemetry_failure: nil,
+          codex_token_telemetry_epoch: 0,
           turn_count: 0,
           run_budget: run_budget,
           run_budget_timer_ref: nil,
@@ -2651,13 +2655,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
-    codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
-    codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
-    codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
+    accounting = token_delta.accounting
     codex_app_server_pid = Map.get(running_entry, :codex_app_server_pid)
-    last_reported_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
-    last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
-    last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
     {
@@ -2672,15 +2671,17 @@ defmodule SymphonyElixir.Orchestrator do
         model_catalog: model_catalog_for_update(Map.get(running_entry, :model_catalog), update),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
-        codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
-        codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
-        codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
-        codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
-        codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
-        codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
-        codex_token_telemetry_observed:
-          Map.get(running_entry, :codex_token_telemetry_observed, false) or
-            token_delta.telemetry_observed,
+        codex_input_tokens: accounting.input.lifetime,
+        codex_output_tokens: accounting.output.lifetime,
+        codex_total_tokens: accounting.total.lifetime,
+        codex_last_reported_input_tokens: accounting.input.last_raw || 0,
+        codex_last_reported_output_tokens: accounting.output.last_raw || 0,
+        codex_last_reported_total_tokens: accounting.total.last_raw || 0,
+        codex_token_accounting: accounting,
+        codex_token_telemetry_observed: accounting.integrity == :valid,
+        codex_token_telemetry_integrity: accounting.integrity,
+        codex_token_telemetry_failure: accounting.failure,
+        codex_token_telemetry_epoch: accounting.total.epoch,
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
       token_delta
@@ -3699,58 +3700,63 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp extract_token_delta(running_entry, %{event: _, timestamp: _} = update) do
+    accounting = token_accounting(running_entry)
+
     case canonical_token_usage(extract_token_usage(update)) do
-      {:ok, usage} -> token_delta_from_canonical_usage(running_entry, usage)
-      :invalid -> empty_token_delta(running_entry)
+      {:ok, usage} -> token_delta_from_canonical_usage(accounting, usage)
+      {:error, reason} -> failed_token_delta(accounting, reason)
     end
   end
 
-  defp token_delta_from_canonical_usage(running_entry, usage) do
-    input =
-      compute_token_delta(
-        running_entry,
-        :input,
-        usage,
-        :codex_last_reported_input_tokens
-      )
+  defp token_delta_from_canonical_usage(%{integrity: :failed} = accounting, _usage),
+    do: empty_token_delta(accounting)
 
-    output =
-      compute_token_delta(
-        running_entry,
-        :output,
-        usage,
-        :codex_last_reported_output_tokens
-      )
+  defp token_delta_from_canonical_usage(accounting, usage) do
+    with {:ok, input, input_delta} <-
+           advance_token_component(accounting.input, get_token_usage(usage, :input)),
+         {:ok, output, output_delta} <-
+           advance_token_component(accounting.output, get_token_usage(usage, :output)),
+         {:ok, total, total_delta} <-
+           advance_token_component(accounting.total, get_token_usage(usage, :total)) do
+      integrity =
+        if accounting.integrity == :valid or is_integer(get_token_usage(usage, :total)),
+          do: :valid,
+          else: :unobserved
 
-    total =
-      compute_token_delta(
-        running_entry,
-        :total,
-        usage,
-        :codex_last_reported_total_tokens
-      )
+      updated_accounting = %{
+        integrity: integrity,
+        failure: nil,
+        input: input,
+        output: output,
+        total: total
+      }
 
-    %{
-      input_tokens: input.delta,
-      output_tokens: output.delta,
-      total_tokens: total.delta,
-      input_reported: input.reported,
-      output_reported: output.reported,
-      total_reported: total.reported,
-      telemetry_observed: is_integer(get_token_usage(usage, :total))
-    }
+      %{
+        input_tokens: input_delta,
+        output_tokens: output_delta,
+        total_tokens: total_delta,
+        accounting: updated_accounting
+      }
+    else
+      {:error, reason} -> failed_token_delta(accounting, reason)
+    end
   end
 
-  defp empty_token_delta(running_entry) do
+  defp empty_token_delta(accounting) do
     %{
       input_tokens: 0,
       output_tokens: 0,
       total_tokens: 0,
-      input_reported: Map.get(running_entry, :codex_last_reported_input_tokens, 0),
-      output_reported: Map.get(running_entry, :codex_last_reported_output_tokens, 0),
-      total_reported: Map.get(running_entry, :codex_last_reported_total_tokens, 0),
-      telemetry_observed: false
+      accounting: accounting
     }
+  end
+
+  defp failed_token_delta(%{integrity: :failed} = accounting, _reason),
+    do: empty_token_delta(accounting)
+
+  defp failed_token_delta(accounting, reason) do
+    accounting = %{accounting | integrity: :failed, failure: reason}
+    empty_token_delta(accounting)
   end
 
   defp canonical_token_usage(usage) when is_map(usage) do
@@ -3765,11 +3771,11 @@ defmodule SymphonyElixir.Orchestrator do
          total: canonical_total(explicit_total, derived_total)
        }}
     else
-      :invalid -> :invalid
+      :invalid -> {:error, :malformed_counter}
     end
   end
 
-  defp canonical_token_usage(_usage), do: :invalid
+  defp canonical_token_usage(_usage), do: {:error, :malformed_counter}
 
   defp normalized_token_component(usage, fields) do
     values =
@@ -3799,22 +3805,91 @@ defmodule SymphonyElixir.Orchestrator do
   defp canonical_total(nil, derived), do: derived
   defp canonical_total(total, derived), do: max(total, derived)
 
-  defp compute_token_delta(running_entry, token_key, usage, reported_key) do
-    next_total = get_token_usage(usage, token_key)
-    prev_reported = Map.get(running_entry, reported_key, 0)
+  defp advance_token_component(component, nil), do: {:ok, component, 0}
 
-    delta =
-      if is_integer(next_total) and next_total >= prev_reported do
-        next_total - prev_reported
-      else
-        0
-      end
+  defp advance_token_component(%{last_raw: nil} = component, next_raw)
+       when is_integer(next_raw) do
+    with {:ok, lifetime} <- checked_token_add(component.lifetime, next_raw) do
+      {:ok, %{component | last_raw: next_raw, lifetime: lifetime}, next_raw}
+    end
+  end
+
+  defp advance_token_component(%{last_raw: previous_raw} = component, 0)
+       when is_integer(previous_raw) and previous_raw > 0 do
+    {:ok, %{component | last_raw: 0, epoch: component.epoch + 1}, 0}
+  end
+
+  defp advance_token_component(%{last_raw: previous_raw} = component, next_raw)
+       when is_integer(previous_raw) and is_integer(next_raw) and next_raw >= previous_raw do
+    delta = next_raw - previous_raw
+
+    with {:ok, lifetime} <- checked_token_add(component.lifetime, delta) do
+      {:ok, %{component | last_raw: next_raw, lifetime: lifetime}, delta}
+    end
+  end
+
+  defp advance_token_component(%{last_raw: previous_raw}, next_raw)
+       when is_integer(previous_raw) and is_integer(next_raw) and next_raw > 0 and
+              next_raw < previous_raw,
+       do: {:error, :ambiguous_counter_decrease}
+
+  defp advance_token_component(_component, _next_raw),
+    do: {:error, :malformed_counter}
+
+  defp checked_token_add(left, right)
+       when is_integer(left) and left >= 0 and is_integer(right) and right >= 0 do
+    if left <= @max_cumulative_token_count - right do
+      {:ok, left + right}
+    else
+      {:error, :counter_overflow}
+    end
+  end
+
+  defp token_accounting(%{codex_token_accounting: accounting}) when is_map(accounting),
+    do: accounting
+
+  defp token_accounting(running_entry) do
+    observed? = Map.get(running_entry, :codex_token_telemetry_observed, false) == true
 
     %{
-      delta: max(delta, 0),
-      reported: if(is_integer(next_total), do: next_total, else: prev_reported)
+      integrity: if(observed?, do: :valid, else: :unobserved),
+      failure: Map.get(running_entry, :codex_token_telemetry_failure),
+      input: legacy_token_component(running_entry, :input),
+      output: legacy_token_component(running_entry, :output),
+      total: legacy_token_component(running_entry, :total)
     }
   end
+
+  defp legacy_token_component(running_entry, token_key) do
+    lifetime = Map.get(running_entry, token_lifetime_key(token_key), 0)
+    last_raw = Map.get(running_entry, token_last_reported_key(token_key), 0)
+
+    %{
+      last_raw: if(last_raw == 0 and lifetime == 0, do: nil, else: last_raw),
+      lifetime: lifetime,
+      epoch: 0
+    }
+  end
+
+  defp token_lifetime_key(:input), do: :codex_input_tokens
+  defp token_lifetime_key(:output), do: :codex_output_tokens
+  defp token_lifetime_key(:total), do: :codex_total_tokens
+
+  defp token_last_reported_key(:input), do: :codex_last_reported_input_tokens
+  defp token_last_reported_key(:output), do: :codex_last_reported_output_tokens
+  defp token_last_reported_key(:total), do: :codex_last_reported_total_tokens
+
+  defp new_token_accounting do
+    %{
+      integrity: :unobserved,
+      failure: nil,
+      input: new_token_component(),
+      output: new_token_component(),
+      total: new_token_component()
+    }
+  end
+
+  defp new_token_component, do: %{last_raw: nil, lifetime: 0, epoch: 0}
 
   defp extract_token_usage(update) do
     payloads = [
@@ -3867,7 +3942,7 @@ defmodule SymphonyElixir.Orchestrator do
           map_at_path(payload, ["params", "usage"]) ||
           map_at_path(payload, [:params, :usage])
 
-      if is_map(direct) and integer_token_map?(direct), do: direct
+      if is_map(direct) and token_counter_map?(direct), do: direct
     end
   end
 
@@ -3920,7 +3995,7 @@ defmodule SymphonyElixir.Orchestrator do
     Enum.find_value(paths, fn path ->
       value = map_at_path(payload, path)
 
-      if is_map(value) and integer_token_map?(value), do: value
+      if is_map(value) and token_counter_map?(value), do: value
     end)
   end
 
@@ -3938,14 +4013,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp map_at_path(_payload, _path), do: nil
 
-  defp integer_token_map?(payload) do
+  defp token_counter_map?(payload) do
     token_fields = token_fields(:input) ++ token_fields(:output) ++ token_fields(:total)
-
-    token_fields
-    |> Enum.any?(fn field ->
-      value = payload_get(payload, field)
-      !is_nil(integer_like(value))
-    end)
+    Enum.any?(token_fields, &Map.has_key?(payload, &1))
   end
 
   defp get_token_usage(usage, :input),
@@ -4020,10 +4090,19 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp run_budget_metrics(running_entry, now) do
+    telemetry_observed? = Map.get(running_entry, :codex_token_telemetry_observed, false)
+
     %{
       turns: Map.get(running_entry, :turn_count, 0),
       tokens: Map.get(running_entry, :codex_total_tokens, 0),
-      token_telemetry_observed: Map.get(running_entry, :codex_token_telemetry_observed, false),
+      token_telemetry_observed: telemetry_observed?,
+      token_telemetry_integrity:
+        Map.get(
+          running_entry,
+          :codex_token_telemetry_integrity,
+          if(telemetry_observed?, do: :valid, else: :unobserved)
+        ),
+      token_telemetry_failure: Map.get(running_entry, :codex_token_telemetry_failure),
       seconds: running_seconds(Map.get(running_entry, :started_at), now)
     }
   end

@@ -738,7 +738,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_total_tokens == 14
   end
 
-  test "canonical token accounting derives a monotonic total and rejects malformed counters" do
+  test "canonical token accounting derives monotonic totals and resolves contradictions" do
     {state, issue_id, run_id} = token_accounting_state("canonical")
 
     state = apply_token_usage(state, issue_id, run_id, %{"input_tokens" => 8, "output_tokens" => 3})
@@ -756,11 +756,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert_token_usage(increased, issue_id, 10, 5, 15, true)
 
-    reset = apply_token_usage(increased, issue_id, run_id, %{"input_tokens" => 2, "output_tokens" => 1})
-    assert_token_usage(reset, issue_id, 10, 5, 15, true)
-
     mismatched =
-      apply_token_usage(reset, issue_id, run_id, %{
+      apply_token_usage(increased, issue_id, run_id, %{
         "input_tokens" => 20,
         "output_tokens" => 5,
         "total_tokens" => 12
@@ -776,24 +773,149 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       })
 
     assert_token_usage(explicit_high, issue_id, 25, 5, 40, true)
+  end
 
-    malformed =
-      apply_token_usage(explicit_high, issue_id, run_id, %{
-        "input_tokens" => 30,
-        "output_tokens" => 10,
-        "total_tokens" => "40-trailing"
+  test "proven counter resets create epochs and accumulate post-reset growth" do
+    {state, issue_id, run_id} = token_accounting_state("epochs")
+
+    state = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 100})
+    state = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 0})
+    state = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 60})
+    state = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 0})
+    state = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 80})
+
+    assert_token_usage(state, issue_id, 0, 0, 240, true)
+
+    assert %{
+             integrity: :valid,
+             failure: nil,
+             total: %{last_raw: 80, lifetime: 240, epoch: 2}
+           } = state.running[issue_id].codex_token_accounting
+  end
+
+  test "reset growth crosses the configured budget using accumulated lifetime" do
+    {state, issue_id, run_id} = token_accounting_state("reset-budget", max_tokens: 250)
+
+    state =
+      apply_token_usage(state, issue_id, run_id, %{
+        "input_tokens" => 150,
+        "output_tokens" => 50
       })
 
-    assert_token_usage(malformed, issue_id, 25, 5, 40, true)
-
-    overflow =
-      apply_token_usage(malformed, issue_id, run_id, %{
-        "input_tokens" => 9_223_372_036_854_775_807,
-        "output_tokens" => 1
+    state =
+      apply_token_usage(state, issue_id, run_id, %{
+        "input_tokens" => 0,
+        "output_tokens" => 0
       })
 
-    assert_token_usage(overflow, issue_id, 25, 5, 40, true)
-    assert overflow.codex_totals == explicit_high.codex_totals
+    parked =
+      apply_token_usage(state, issue_id, run_id, %{
+        "input_tokens" => 150,
+        "output_tokens" => 50
+      })
+
+    refute Map.has_key?(parked.running, issue_id)
+    assert parked.codex_totals.total_tokens == 400
+
+    assert %{
+             reason: "run_budget_exhausted",
+             terminal_reason: "token_budget_exhausted"
+           } = parked.parked[issue_id]
+  end
+
+  test "ambiguous, malformed, and overflowing counters fail configured budgets closed" do
+    invalid_updates = [
+      {"ambiguous", %{"total_tokens" => 150}, :ambiguous_counter_decrease},
+      {"malformed", %{"total_tokens" => "200-trailing"}, :malformed_counter},
+      {"overflow", %{"input_tokens" => 9_223_372_036_854_775_807, "output_tokens" => 1}, :malformed_counter}
+    ]
+
+    for {tag, invalid_usage, expected_failure} <- invalid_updates do
+      {unbounded, unbounded_issue_id, unbounded_run_id} = token_accounting_state("#{tag}-status")
+
+      unbounded =
+        apply_token_usage(unbounded, unbounded_issue_id, unbounded_run_id, %{
+          "total_tokens" => 200
+        })
+
+      failed =
+        apply_token_usage(unbounded, unbounded_issue_id, unbounded_run_id, invalid_usage)
+
+      assert failed.running[unbounded_issue_id].codex_token_telemetry_integrity == :failed
+      assert failed.running[unbounded_issue_id].codex_token_telemetry_failure == expected_failure
+      assert failed.running[unbounded_issue_id].codex_token_telemetry_observed == false
+
+      {state, issue_id, run_id} = token_accounting_state(tag, max_tokens: 250)
+      valid = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 200})
+      parked = apply_token_usage(valid, issue_id, run_id, invalid_usage)
+
+      refute Map.has_key?(parked.running, issue_id)
+      assert parked.codex_totals.total_tokens == 200
+
+      assert %{
+               reason: "run_budget_exhausted",
+               terminal_reason: "token_telemetry_integrity_failed"
+             } = parked.parked[issue_id]
+    end
+  end
+
+  test "epoch lifetime overflow fails with a bounded integrity status" do
+    {state, issue_id, run_id} = token_accounting_state("lifetime-overflow")
+
+    state =
+      apply_token_usage(state, issue_id, run_id, %{
+        "total_tokens" => 9_223_372_036_854_775_807
+      })
+
+    state = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 0})
+    failed = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 1})
+    entry = failed.running[issue_id]
+
+    assert entry.codex_total_tokens == 9_223_372_036_854_775_807
+    assert entry.codex_token_telemetry_integrity == :failed
+    assert entry.codex_token_telemetry_failure == :counter_overflow
+    assert entry.codex_token_telemetry_observed == false
+
+    assert {:reply, snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, failed)
+
+    assert [row] = snapshot.running
+    assert row.budget.tokens.used == 9_223_372_036_854_775_807
+    assert row.budget.tokens.remaining == nil
+    assert row.budget.tokens.telemetry_integrity == "failed"
+    assert row.budget.tokens.integrity_error == "counter_overflow"
+  end
+
+  test "integrity failure stays visible without a token limit and unrelated usage stays unobserved" do
+    {state, issue_id, run_id} = token_accounting_state("integrity-status")
+
+    unrelated = apply_token_usage(state, issue_id, run_id, %{"cached_tokens" => 999})
+    assert_token_usage(unrelated, issue_id, 0, 0, 0, false)
+
+    valid = apply_token_usage(unrelated, issue_id, run_id, %{"total_tokens" => 200})
+    duplicate = apply_token_usage(valid, issue_id, run_id, %{"total_tokens" => 200})
+    malformed = apply_token_usage(duplicate, issue_id, run_id, %{"total_tokens" => "bad"})
+    ignored_after_failure = apply_token_usage(malformed, issue_id, run_id, %{"total_tokens" => 220})
+
+    entry = ignored_after_failure.running[issue_id]
+    assert entry.codex_total_tokens == 200
+    assert entry.codex_token_telemetry_observed == false
+    assert entry.codex_token_telemetry_integrity == :failed
+    assert entry.codex_token_telemetry_failure == :malformed_counter
+
+    assert {:reply, snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, ignored_after_failure)
+
+    assert [row] = snapshot.running
+
+    assert row.budget.tokens == %{
+             limit: nil,
+             used: 200,
+             remaining: nil,
+             telemetry_observed: false,
+             telemetry_integrity: "failed",
+             integrity_error: "malformed_counter"
+           }
   end
 
   test "one-sided token telemetry stays unenforceable and attempts keep independent high-water marks" do
@@ -2235,7 +2357,17 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       codex_last_reported_input_tokens: 0,
       codex_last_reported_output_tokens: 0,
       codex_last_reported_total_tokens: 0,
+      codex_token_accounting: %{
+        integrity: :unobserved,
+        failure: nil,
+        input: %{last_raw: nil, lifetime: 0, epoch: 0},
+        output: %{last_raw: nil, lifetime: 0, epoch: 0},
+        total: %{last_raw: nil, lifetime: 0, epoch: 0}
+      },
       codex_token_telemetry_observed: false,
+      codex_token_telemetry_integrity: :unobserved,
+      codex_token_telemetry_failure: nil,
+      codex_token_telemetry_epoch: 0,
       turn_count: 0,
       run_budget: %{max_turns: 20, max_tokens: Keyword.get(opts, :max_tokens), max_seconds: nil},
       run_budget_timer_ref: nil,
@@ -2274,6 +2406,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     [row] = snapshot.running
     assert row.budget.tokens.telemetry_observed == telemetry_observed?
     assert row.budget.tokens.used == if(telemetry_observed?, do: total)
+
+    assert row.budget.tokens.telemetry_integrity ==
+             if(telemetry_observed?, do: "valid", else: "unobserved")
+
+    assert row.budget.tokens.integrity_error == nil
   end
 
   defp successful_poll_result(request) do

@@ -108,7 +108,8 @@ blocks dispatch visibly instead of falling back to another SSH worker.
 
 Run-budget stops use the same durable model with reason
 `run_budget_exhausted` and exact terminal reason `turn_budget_exhausted`,
-`token_budget_exhausted`, or `time_budget_exhausted`.
+`token_budget_exhausted`, `token_telemetry_integrity_failed`, or
+`time_budget_exhausted`.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt. If the Markdown body contains `## Symphony Runtime Prompt`, Symphony renders
@@ -170,8 +171,11 @@ Notes:
 - `agent.max_run_tokens` optionally caps cumulative Codex tokens observed during one attempt. An
   explicit cumulative total is accepted; when it is absent, Symphony derives a checked total only
   when both cumulative input and output counters are present. One-sided or malformed telemetry does
-  not claim enforceable usage, while duplicate and decreasing/reset counters cannot reduce the
-  attempt's monotonic high-water mark or reopen the budget.
+  not claim enforceable usage. Exact zero resets start a new telemetry epoch whose later growth is
+  added to the prior bounded lifetime. Duplicate values add nothing; malformed counters, checked
+  overflow, and ambiguous non-zero decreases permanently fail the attempt's telemetry integrity.
+  With a configured token limit, that integrity failure creates a typed durable park instead of
+  admitting more work with unknown usage.
 - `agent.max_run_seconds` optionally caps wall-clock seconds for one attempt and can stop an
   in-flight turn.
 - Reaching any run budget preserves the workspace and creates a durable
