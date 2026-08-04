@@ -2565,13 +2565,29 @@ defmodule SymphonyElixir.CoreTest do
 
     File.write!(fake_ssh, """
     #!/bin/sh
-    printf 'ARGV:%s\n' "$*" >> "${SYMP_TEST_SSH_TRACE}"
     case "$*" in
+      *"rm -rf"*"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'UNSAFE_PREFLIGHT' >> "${SYMP_TEST_SSH_TRACE}"
+        rm -f "${SYMP_TEST_WRONG_ROOT_SENTINEL}"
+        exit 76
+        ;;
+      *#{wrong_root_workspace}*"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'PREFLIGHT:#{old_root}:#{wrong_root_workspace}' >> "${SYMP_TEST_SSH_TRACE}"
+        printf '%s\t%s\t%s\n' '__SYMPHONY_AFFINITY__' '#{old_root}' '#{wrong_root_workspace}'
+        exit 0
+        ;;
+      *#{old_workspace}*"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'PREFLIGHT:#{old_root}:#{old_workspace}' >> "${SYMP_TEST_SSH_TRACE}"
+        printf '%s\t%s\t%s\n' '__SYMPHONY_AFFINITY__' '#{old_root}' '#{old_workspace}'
+        exit 0
+        ;;
       *#{old_workspace}*"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\n' 'MUTATE:#{old_workspace}' >> "${SYMP_TEST_SSH_TRACE}"
         printf '%s\t%s\t%s\n' '__SYMPHONY_WORKSPACE__' '0' '#{old_workspace}'
         exit 0
         ;;
       *#{wrong_root_workspace}*"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\n' 'WRONG_MUTATE:#{wrong_root_workspace}' >> "${SYMP_TEST_SSH_TRACE}"
         rm -f "${SYMP_TEST_WRONG_ROOT_SENTINEL}"
         printf '%s\t%s\t%s\n' '__SYMPHONY_WORKSPACE__' '0' '#{wrong_root_workspace}'
         exit 0
@@ -2595,8 +2611,27 @@ defmodule SymphonyElixir.CoreTest do
     assert prepared.path == old_workspace
     assert prepared.root == old_root
     assert File.read!(wrong_root_sentinel) == "wrong-root-directory-must-survive"
-    assert File.read!(trace_file) =~ old_workspace
-    refute File.read!(trace_file) =~ wrong_root_workspace
+    trace = File.read!(trace_file)
+    assert trace =~ old_workspace
+    refute trace =~ wrong_root_workspace
+
+    [preflight_trace, mutation_trace] = String.split(trace, "\n", trim: true)
+    assert preflight_trace == "PREFLIGHT:#{old_root}:#{old_workspace}"
+    assert mutation_trace == "MUTATE:#{old_workspace}"
+
+    File.write!(trace_file, "")
+
+    assert {:error, {:workspace_outside_root, ^wrong_root_workspace, ^old_root}} =
+             Workspace.prepare_for_issue(identifier, "worker-a",
+               expected_workspace_path: wrong_root_workspace,
+               expected_workspace_root: old_root,
+               expected_worker_host: "worker-a"
+             )
+
+    trace = File.read!(trace_file)
+    assert String.trim(trace) == "PREFLIGHT:#{old_root}:#{wrong_root_workspace}"
+    refute trace =~ "MUTATE:"
+    assert File.read!(wrong_root_sentinel) == "wrong-root-directory-must-survive"
 
     File.write!(trace_file, "")
 
@@ -2609,6 +2644,187 @@ defmodule SymphonyElixir.CoreTest do
 
     assert File.read!(trace_file) == ""
     assert File.read!(wrong_root_sentinel) == "wrong-root-directory-must-survive"
+  end
+
+  test "remote tilde affinity is resolved on its host and reused across retry and restart" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-remote-tilde-affinity-#{System.unique_integer([:positive])}"
+      )
+
+    identifier = "MT-REMOTE-TILDE"
+    local_home = Path.join(test_root, "local-home")
+    remote_home = "/home/remote-user"
+    remote_root = remote_home <> "/.symphony-remote-workspaces"
+    remote_workspace = remote_root <> "/#{identifier}"
+    changed_remote_root = remote_home <> "/changed-workspaces"
+    local_wrong_workspace = Path.join([local_home, ".symphony-remote-workspaces", identifier])
+    local_sentinel = Path.join(local_wrong_workspace, "must-survive")
+    remote_wrong_sentinel = Path.join(test_root, "remote-wrong-root-must-survive")
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    ledger_path = Path.join(test_root, "events.jsonl")
+    previous_home = System.get_env("HOME")
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_sentinel = System.get_env("SYMP_TEST_WRONG_ROOT_SENTINEL")
+
+    on_exit(fn ->
+      restore_env("HOME", previous_home)
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      restore_env("SYMP_TEST_WRONG_ROOT_SENTINEL", previous_sentinel)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(local_wrong_workspace)
+    File.write!(local_sentinel, "local-home-path-must-survive")
+    File.write!(remote_wrong_sentinel, "remote-wrong-root-must-survive")
+    System.put_env("HOME", local_home)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("SYMP_TEST_WRONG_ROOT_SENTINEL", remote_wrong_sentinel)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    case "$*" in
+      *"rm -rf"*"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'UNSAFE_PREFLIGHT' >> "${SYMP_TEST_SSH_TRACE}"
+        rm -f "${SYMP_TEST_WRONG_ROOT_SENTINEL}"
+        exit 76
+        ;;
+      *legacy-missing*"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'PREFLIGHT_FAILED:legacy-missing' >> "${SYMP_TEST_SSH_TRACE}"
+        exit 74
+        ;;
+      *"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'PREFLIGHT:#{remote_root}:#{remote_workspace}' >> "${SYMP_TEST_SSH_TRACE}"
+        printf '%s\t%s\t%s\n' '__SYMPHONY_AFFINITY__' '#{remote_root}' '#{remote_workspace}'
+        exit 0
+        ;;
+      *#{remote_workspace}*"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\n' 'MUTATE:#{remote_workspace}' >> "${SYMP_TEST_SSH_TRACE}"
+        printf '%s\t%s\t%s\n' '__SYMPHONY_WORKSPACE__' '0' '#{remote_workspace}'
+        exit 0
+        ;;
+      *"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\n' 'WRONG_MUTATE' >> "${SYMP_TEST_SSH_TRACE}"
+        rm -f "${SYMP_TEST_WRONG_ROOT_SENTINEL}"
+        exit 75
+        ;;
+      *)
+        exit 75
+        ;;
+    esac
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: "~/.symphony-remote-workspaces",
+      worker_ssh_hosts: ["worker-a", "worker-b"]
+    )
+
+    issue = %Issue{
+      id: "issue-remote-tilde",
+      identifier: identifier,
+      title: "Remote tilde affinity",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    state = %Orchestrator.State{
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: &RunLedger.append/2,
+      runner_generation: "runner-remote-tilde",
+      task_start_fn: fn _task -> {:error, :forced_spawn_failure} end,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    failed =
+      Orchestrator.claim_and_start_issue_for_test(
+        state,
+        issue,
+        1,
+        "worker-a",
+        nil,
+        nil,
+        nil
+      )
+
+    assert {:ok, [claim | _events]} = RunLedger.read_events(ledger_path)
+    assert claim["transition"] == "run_claimed"
+    assert claim["worker_host"] == "worker-a"
+    assert claim["workspace_path"] == remote_workspace
+    assert claim["workspace_root"] == remote_root
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(ledger_path, "runner-remote-tilde-restart")
+    recovered = recovery.recovered_dispatches[issue.id]
+    assert recovered.worker_host == "worker-a"
+    assert recovered.workspace_path == remote_workspace
+    assert recovered.workspace_root == remote_root
+
+    Process.cancel_timer(failed.retry_attempts[issue.id].timer_ref)
+
+    assert {:ok, legacy_retry} =
+             Workspace.prepare_for_issue(identifier, "worker-a",
+               expected_workspace_path: remote_workspace,
+               expected_workspace_root: "~/.symphony-remote-workspaces",
+               expected_worker_host: "worker-a"
+             )
+
+    assert legacy_retry.path == remote_workspace
+    assert legacy_retry.root == remote_root
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: changed_remote_root)
+
+    assert {:ok, restarted} =
+             Workspace.prepare_for_issue(identifier, "worker-a",
+               expected_workspace_path: recovered.workspace_path,
+               expected_workspace_root: recovered.workspace_root,
+               expected_worker_host: "worker-a"
+             )
+
+    assert restarted.path == remote_workspace
+    assert restarted.root == remote_root
+    assert File.read!(local_sentinel) == "local-home-path-must-survive"
+    assert File.read!(remote_wrong_sentinel) == "remote-wrong-root-must-survive"
+
+    trace_lines = trace_file |> File.read!() |> String.split("\n", trim: true)
+    assert length(trace_lines) == 6
+
+    trace_lines
+    |> Enum.chunk_every(2)
+    |> Enum.each(fn [preflight, mutation] ->
+      assert preflight == "PREFLIGHT:#{remote_root}:#{remote_workspace}"
+      assert mutation == "MUTATE:#{remote_workspace}"
+      refute mutation =~ changed_remote_root
+      refute mutation =~ local_home
+    end)
+
+    File.write!(trace_file, "")
+
+    assert {:error, {:workspace_host_affinity_mismatch, "worker-a", "worker-b"}} =
+             Workspace.prepare_for_issue(identifier, "worker-b",
+               expected_workspace_path: recovered.workspace_path,
+               expected_workspace_root: recovered.workspace_root,
+               expected_worker_host: "worker-a"
+             )
+
+    assert File.read!(trace_file) == ""
+
+    assert {:error, {:workspace_affinity_preflight_failed, "worker-a", 74, ""}} =
+             Workspace.prepare_for_issue("legacy-missing", "worker-a",
+               expected_workspace_path: "~/.symphony-remote-workspaces/legacy-missing",
+               expected_workspace_root: "~/.symphony-remote-workspaces",
+               expected_worker_host: "worker-a"
+             )
+
+    trace = File.read!(trace_file)
+    assert String.trim(trace) == "PREFLIGHT_FAILED:legacy-missing"
+    refute trace =~ "MUTATE:"
+    assert File.read!(remote_wrong_sentinel) == "remote-wrong-root-must-survive"
   end
 
   test "prepared affinity is acknowledged before workspace hooks or Codex" do
@@ -3178,9 +3394,17 @@ defmodule SymphonyElixir.CoreTest do
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
 
       case "$*" in
+        *worker-a*"__SYMPHONY_AFFINITY__"*)
+          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_AFFINITY__' '/remote/home/.symphony-remote-workspaces' '/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER'
+          exit 0
+          ;;
         *worker-a*"__SYMPHONY_WORKSPACE__"*)
           printf '%s\\n' 'worker-a prepare failed' >&2
           exit 75
+          ;;
+        *worker-b*"__SYMPHONY_AFFINITY__"*)
+          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_AFFINITY__' '/remote/home/.symphony-remote-workspaces' '/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER'
+          exit 0
           ;;
         *worker-b*"__SYMPHONY_WORKSPACE__"*)
           printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER'
@@ -4038,6 +4262,11 @@ defmodule SymphonyElixir.CoreTest do
     File.write!(fake_ssh, """
     #!/bin/sh
     printf 'ARGV:%s\\n' "$*" >> "${SYMP_TEST_SSH_TRACE}"
+    case "$*" in
+      *"__SYMPHONY_AFFINITY__"*)
+        printf '%s\\t%s\\t%s\\n' '__SYMPHONY_AFFINITY__' '#{remote_root}' '#{workspace}'
+        ;;
+    esac
     exit 0
     """)
 

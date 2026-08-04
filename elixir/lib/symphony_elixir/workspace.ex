@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.{Config, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @remote_affinity_marker "__SYMPHONY_AFFINITY__"
 
   @type worker_host :: String.t() | nil
   @type prepared_workspace :: %{
@@ -29,7 +30,8 @@ defmodule SymphonyElixir.Workspace do
       safe_id = safe_identifier(issue_context.issue_identifier)
 
       with {:ok, target} <- prepare_target(safe_id, worker_host, opts),
-           {:ok, workspace, created?} <- ensure_workspace(target.path, worker_host) do
+           {:ok, workspace, created?} <- ensure_workspace(target.path, worker_host),
+           :ok <- validate_ensured_workspace(workspace, target, worker_host) do
         {:ok, %{path: workspace, root: target.root, created?: created?}}
       end
     rescue
@@ -63,7 +65,7 @@ defmodule SymphonyElixir.Workspace do
         worker_host
       )
       when is_binary(workspace) and is_binary(root) and is_boolean(created?) do
-    with :ok <- validate_path_against_root(workspace, root),
+    with :ok <- validate_path_against_root(workspace, root, worker_host),
          :ok <- validate_prepared_workspace_exists(workspace, worker_host) do
       {:ok, prepared}
     end
@@ -128,6 +130,12 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  defp validate_ensured_workspace(path, %{path: path}, _worker_host), do: :ok
+
+  defp validate_ensured_workspace(path, %{path: expected_path}, worker_host) do
+    {:error, {:workspace_affinity_mismatch, expected_path, path, worker_host}}
+  end
+
   defp create_workspace(workspace) do
     File.rm_rf!(workspace)
     File.mkdir_p!(workspace)
@@ -181,7 +189,7 @@ defmodule SymphonyElixir.Workspace do
           {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove_exact(workspace, captured_root, nil)
       when is_binary(workspace) and is_binary(captured_root) do
-    case validate_path_against_root(workspace, captured_root) do
+    case validate_path_against_root(workspace, captured_root, nil) do
       :ok ->
         maybe_run_before_remove_hook(workspace, nil)
         File.rm_rf(workspace)
@@ -193,8 +201,12 @@ defmodule SymphonyElixir.Workspace do
 
   def remove_exact(workspace, captured_root, worker_host)
       when is_binary(workspace) and is_binary(captured_root) and is_binary(worker_host) do
-    case validate_path_against_root(workspace, captured_root) do
-      :ok -> remove_exact_remote(workspace, worker_host)
+    with :ok <- validate_affinity_path(workspace, worker_host),
+         :ok <- validate_affinity_path(captured_root, worker_host),
+         {:ok, target} <- canonical_affinity_target(workspace, captured_root, worker_host),
+         :ok <- validate_path_against_root(target.path, target.root, worker_host) do
+      remove_exact_remote(target.path, worker_host)
+    else
       {:error, reason} -> {:error, reason, ""}
     end
   end
@@ -301,11 +313,27 @@ defmodule SymphonyElixir.Workspace do
     if is_binary(expected_path) do
       prepare_affinity_target(expected_path, worker_host, opts)
     else
-      with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
-           :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, root} <- workspace_root(worker_host) do
-        {:ok, %{path: workspace, root: root}}
-      end
+      prepare_fresh_target(safe_id, worker_host)
+    end
+  end
+
+  defp prepare_fresh_target(safe_id, nil) do
+    with {:ok, workspace} <- workspace_path_for_issue(safe_id, nil),
+         :ok <- validate_workspace_path(workspace, nil),
+         {:ok, root} <- workspace_root(nil) do
+      {:ok, %{path: workspace, root: root}}
+    end
+  end
+
+  defp prepare_fresh_target(safe_id, worker_host) when is_binary(worker_host) do
+    root = Config.settings!().workspace.root
+    workspace = Path.join(root, safe_id)
+
+    with :ok <- validate_affinity_path(workspace, worker_host),
+         :ok <- validate_affinity_path(root, worker_host),
+         {:ok, target} <- resolve_remote_affinity_target(workspace, root, worker_host),
+         :ok <- validate_path_against_root(target.path, target.root, worker_host) do
+      {:ok, target}
     end
   end
 
@@ -317,13 +345,13 @@ defmodule SymphonyElixir.Workspace do
          :ok <- validate_affinity_path(expected_path, worker_host),
          :ok <- validate_affinity_path(expected_root, worker_host),
          {:ok, target} <- canonical_affinity_target(expected_path, expected_root, worker_host),
-         :ok <- validate_path_against_root(target.path, target.root) do
+         :ok <- validate_path_against_root(target.path, target.root, worker_host) do
       {:ok, target}
     end
   end
 
   defp validate_affinity_path(path, worker_host) when is_binary(path) do
-    if String.trim(path) != "" and not String.contains?(path, ["\n", "\r", <<0>>]) do
+    if String.trim(path) != "" and not String.contains?(path, ["\n", "\r", "\t", <<0>>]) do
       :ok
     else
       {:error, {:workspace_affinity_mismatch, path, :invalid_path, worker_host}}
@@ -343,11 +371,108 @@ defmodule SymphonyElixir.Workspace do
 
   defp canonical_affinity_target(expected_path, expected_root, worker_host)
        when is_binary(expected_path) and is_binary(expected_root) and is_binary(worker_host) do
-    {:ok, %{path: Path.expand(expected_path), root: Path.expand(expected_root)}}
+    with :ok <- validate_persisted_remote_path_forms(expected_path, expected_root, worker_host),
+         {:ok, target} <- resolve_remote_affinity_target(expected_path, expected_root, worker_host),
+         :ok <- validate_resolved_remote_affinity(expected_path, expected_root, target, worker_host) do
+      {:ok, target}
+    end
   end
 
   defp canonical_affinity_target(expected_path, expected_root, worker_host),
     do: {:error, {:workspace_affinity_mismatch, expected_path, expected_root, worker_host}}
+
+  defp validate_persisted_remote_path_forms(path, root, worker_host) do
+    absolute_affinity? = remote_absolute_path?(path) and remote_absolute_path?(root)
+
+    legacy_tilde_affinity? =
+      (remote_tilde_path?(path) or remote_tilde_path?(root)) and
+        remote_resolvable_path?(path) and remote_resolvable_path?(root)
+
+    if absolute_affinity? or legacy_tilde_affinity?,
+      do: :ok,
+      else: {:error, {:workspace_affinity_mismatch, path, root, worker_host}}
+  end
+
+  defp validate_resolved_remote_affinity(path, root, target, worker_host) do
+    cond do
+      remote_tilde_path?(path) or remote_tilde_path?(root) ->
+        :ok
+
+      target.path == path and target.root == root ->
+        :ok
+
+      true ->
+        {:error, {:workspace_affinity_mismatch, path, root, target.path, target.root, worker_host}}
+    end
+  end
+
+  defp resolve_remote_affinity_target(path, root, worker_host) do
+    with :ok <- validate_remote_resolvable_path(path, worker_host),
+         :ok <- validate_remote_resolvable_path(root, worker_host) do
+      script = remote_affinity_preflight_script(path, root)
+
+      case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+        {:ok, {output, 0}} ->
+          parse_remote_affinity_output(output, worker_host)
+
+        {:ok, {output, status}} ->
+          {:error, {:workspace_affinity_preflight_failed, worker_host, status, output}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp remote_affinity_preflight_script(path, root) do
+    [
+      "set -eu",
+      remote_shell_assign("root", root),
+      remote_shell_assign("workspace", path),
+      "resolve_remote_path() {",
+      "  candidate=$1",
+      "  case \"$candidate\" in /*) ;; *) return 64 ;; esac",
+      "  parent=$candidate",
+      "  suffix=",
+      "  while [ ! -d \"$parent\" ]; do",
+      "    [ \"$parent\" = / ] && return 65",
+      "    leaf=${parent##*/}",
+      "    [ -n \"$leaf\" ] || return 65",
+      "    suffix=/$leaf$suffix",
+      "    parent=${parent%/*}",
+      "    [ -n \"$parent\" ] || parent=/",
+      "  done",
+      "  canonical_parent=$(CDPATH= cd -P \"$parent\" 2>/dev/null && pwd -P) || return 65",
+      "  case \"$canonical_parent\" in",
+      "    /) printf '/%s\\n' \"${suffix#/}\" ;;",
+      "    *) printf '%s%s\\n' \"$canonical_parent\" \"$suffix\" ;;",
+      "  esac",
+      "}",
+      "canonical_root=$(resolve_remote_path \"$root\")",
+      "canonical_workspace=$(resolve_remote_path \"$workspace\")",
+      "printf '%s\\t%s\\t%s\\n' '#{@remote_affinity_marker}' \"$canonical_root\" \"$canonical_workspace\""
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp validate_remote_resolvable_path(path, worker_host) do
+    if remote_resolvable_path?(path) and not remote_dot_segment?(path),
+      do: :ok,
+      else: {:error, {:workspace_affinity_mismatch, path, :invalid_remote_path, worker_host}}
+  end
+
+  defp remote_resolvable_path?(path), do: remote_absolute_path?(path) or remote_tilde_path?(path)
+  defp remote_absolute_path?(path) when is_binary(path), do: String.starts_with?(path, "/")
+  defp remote_absolute_path?(_path), do: false
+  defp remote_tilde_path?("~"), do: true
+  defp remote_tilde_path?("~/" <> _rest), do: true
+  defp remote_tilde_path?(_path), do: false
+
+  defp remote_dot_segment?(path) do
+    path
+    |> String.split("/", trim: true)
+    |> Enum.any?(&(&1 in [".", ".."]))
+  end
 
   defp validate_expected_worker_host(worker_host, worker_host), do: :ok
 
@@ -355,7 +480,6 @@ defmodule SymphonyElixir.Workspace do
     do: {:error, {:workspace_host_affinity_mismatch, expected_host, worker_host}}
 
   defp workspace_root(nil), do: PathSafety.canonicalize(Config.settings!().workspace.root)
-  defp workspace_root(worker_host) when is_binary(worker_host), do: {:ok, Config.settings!().workspace.root}
 
   defp safe_identifier(identifier) do
     String.replace(identifier || "issue", ~r/[^a-zA-Z0-9._-]/, "_")
@@ -551,7 +675,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp validate_path_against_root(workspace, root)
+  defp validate_path_against_root(workspace, root, nil)
        when is_binary(workspace) and is_binary(root) do
     with {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace),
          {:ok, canonical_root} <- PathSafety.canonicalize(root) do
@@ -568,6 +692,37 @@ defmodule SymphonyElixir.Workspace do
           {:error, {:workspace_outside_root, canonical_workspace, canonical_root}}
       end
     end
+  end
+
+  defp validate_path_against_root(workspace, root, worker_host)
+       when is_binary(workspace) and is_binary(root) and is_binary(worker_host) do
+    with :ok <- validate_remote_absolute_path(workspace, worker_host),
+         :ok <- validate_remote_absolute_path(root, worker_host) do
+      root_prefix = if root == "/", do: root, else: root <> "/"
+
+      cond do
+        workspace == root ->
+          {:error, {:workspace_equals_root, workspace, root}}
+
+        String.starts_with?(workspace, root_prefix) ->
+          :ok
+
+        true ->
+          {:error, {:workspace_outside_root, workspace, root}}
+      end
+    end
+  end
+
+  defp validate_remote_absolute_path(path, worker_host) do
+    canonical_shape? =
+      remote_absolute_path?(path) and
+        not String.contains?(path, "//") and
+        (path == "/" or not String.ends_with?(path, "/")) and
+        not remote_dot_segment?(path)
+
+    if canonical_shape?,
+      do: :ok,
+      else: {:error, {:workspace_affinity_mismatch, path, :noncanonical_remote_path, worker_host}}
   end
 
   defp validate_prepared_workspace_exists(workspace, nil) do
@@ -614,6 +769,33 @@ defmodule SymphonyElixir.Workspace do
 
       _ ->
         {:error, {:workspace_prepare_failed, :invalid_output, output}}
+    end
+  end
+
+  defp parse_remote_affinity_output(output, worker_host) do
+    payload =
+      output
+      |> IO.iodata_to_binary()
+      |> String.split("\n", trim: true)
+      |> Enum.find_value(fn line ->
+        case String.split(line, "\t", parts: 3) do
+          [@remote_affinity_marker, root, path] when root != "" and path != "" ->
+            %{path: path, root: root}
+
+          _ ->
+            nil
+        end
+      end)
+
+    case payload do
+      %{path: path, root: root} = target ->
+        with :ok <- validate_remote_absolute_path(path, worker_host),
+             :ok <- validate_remote_absolute_path(root, worker_host) do
+          {:ok, target}
+        end
+
+      _ ->
+        {:error, {:workspace_affinity_preflight_failed, worker_host, :invalid_output, output}}
     end
   end
 

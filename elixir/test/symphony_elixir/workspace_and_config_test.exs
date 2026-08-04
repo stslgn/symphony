@@ -1265,6 +1265,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       trace_file = Path.join(test_root, "ssh.trace")
       fake_ssh = Path.join(test_root, "ssh")
       workspace_root = "~/.symphony-remote-workspaces"
+      canonical_workspace_root = "/remote/home/.symphony-remote-workspaces"
       workspace_path = "/remote/home/.symphony-remote-workspaces/MT-SSH-WS"
 
       File.mkdir_p!(test_root)
@@ -1277,6 +1278,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
 
       case "$*" in
+        *"__SYMPHONY_AFFINITY__"*)
+          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_AFFINITY__' '#{canonical_workspace_root}' '#{workspace_path}'
+          ;;
         *"__SYMPHONY_WORKSPACE__"*)
           printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{workspace_path}'
           ;;
@@ -1304,6 +1308,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       trace = File.read!(trace_file)
       assert trace =~ "-p 2200 worker-01 bash -lc"
+      assert trace =~ "__SYMPHONY_AFFINITY__"
       assert trace =~ "__SYMPHONY_WORKSPACE__"
       assert trace =~ "~/.symphony-remote-workspaces/MT-SSH-WS"
       assert trace =~ "${workspace#~/}"
