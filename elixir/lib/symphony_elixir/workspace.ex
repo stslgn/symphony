@@ -394,16 +394,12 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp validate_resolved_remote_affinity(path, root, target, worker_host) do
-    cond do
-      remote_tilde_path?(path) or remote_tilde_path?(root) ->
-        :ok
+    path_matches? = remote_tilde_path?(path) or target.path == path
+    root_matches? = remote_tilde_path?(root) or target.root == root
 
-      target.path == path and target.root == root ->
-        :ok
-
-      true ->
-        {:error, {:workspace_affinity_mismatch, path, root, target.path, target.root, worker_host}}
-    end
+    if path_matches? and root_matches?,
+      do: :ok,
+      else: {:error, {:workspace_affinity_mismatch, path, root, target.path, target.root, worker_host}}
   end
 
   defp resolve_remote_affinity_target(path, root, worker_host) do
