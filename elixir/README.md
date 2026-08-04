@@ -291,6 +291,30 @@ The observability UI now runs on a minimal Phoenix stack:
 make all
 ```
 
+Run the deterministic cross-feature scenario profile directly with:
+
+```bash
+make scenarios
+```
+
+The scenario harness is offline and credential-free. It drives the real
+orchestrator, run ledger, run budgets, and Codex app-server client through an
+in-memory tracker and bounded fake Codex process. The profile currently covers:
+
+- duplicate wake-ups while global dispatch is paused, followed by exactly one
+  eligible dispatch;
+- live model discovery, a typed turn-budget park, and parked-wait restoration
+  after runner restart;
+- batched token telemetry crossing a configured threshold exactly once without
+  completion or failure retry;
+- fail-closed live model mismatch before prompt delivery and compatibility when
+  model discovery is unavailable;
+- capability preflight rejecting unknown client-side tools before the Codex
+  app-server process launches.
+
+These tests also run inside `make all`. The separate target exists for quick
+release-gate and regression checks.
+
 Run the real external end-to-end test only when you want Symphony to create disposable Linear
 resources and launch a real `codex app-server` session:
 

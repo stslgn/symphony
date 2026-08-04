@@ -2338,7 +2338,28 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - CLI exits with success when application starts and shuts down normally
 - CLI exits nonzero when startup fails or the host process exits abnormally
 
-### 17.8 Real Integration Profile (RECOMMENDED)
+### 17.8 Deterministic Scenario Profile (RECOMMENDED)
+
+Implementations SHOULD provide a credential-free scenario harness that exercises
+multiple orchestration boundaries together rather than only repeating isolated
+unit tests.
+
+- The harness SHOULD run offline with fakes only at external tracker, provider,
+  clock, and process boundaries.
+- Scenarios SHOULD drive the real orchestrator, durable ledger, budget logic,
+  reconciliation, and coding-agent protocol client used in production.
+- Every scenario SHOULD finish by checking shared invariants: one active
+  lifecycle location per issue, no duplicate terminal transition per run, no
+  duplicate model-resolution event, and no implicit retry after a parked stop.
+- The profile SHOULD cover duplicate wake-ups, global pause/resume, restart
+  restoration, typed waits, batched token-threshold crossing, and live model
+  validation before prompt delivery.
+- Scenario waits MUST be bounded and failures MUST report the last safe runtime
+  snapshot rather than raw prompts, credentials, or provider payloads.
+- The deterministic profile SHOULD run in normal CI and MAY also expose a narrow
+  command for release-gate execution.
+
+### 17.9 Real Integration Profile (RECOMMENDED)
 
 These checks are RECOMMENDED for production readiness and MAY be skipped in CI when credentials,
 network access, or external service permissions are unavailable.
@@ -2398,7 +2419,8 @@ Use the same validation profiles as Section 17:
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)
 
-- Run the `Real Integration Profile` from Section 17.8 with valid credentials and network access.
+- Run the deterministic scenario profile from Section 17.8 before any live check.
+- Run the `Real Integration Profile` from Section 17.9 with valid credentials and network access.
 - Verify hook execution and workflow path resolution on the target host OS/shell environment.
 - If the OPTIONAL HTTP server is shipped, verify the configured port behavior and loopback/default
   bind expectations on the target environment.
