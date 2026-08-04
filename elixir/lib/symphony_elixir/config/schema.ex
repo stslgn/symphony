@@ -37,6 +37,25 @@ defmodule SymphonyElixir.Config.Schema do
     def dump(_value), do: :error
   end
 
+  defmodule WorkflowContract do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+
+    embedded_schema do
+      field(:runtime_prompt_mode, :string, default: "managed")
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:runtime_prompt_mode], empty_values: [])
+      |> validate_inclusion(:runtime_prompt_mode, ["managed", "full_prompt_compat"])
+    end
+  end
+
   defmodule Tracker do
     @moduledoc false
     use Ecto.Schema
@@ -354,6 +373,7 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   embedded_schema do
+    embeds_one(:workflow, WorkflowContract, on_replace: :update, defaults_to_struct: true)
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
@@ -446,6 +466,7 @@ defmodule SymphonyElixir.Config.Schema do
   defp changeset(attrs) do
     %__MODULE__{}
     |> cast(attrs, [])
+    |> cast_embed(:workflow, with: &WorkflowContract.changeset/2)
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)

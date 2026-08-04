@@ -27,6 +27,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.agent.max_turns == 20
     assert config.agent.max_run_tokens == nil
     assert config.agent.max_run_seconds == nil
+    assert config.workflow.runtime_prompt_mode == "full_prompt_compat"
     assert config.codex.dynamic_tool_allowlist == []
     assert config.codex.required_dynamic_tools == []
     assert config.codex.mcp_tool_auto_approve_allowlist == []
@@ -203,6 +204,9 @@ defmodule SymphonyElixir.CoreTest do
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
 
+    workflow = Map.get(config, "workflow", %{})
+    assert Map.get(workflow, "runtime_prompt_mode") == "managed"
+
     codex = Map.get(config, "codex", %{})
     assert Map.get(codex, "dynamic_tool_allowlist") == ["linear_graphql"]
     assert Map.get(codex, "required_dynamic_tools") == ["linear_graphql"]
@@ -215,9 +219,25 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
 
     assert String.trim(prompt) != ""
+    assert prompt =~ "This preamble is operator-only."
     assert is_binary(Config.workflow_prompt())
-    assert Config.workflow_prompt() == prompt
+    assert String.starts_with?(Config.workflow_prompt(), "## Symphony Runtime Prompt")
+    refute Config.workflow_prompt() =~ "This preamble is operator-only."
+    refute Config.workflow_prompt() =~ "Symphony Operator Contract"
     assert :ok = Config.validate_runtime_capabilities()
+
+    worker_prompt =
+      PromptBuilder.build_prompt(%Issue{
+        id: "managed-boundary",
+        identifier: "MT-BOUNDARY",
+        title: "Managed prompt boundary",
+        state: "Todo",
+        labels: []
+      })
+
+    assert worker_prompt =~ "## Symphony Runtime Prompt"
+    refute worker_prompt =~ "This preamble is operator-only."
+    refute worker_prompt =~ "Symphony Operator Contract"
   end
 
   test "linear api token resolves from LINEAR_API_KEY env var" do
@@ -278,12 +298,32 @@ defmodule SymphonyElixir.CoreTest do
     assert Workflow.workflow_file_path() == app_workflow_path
   end
 
-  test "workflow load accepts prompt-only files without front matter" do
+  test "managed workflow rejects prompt-only files without a runtime heading" do
     workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "PROMPT_ONLY_WORKFLOW.md")
     File.write!(workflow_path, "Prompt only\n")
 
-    assert {:ok, %{config: %{}, prompt: "Prompt only", prompt_template: "Prompt only"}} =
+    assert {:error, {:workflow_parse_error, :missing_runtime_prompt_heading}} =
              Workflow.load(workflow_path)
+  end
+
+  test "workflow full-prompt fallback requires explicit compatibility mode" do
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "COMPAT_WORKFLOW.md")
+
+    File.write!(workflow_path, """
+    ---
+    workflow:
+      runtime_prompt_mode: full_prompt_compat
+    ---
+
+    Compatibility worker prompt.
+    """)
+
+    assert {:ok,
+            %{
+              prompt: "Compatibility worker prompt.",
+              prompt_template: "Compatibility worker prompt.",
+              runtime_prompt_mode: "full_prompt_compat"
+            }} = Workflow.load(workflow_path)
   end
 
   test "workflow load uses Symphony Runtime Prompt section as worker prompt template" do
@@ -353,11 +393,29 @@ defmodule SymphonyElixir.CoreTest do
     refute prompt_template =~ "Operator workflow"
   end
 
-  test "workflow load accepts unterminated front matter with an empty prompt" do
+  test "managed workflow rejects a non-exact runtime prompt heading" do
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "INEXACT_RUNTIME_PROMPT_WORKFLOW.md")
+
+    File.write!(workflow_path, """
+    ---
+    workflow:
+      runtime_prompt_mode: managed
+    ---
+
+    ### Symphony Runtime Prompt
+
+    This heading has the wrong level.
+    """)
+
+    assert {:error, {:workflow_parse_error, :missing_runtime_prompt_heading}} =
+             Workflow.load(workflow_path)
+  end
+
+  test "managed workflow rejects unterminated front matter with no runtime heading" do
     workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "UNTERMINATED_WORKFLOW.md")
     File.write!(workflow_path, "---\ntracker:\n  kind: linear\n")
 
-    assert {:ok, %{config: %{"tracker" => %{"kind" => "linear"}}, prompt: "", prompt_template: ""}} =
+    assert {:error, {:workflow_parse_error, :missing_runtime_prompt_heading}} =
              Workflow.load(workflow_path)
   end
 

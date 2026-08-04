@@ -96,6 +96,7 @@ defmodule SymphonyElixir.TestSupport do
     config =
       Keyword.merge(
         [
+          workflow_runtime_prompt_mode: "full_prompt_compat",
           tracker_kind: "linear",
           tracker_endpoint: "https://api.linear.app/graphql",
           tracker_api_token: "token",
@@ -141,6 +142,7 @@ defmodule SymphonyElixir.TestSupport do
         overrides
       )
 
+    workflow_runtime_prompt_mode = Keyword.get(config, :workflow_runtime_prompt_mode)
     tracker_kind = Keyword.get(config, :tracker_kind)
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
@@ -191,6 +193,8 @@ defmodule SymphonyElixir.TestSupport do
     sections =
       [
         "---",
+        "workflow:",
+        "  runtime_prompt_mode: #{yaml_value(workflow_runtime_prompt_mode)}",
         "tracker:",
         "  kind: #{yaml_value(tracker_kind)}",
         "  endpoint: #{yaml_value(tracker_endpoint)}",

@@ -958,6 +958,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   test "config supports per-state max concurrent agent overrides" do
     workflow = """
     ---
+    workflow:
+      runtime_prompt_mode: full_prompt_compat
     agent:
       max_concurrent_agents: 10
       max_concurrent_agents_by_state:

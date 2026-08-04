@@ -30,7 +30,8 @@ defmodule SymphonyElixir.Workflow do
   @type loaded_workflow :: %{
           config: map(),
           prompt: String.t(),
-          prompt_template: String.t()
+          prompt_template: String.t(),
+          runtime_prompt_mode: String.t()
         }
 
   @spec current() :: {:ok, loaded_workflow()} | {:error, term()}
@@ -66,14 +67,21 @@ defmodule SymphonyElixir.Workflow do
     case front_matter_yaml_to_map(front_matter_lines) do
       {:ok, front_matter} ->
         prompt = Enum.join(prompt_lines, "\n") |> String.trim()
-        prompt_template = runtime_prompt_template(prompt)
+        runtime_prompt_mode = runtime_prompt_mode(front_matter)
 
-        {:ok,
-         %{
-           config: front_matter,
-           prompt: prompt,
-           prompt_template: prompt_template
-         }}
+        case runtime_prompt_template(prompt, runtime_prompt_mode) do
+          {:ok, prompt_template} ->
+            {:ok,
+             %{
+               config: front_matter,
+               prompt: prompt,
+               prompt_template: prompt_template,
+               runtime_prompt_mode: runtime_prompt_mode
+             }}
+
+          {:error, reason} ->
+            {:error, {:workflow_parse_error, reason}}
+        end
 
       {:error, :workflow_front_matter_not_a_map} ->
         {:error, :workflow_front_matter_not_a_map}
@@ -114,18 +122,36 @@ defmodule SymphonyElixir.Workflow do
     end
   end
 
-  defp runtime_prompt_template(prompt) when is_binary(prompt) do
+  defp runtime_prompt_mode(front_matter) when is_map(front_matter) do
+    case get_in(front_matter, ["workflow", "runtime_prompt_mode"]) do
+      mode when mode in ["managed", "full_prompt_compat"] -> mode
+      nil -> "managed"
+      mode -> {:invalid, mode}
+    end
+  end
+
+  defp runtime_prompt_template(prompt, runtime_prompt_mode) when is_binary(prompt) do
     lines = String.split(prompt, ~r/\R/, trim: false)
 
     case last_runtime_prompt_heading_index(lines) do
       nil ->
-        prompt
+        case runtime_prompt_mode do
+          "full_prompt_compat" -> {:ok, prompt}
+          "managed" -> {:error, :missing_runtime_prompt_heading}
+          {:invalid, mode} -> {:error, {:invalid_runtime_prompt_mode, mode}}
+        end
 
       index ->
-        lines
-        |> Enum.drop(index)
-        |> Enum.join("\n")
-        |> String.trim()
+        prompt_template =
+          lines
+          |> Enum.drop(index)
+          |> Enum.join("\n")
+          |> String.trim()
+
+        case runtime_prompt_mode do
+          {:invalid, mode} -> {:error, {:invalid_runtime_prompt_mode, mode}}
+          _ -> {:ok, prompt_template}
+        end
     end
   end
 
@@ -133,7 +159,7 @@ defmodule SymphonyElixir.Workflow do
     lines
     |> Enum.with_index()
     |> Enum.reduce(nil, fn {line, index}, last_index ->
-      if String.trim(line) == "## Symphony Runtime Prompt" do
+      if line == "## Symphony Runtime Prompt" do
         index
       else
         last_index

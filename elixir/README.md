@@ -165,12 +165,14 @@ Notes:
   in-flight turn.
 - Reaching any run budget preserves the workspace and creates a durable
   `run_budget_exhausted` wait. Only an explicit `retry` or `reject` resolves it.
-- If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
-  identifier, title, and body.
+- In explicit `full_prompt_compat` mode, a blank Markdown body uses a default
+  prompt template. Managed mode rejects a blank body because the required
+  runtime heading is absent.
 - Prompt templates may read immutable run metadata from `run.id`, `run.attempt`,
   `run.stage`, and `run.runner_generation`.
-- Use `## Symphony Runtime Prompt` when `WORKFLOW.md` also contains operator-only instructions, so
-  pickup/watch-loop guidance does not get sent to the worker as task instructions.
+- Managed workflows must use an exact `## Symphony Runtime Prompt` line so
+  pickup/watch-loop guidance does not get sent to the worker as task
+  instructions.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
@@ -189,6 +191,8 @@ Notes:
   launched shell.
 
 ```yaml
+workflow:
+  runtime_prompt_mode: managed
 tracker:
   api_key: $LINEAR_API_KEY
   webhook_secret: $LINEAR_WEBHOOK_SECRET
@@ -221,6 +225,10 @@ codex:
   MCP servers configured directly in Codex and host/network isolation remain
   separate boundaries.
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
+- Managed workflows require an exact `## Symphony Runtime Prompt` heading and
+  send only the final such section to workers. A missing heading fails closed.
+  Full-body prompt fallback exists only as the explicit
+  `workflow.runtime_prompt_mode: full_prompt_compat` compatibility mode.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at

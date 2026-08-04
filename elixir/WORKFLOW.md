@@ -1,4 +1,6 @@
 ---
+workflow:
+  runtime_prompt_mode: managed
 tracker:
   kind: linear
   webhook_secret: $LINEAR_WEBHOOK_SECRET
@@ -44,6 +46,14 @@ codex:
   turn_sandbox_policy:
     type: workspaceWrite
 ---
+
+# Symphony Operator Contract
+
+This preamble is operator-only. The orchestrator owns dispatch, durable run
+transitions, global pause, and native operator-command reconciliation. It must
+never be included in a worker prompt.
+
+## Symphony Runtime Prompt
 
 You are working on a Linear ticket `{{ issue.identifier }}`
 

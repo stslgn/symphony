@@ -537,10 +537,13 @@ fields locally if they want stricter startup checks.
 
 ### 5.4 Prompt Template Contract
 
-The Markdown body of `WORKFLOW.md` is the per-issue prompt template unless the
-implementation documents an explicit runtime prompt section marker. The Elixir
-implementation uses `## Symphony Runtime Prompt` as that marker; when present,
-only that section through EOF is rendered for the worker.
+The Elixir implementation uses the exact `## Symphony Runtime Prompt` line as
+the worker boundary. In `workflow.runtime_prompt_mode: managed`, the heading is
+required and only the last exact heading through EOF is rendered for the
+worker; a missing heading is a workflow parse error. The legacy full-body
+fallback is available only through the explicit
+`workflow.runtime_prompt_mode: full_prompt_compat` setting and MUST NOT be used
+by managed deployments.
 
 Rendering requirements:
 
@@ -558,8 +561,10 @@ Template input variables:
 
 Fallback prompt behavior:
 
-- If the workflow prompt body is empty, the runtime MAY use a minimal default prompt
-  (`You are working on an issue from Linear.`).
+- Only explicit `full_prompt_compat` mode MAY use a minimal default prompt when
+  the workflow body is empty (`You are working on an issue from Linear.`).
+- Managed mode MUST reject an empty body because the exact runtime heading is
+  absent.
 - Workflow file read/parse failures are configuration/validation errors and SHOULD NOT silently fall
   back to a prompt.
 
@@ -569,6 +574,7 @@ Error classes:
 
 - `missing_workflow_file`
 - `workflow_parse_error`
+- `missing_runtime_prompt_heading` (managed prompt mode)
 - `workflow_front_matter_not_a_map`
 - `template_parse_error` (during prompt rendering)
 - `template_render_error` (unknown variable/filter, invalid interpolation)
