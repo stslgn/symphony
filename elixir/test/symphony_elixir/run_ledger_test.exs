@@ -556,7 +556,10 @@ defmodule SymphonyElixir.RunLedgerTest do
                workspace_root: "/srv/b"
              })
 
-    assert {:error, {:invalid_ledger_record, 4, {:invalid_transition_sequence, "retry_scheduled", :retry_terminal_intent_mismatch}}} = RunLedger.read_events(path)
+    expected_error =
+      {:error, {:invalid_ledger_record, 4, {:invalid_transition_sequence, "retry_scheduled", :retry_terminal_intent_mismatch}}}
+
+    assert expected_error == RunLedger.read_events(path)
 
     [claim, started, terminal, forged] = valid_records(path)
     rewrite_records!(path, [claim, started, terminal, %{forged | "next_attempt" => 4}])
@@ -632,7 +635,10 @@ defmodule SymphonyElixir.RunLedgerTest do
 
     assert :ok = RunLedger.append(path, %{event | next_action: "continuation"})
 
-    assert {:error, {:invalid_ledger_record, 6, {:invalid_transition_sequence, "retry_scheduled", :retry_terminal_intent_mismatch}}} = RunLedger.read_events(path)
+    expected_error =
+      {:error, {:invalid_ledger_record, 6, {:invalid_transition_sequence, "retry_scheduled", :retry_terminal_intent_mismatch}}}
+
+    assert expected_error == RunLedger.read_events(path)
   end
 
   test "workspace cleanup records require durable terminal cleanup intent" do
@@ -651,7 +657,10 @@ defmodule SymphonyElixir.RunLedgerTest do
                workspace_root: "/srv/a"
              })
 
-    assert {:error, {:invalid_ledger_record, 4, {:invalid_transition_sequence, "workspace_cleanup_completed", :missing_cleanup_request}}} = RunLedger.read_events(path)
+    expected_error =
+      {:error, {:invalid_ledger_record, 4, {:invalid_transition_sequence, "workspace_cleanup_completed", :missing_cleanup_request}}}
+
+    assert expected_error == RunLedger.read_events(path)
   end
 
   test "startup reconciliation restores global pause and operator command cursors" do

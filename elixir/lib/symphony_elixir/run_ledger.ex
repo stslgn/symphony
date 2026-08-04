@@ -239,11 +239,7 @@ defmodule SymphonyElixir.RunLedger do
              stage: "startup",
              runner_generation: runner_generation
            }) do
-      recovered_dispatches =
-        recovery.recovered_dispatches
-        |> Map.merge(recovered_dispatches_from_stale_runs(stale_runs), fn _issue_id, left, right ->
-          if left.attempt >= right.attempt, do: left, else: right
-        end)
+      recovered_dispatches = merge_recovered_dispatches(recovery.recovered_dispatches, stale_runs)
 
       recovered_attempts =
         Map.new(recovered_dispatches, fn {issue_id, dispatch} ->
@@ -528,6 +524,18 @@ defmodule SymphonyElixir.RunLedger do
 
       Map.update(acc, issue_id, dispatch, &prefer_recovered_dispatch(&1, dispatch))
     end)
+  end
+
+  defp merge_recovered_dispatches(recovered_dispatches, stale_runs) do
+    Map.merge(
+      recovered_dispatches,
+      recovered_dispatches_from_stale_runs(stale_runs),
+      &prefer_recovered_dispatch/3
+    )
+  end
+
+  defp prefer_recovered_dispatch(_issue_id, current, candidate) do
+    prefer_recovered_dispatch(current, candidate)
   end
 
   defp prefer_recovered_dispatch(current, candidate) do
@@ -1222,15 +1230,17 @@ defmodule SymphonyElixir.RunLedger do
   defp validate_retry_affinity(run, event) do
     fields = [:worker_host, :workspace_path, :workspace_root]
 
-    if Enum.all?(fields, fn field ->
-         incoming = event[Atom.to_string(field)]
-         current = Map.fetch!(run, field)
-         is_nil(incoming) or incoming == current
-       end) do
+    if Enum.all?(fields, &retry_affinity_field_matches?(run, event, &1)) do
       :ok
     else
       {:error, :retry_affinity_mismatch}
     end
+  end
+
+  defp retry_affinity_field_matches?(run, event, field) do
+    incoming = event[Atom.to_string(field)]
+    current = Map.fetch!(run, field)
+    is_nil(incoming) or incoming == current
   end
 
   defp record_retry_event(%{retry_event: nil} = run, event) do
