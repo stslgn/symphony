@@ -24,6 +24,10 @@ the thread, and rejects an incompatible live pair before sending the first
 prompt. Catalog discovery is best-effort so older app-server versions remain
 usable.
 
+Managed workflows also declare required worker capabilities. Symphony rejects
+pickup before a durable claim or process launch when an obligation such as
+`linear_graphql` is absent from the effective dynamic-tool allowlist.
+
 ## Running Symphony
 
 ### Requirements

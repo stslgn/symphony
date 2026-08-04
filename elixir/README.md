@@ -201,12 +201,17 @@ codex:
   command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
   dynamic_tool_allowlist:
     - linear_graphql
+  required_dynamic_tools:
+    - linear_graphql
   mcp_tool_auto_approve_allowlist: []
   mcp_elicitation_auto_approve_allowlist: []
 ```
 
 - All capability allowlists default to empty. Symphony advertises and executes
   only client-side dynamic tools in `dynamic_tool_allowlist`.
+- `required_dynamic_tools` declares worker obligations. Missing entries in the
+  effective dynamic-tool allowlist block dispatch before `run_claimed`; the
+  same preflight runs before the Codex process starts.
 - MCP auto-approval is independent of `approval_policy`: tool approvals require
   an exact `server/tool` entry and elicitation approvals require an exact server
   entry. Tool approval is correlated to a prior structured `mcpToolCall`

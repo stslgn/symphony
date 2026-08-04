@@ -37,6 +37,8 @@ codex:
   thread_sandbox: workspace-write
   dynamic_tool_allowlist:
     - linear_graphql
+  required_dynamic_tools:
+    - linear_graphql
   mcp_tool_auto_approve_allowlist: []
   mcp_elicitation_auto_approve_allowlist: []
   turn_sandbox_policy:

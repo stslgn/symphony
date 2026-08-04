@@ -205,6 +205,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
       field(:dynamic_tool_allowlist, {:array, :string}, default: [])
+      field(:required_dynamic_tools, {:array, :string}, default: [])
       field(:mcp_tool_auto_approve_allowlist, {:array, :string}, default: [])
       field(:mcp_elicitation_auto_approve_allowlist, {:array, :string}, default: [])
       field(:turn_timeout_ms, :integer, default: 3_600_000)
@@ -223,6 +224,7 @@ defmodule SymphonyElixir.Config.Schema do
           :thread_sandbox,
           :turn_sandbox_policy,
           :dynamic_tool_allowlist,
+          :required_dynamic_tools,
           :mcp_tool_auto_approve_allowlist,
           :mcp_elicitation_auto_approve_allowlist,
           :turn_timeout_ms,
@@ -233,12 +235,14 @@ defmodule SymphonyElixir.Config.Schema do
       )
       |> validate_required([:command])
       |> update_change(:dynamic_tool_allowlist, &normalize_allowlist/1)
+      |> update_change(:required_dynamic_tools, &normalize_allowlist/1)
       |> update_change(
         :mcp_tool_auto_approve_allowlist,
         &normalize_mcp_tool_allowlist/1
       )
       |> update_change(:mcp_elicitation_auto_approve_allowlist, &normalize_allowlist/1)
       |> validate_subset(:dynamic_tool_allowlist, @supported_dynamic_tools)
+      |> validate_subset(:required_dynamic_tools, @supported_dynamic_tools)
       |> validate_change(
         :mcp_tool_auto_approve_allowlist,
         &validate_mcp_tool_allowlist/2

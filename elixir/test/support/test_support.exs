@@ -120,6 +120,7 @@ defmodule SymphonyElixir.TestSupport do
           codex_thread_sandbox: "workspace-write",
           codex_turn_sandbox_policy: nil,
           codex_dynamic_tool_allowlist: ["linear_graphql"],
+          codex_required_dynamic_tools: [],
           codex_mcp_tool_auto_approve_allowlist: [],
           codex_mcp_elicitation_auto_approve_allowlist: [],
           codex_turn_timeout_ms: 3_600_000,
@@ -164,6 +165,7 @@ defmodule SymphonyElixir.TestSupport do
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
     codex_turn_sandbox_policy = Keyword.get(config, :codex_turn_sandbox_policy)
     codex_dynamic_tool_allowlist = Keyword.get(config, :codex_dynamic_tool_allowlist)
+    codex_required_dynamic_tools = Keyword.get(config, :codex_required_dynamic_tools)
 
     codex_mcp_tool_auto_approve_allowlist =
       Keyword.get(config, :codex_mcp_tool_auto_approve_allowlist)
@@ -217,6 +219,7 @@ defmodule SymphonyElixir.TestSupport do
         "  thread_sandbox: #{yaml_value(codex_thread_sandbox)}",
         "  turn_sandbox_policy: #{yaml_value(codex_turn_sandbox_policy)}",
         "  dynamic_tool_allowlist: #{yaml_value(codex_dynamic_tool_allowlist)}",
+        "  required_dynamic_tools: #{yaml_value(codex_required_dynamic_tools)}",
         "  mcp_tool_auto_approve_allowlist: #{yaml_value(codex_mcp_tool_auto_approve_allowlist)}",
         "  mcp_elicitation_auto_approve_allowlist: #{yaml_value(codex_mcp_elicitation_auto_approve_allowlist)}",
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",

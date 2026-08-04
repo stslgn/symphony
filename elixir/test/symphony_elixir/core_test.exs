@@ -13,6 +13,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_terminal_states: nil,
       codex_command: nil,
       codex_dynamic_tool_allowlist: nil,
+      codex_required_dynamic_tools: nil,
       codex_mcp_tool_auto_approve_allowlist: nil,
       codex_mcp_elicitation_auto_approve_allowlist: nil
     )
@@ -27,6 +28,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.agent.max_run_tokens == nil
     assert config.agent.max_run_seconds == nil
     assert config.codex.dynamic_tool_allowlist == []
+    assert config.codex.required_dynamic_tools == []
     assert config.codex.mcp_tool_auto_approve_allowlist == []
     assert config.codex.mcp_elicitation_auto_approve_allowlist == []
 
@@ -133,12 +135,14 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_dynamic_tool_allowlist: [" linear_graphql ", "linear_graphql"],
+      codex_required_dynamic_tools: [" linear_graphql ", "linear_graphql"],
       codex_mcp_tool_auto_approve_allowlist: [" Linear / Save issue "],
       codex_mcp_elicitation_auto_approve_allowlist: [" Linear "]
     )
 
     assert config = Config.settings!().codex
     assert config.dynamic_tool_allowlist == ["linear_graphql"]
+    assert config.required_dynamic_tools == ["linear_graphql"]
     assert config.mcp_tool_auto_approve_allowlist == ["Linear/Save issue"]
     assert config.mcp_elicitation_auto_approve_allowlist == ["Linear"]
 
@@ -148,6 +152,23 @@ defmodule SymphonyElixir.CoreTest do
 
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.dynamic_tool_allowlist"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_dynamic_tool_allowlist: [],
+      codex_required_dynamic_tools: ["linear_graphql"]
+    )
+
+    assert :ok = Config.validate!()
+
+    assert {:error, {:missing_required_dynamic_tools, ["linear_graphql"]}} =
+             Config.validate_runtime_capabilities()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_required_dynamic_tools: ["unknown_tool"]
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.required_dynamic_tools"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_mcp_tool_auto_approve_allowlist: ["missing-separator"]
@@ -182,6 +203,10 @@ defmodule SymphonyElixir.CoreTest do
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
 
+    codex = Map.get(config, "codex", %{})
+    assert Map.get(codex, "dynamic_tool_allowlist") == ["linear_graphql"]
+    assert Map.get(codex, "required_dynamic_tools") == ["linear_graphql"]
+
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
     assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
@@ -192,6 +217,7 @@ defmodule SymphonyElixir.CoreTest do
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())
     assert Config.workflow_prompt() == prompt
+    assert :ok = Config.validate_runtime_capabilities()
   end
 
   test "linear api token resolves from LINEAR_API_KEY env var" do

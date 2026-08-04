@@ -515,6 +515,11 @@ fields locally if they want stricter startup checks.
 - `dynamic_tool_allowlist` (list of exact registered client-side tool names)
   - Default: empty list.
   - Unknown tool names MUST fail workflow validation.
+- `required_dynamic_tools` (list of exact registered client-side tool names)
+  - Default: empty list for compatibility workflows.
+  - Every entry MUST also exist in the effective `dynamic_tool_allowlist` before
+    a run is claimed and before Codex is launched. Missing entries block the run
+    with the bounded `missing_required_dynamic_tools` reason.
 - `mcp_tool_auto_approve_allowlist` (list of exact `server/tool` identities)
   - Default: empty list.
   - Authorization MUST use structured `mcpToolCall` lifecycle identity correlated
@@ -675,6 +680,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
 - `codex.dynamic_tool_allowlist`: list of registered names, default `[]`
+- `codex.required_dynamic_tools`: required registered names, default `[]`
 - `codex.mcp_tool_auto_approve_allowlist`: list of `server/tool` identities, default `[]`
 - `codex.mcp_elicitation_auto_approve_allowlist`: list of server names, default `[]`
 - `codex.turn_timeout_ms`: integer, default `3600000`

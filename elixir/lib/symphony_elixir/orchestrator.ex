@@ -314,6 +314,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     with false <- state.dispatch_paused,
          :ok <- Config.validate!(),
+         :ok <- Config.validate_runtime_capabilities(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
       choose_issues(issues, state)
@@ -338,6 +339,10 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, {:invalid_workflow_config, message}} ->
         Logger.error("Invalid WORKFLOW.md config: #{message}")
+        state
+
+      {:error, {:missing_required_dynamic_tools, tools}} ->
+        Logger.error("Runtime capability preflight blocked dispatch: missing_required_dynamic_tools=#{Enum.join(tools, ",")}")
         state
 
       {:error, {:missing_workflow_file, path, reason}} ->
@@ -946,6 +951,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    case Config.validate_runtime_capabilities() do
+      :ok ->
+        claim_and_start_issue(state, issue, attempt, recipient, worker_host)
+
+      {:error, {:missing_required_dynamic_tools, tools}} ->
+        Logger.error("Runtime capability preflight blocked claim for #{issue_context(issue)}: missing_required_dynamic_tools=#{Enum.join(tools, ",")}")
+        state
+
+      {:error, reason} ->
+        Logger.error("Runtime capability preflight failed for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp claim_and_start_issue(%State{} = state, issue, attempt, recipient, worker_host) do
     run_id = RunLedger.new_id("run")
     normalized_attempt = normalize_retry_attempt(attempt)
 

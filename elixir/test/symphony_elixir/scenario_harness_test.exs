@@ -236,22 +236,44 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
     refute unavailable_trace =~ ~s("method":"config/read")
   end
 
-  test "capability preflight rejects unknown tools before app-server launch" do
+  test "capability preflight blocks claims, tasks, and app-server launch when a required tool is missing" do
     root = scenario_root("capability-preflight")
     on_exit(fn -> File.rm_rf(root) end)
 
+    ledger_path = Path.join(root, "run-ledger.jsonl")
+    workspace = Path.join(root, "workspaces/SCN-CAP")
     fake = ScenarioHarness.write_fake_codex!(root, :live_ok)
+    required_issue = issue("issue-capability-preflight", "SCN-CAP")
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       workspace_root: Path.join(root, "workspaces"),
       codex_command: "#{fake.binary} app-server",
-      codex_dynamic_tool_allowlist: ["unknown_tool"]
+      codex_dynamic_tool_allowlist: [],
+      codex_required_dynamic_tools: ["linear_graphql"]
     )
 
-    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
-    assert message =~ "codex.dynamic_tool_allowlist"
+    File.mkdir_p!(workspace)
+
+    assert {:error, {:missing_required_dynamic_tools, ["linear_graphql"]}} =
+             AppServer.start_session(workspace)
+
     refute File.exists?(fake.trace)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [required_issue])
+    task_children_before = MapSet.new(Task.Supervisor.children(SymphonyElixir.TaskSupervisor))
+    harness = ScenarioHarness.start!(Module.concat(__MODULE__, :CapabilityRunner), ledger_path)
+
+    try do
+      snapshot = ScenarioHarness.await_poll_idle(harness)
+      assert snapshot.running == []
+      assert snapshot.retrying == []
+      assert count_transition(ScenarioHarness.events(harness), "run_claimed") == 0
+      assert MapSet.new(Task.Supervisor.children(SymphonyElixir.TaskSupervisor)) == task_children_before
+      refute File.exists?(fake.trace)
+    after
+      ScenarioHarness.stop(harness)
+    end
   end
 
   defp scenario_root(name) do

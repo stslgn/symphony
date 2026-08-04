@@ -70,7 +70,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
     session_title = opts |> Keyword.get(:session_title, "Symphony worker") |> normalize_session_title()
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+    with :ok <- Config.validate_runtime_capabilities(),
+         {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port |> port_metadata(worker_host) |> Map.put(:session_title, session_title)
 
