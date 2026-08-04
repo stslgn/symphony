@@ -564,6 +564,8 @@ defmodule SymphonyElixir.CoreTest do
       retry_attempts: %{}
     }
 
+    seed_running_ledger!(ledger_path, state.running[issue_id])
+
     issue = %Issue{
       id: issue_id,
       identifier: issue_identifier,
@@ -871,6 +873,8 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
+    seed_running_ledger!(ledger_path, state.running[issue_id])
+
     assert {:reply, {:ok, wait}, parked_state} =
              Orchestrator.handle_call(
                {:park_issue, issue_id, "waiting_secret"},
@@ -995,6 +999,8 @@ defmodule SymphonyElixir.CoreTest do
       claimed: MapSet.new([issue_id]),
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
+
+    seed_running_ledger!(ledger_path, running_entry)
 
     update = %{
       event: :notification,
@@ -1167,17 +1173,25 @@ defmodule SymphonyElixir.CoreTest do
     refute MapSet.member?(blocked_state.completed, issue_id)
     refute Map.has_key?(blocked_state.retry_attempts, issue_id)
 
+    seed_running_ledger!(valid_path, blocked_state.running[issue_id])
+
     recovered_state =
       blocked_state
       |> Map.put(:run_ledger_path, valid_path)
       |> Orchestrator.retry_pending_terminal_transitions_for_test()
 
+    assert {:ok, events} = RunLedger.read_events(valid_path)
+
+    assert Enum.map(events, & &1["transition"]) == [
+             "run_claimed",
+             "run_started",
+             "run_completed",
+             "retry_scheduled"
+           ]
+
     refute Map.has_key?(recovered_state.running, issue_id)
     assert MapSet.member?(recovered_state.completed, issue_id)
-    assert recovered_state.retry_attempts[issue_id].attempt == 1
-
-    assert {:ok, events} = RunLedger.read_events(valid_path)
-    assert Enum.map(events, & &1["transition"]) == ["run_completed", "retry_scheduled"]
+    assert recovered_state.retry_attempts[issue_id].attempt == 4
 
     Process.cancel_timer(recovered_state.retry_attempts[issue_id].timer_ref)
   end
@@ -1196,6 +1210,8 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(blocked_state.claimed, issue_id)
     refute Map.has_key?(blocked_state.retry_attempts, issue_id)
 
+    seed_running_ledger!(valid_path, blocked_state.running[issue_id])
+
     recovered_state =
       blocked_state
       |> Map.put(:run_ledger_path, valid_path)
@@ -1205,7 +1221,13 @@ defmodule SymphonyElixir.CoreTest do
     assert recovered_state.retry_attempts[issue_id].attempt == 4
 
     assert {:ok, events} = RunLedger.read_events(valid_path)
-    assert Enum.map(events, & &1["transition"]) == ["run_failed", "retry_scheduled"]
+
+    assert Enum.map(events, & &1["transition"]) == [
+             "run_claimed",
+             "run_started",
+             "run_failed",
+             "retry_scheduled"
+           ]
 
     Process.cancel_timer(recovered_state.retry_attempts[issue_id].timer_ref)
   end
@@ -1272,6 +1294,8 @@ defmodule SymphonyElixir.CoreTest do
       assert Process.alive?(agent_pid)
       assert File.exists?(workspace)
 
+      seed_running_ledger!(valid_path, blocked_state.running[issue_id])
+
       recovered_state =
         blocked_state
         |> Map.put(:run_ledger_path, valid_path)
@@ -1283,7 +1307,7 @@ defmodule SymphonyElixir.CoreTest do
       refute Process.alive?(agent_pid)
       refute File.exists?(workspace)
 
-      assert {:ok, [event]} = RunLedger.read_events(valid_path)
+      assert {:ok, [_claim, _started, event]} = RunLedger.read_events(valid_path)
       assert event["transition"] == "run_stopped"
       assert event["terminal_reason"] == "tracker_terminal"
     after
@@ -1725,6 +1749,8 @@ defmodule SymphonyElixir.CoreTest do
                parked_at: cursor_at
              })
 
+    seed_parked_ledger!(ledger_path, wait)
+
     comment = %SymphonyElixir.Linear.Comment{
       id: "comment-retry",
       body: "$retry after reconnect",
@@ -1895,6 +1921,8 @@ defmodule SymphonyElixir.CoreTest do
       },
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
+
+    seed_running_ledger!(ledger_path, running_entry)
 
     assert {:noreply, stopped_state} = Orchestrator.handle_info(:run_poll_cycle, state)
     refute Map.has_key?(stopped_state.running, issue_id)

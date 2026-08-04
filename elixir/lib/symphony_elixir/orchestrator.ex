@@ -752,6 +752,7 @@ defmodule SymphonyElixir.Orchestrator do
             identifier: identifier,
             error: "stalled for #{elapsed_ms}ms without codex activity",
             previous_run_id: Map.get(running_entry, :run_id),
+            previous_attempt: Map.get(running_entry, :retry_attempt, 0),
             worker_host: Map.get(running_entry, :worker_host),
             workspace_path: Map.get(running_entry, :workspace_path)
           }
@@ -1216,6 +1217,7 @@ defmodule SymphonyElixir.Orchestrator do
                identifier: issue.identifier,
                error: "failed to spawn agent: #{inspect(reason)}",
                previous_run_id: run_id,
+               previous_attempt: normalized_attempt,
                worker_host: worker_host,
                workspace_path: expected_workspace_path
              }}
@@ -1276,6 +1278,9 @@ defmodule SymphonyElixir.Orchestrator do
     previous_run_id =
       Map.get(metadata, :previous_run_id) || Map.get(previous_retry, :previous_run_id)
 
+    previous_attempt =
+      Map.get(metadata, :previous_attempt, Map.get(previous_retry, :previous_attempt, 0))
+
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
     end
@@ -1293,7 +1298,8 @@ defmodule SymphonyElixir.Orchestrator do
         run_id: previous_run_id,
         issue_id: issue_id,
         issue_identifier: identifier,
-        attempt: next_attempt,
+        attempt: previous_attempt,
+        next_attempt: next_attempt,
         worker_host: worker_host,
         workspace_path: workspace_path
       }),
@@ -1311,6 +1317,7 @@ defmodule SymphonyElixir.Orchestrator do
             identifier: identifier,
             error: error,
             previous_run_id: previous_run_id,
+            previous_attempt: previous_attempt,
             worker_host: worker_host,
             workspace_path: workspace_path
           })
@@ -1324,6 +1331,7 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
           previous_run_id: Map.get(retry_entry, :previous_run_id),
+          previous_attempt: Map.get(retry_entry, :previous_attempt),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path)
         }
@@ -2140,11 +2148,12 @@ defmodule SymphonyElixir.Orchestrator do
       transition: "run_completed",
       terminal_reason: "worker_completed",
       action:
-        {:continuation, 1,
+        {:continuation, max(Map.get(running_entry, :retry_attempt, 0) + 1, 1),
          %{
            identifier: running_entry.identifier,
            delay_type: :continuation,
            previous_run_id: Map.get(running_entry, :run_id),
+           previous_attempt: Map.get(running_entry, :retry_attempt, 0),
            worker_host: Map.get(running_entry, :worker_host),
            workspace_path: Map.get(running_entry, :workspace_path)
          }}
@@ -2167,6 +2176,7 @@ defmodule SymphonyElixir.Orchestrator do
            identifier: running_entry.identifier,
            error: "agent exited: #{inspect(reason)}",
            previous_run_id: Map.get(running_entry, :run_id),
+           previous_attempt: Map.get(running_entry, :retry_attempt, 0),
            worker_host: Map.get(running_entry, :worker_host),
            workspace_path: Map.get(running_entry, :workspace_path)
          }}

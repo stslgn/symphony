@@ -61,6 +61,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       started_at: started_at
     }
 
+    seed_running_ledger!(initial_state.run_ledger_path, running_entry)
+
     state_with_issue =
       initial_state
       |> Map.put(:running, %{issue_id => running_entry})
@@ -871,6 +873,22 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     ledger_path = Path.join(root, "run-ledger.jsonl")
     on_exit(fn -> File.rm_rf(root) end)
 
+    for transition_stage <- [{"run_claimed", "claimed"}, {"run_started", "running"}] do
+      {transition, stage} = transition_stage
+
+      assert :ok =
+               RunLedger.append(ledger_path, %{
+                 transition: transition,
+                 stage: stage,
+                 run_id: "run-status-resume-source",
+                 issue_id: "issue-status-resume",
+                 issue_identifier: "MT-RESUME-STATUS",
+                 attempt: 3,
+                 worker_host: "worker-a",
+                 workspace_path: "/srv/symphony/MT-RESUME-STATUS"
+               })
+    end
+
     assert :ok =
              RunLedger.append(ledger_path, %{
                transition: "run_parked",
@@ -967,8 +985,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert :ok =
              RunLedger.append(ledger_path, %{
-               transition: "run_runtime_ready",
-               stage: "running",
+               transition: "run_claimed",
+               stage: "claimed",
                run_id: "run-stale-affinity",
                issue_id: "issue-stale-affinity",
                issue_identifier: "MT-STALE-AFFINITY",
@@ -980,6 +998,18 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert :ok =
              RunLedger.append(ledger_path, %{
                transition: "run_started",
+               stage: "running",
+               run_id: "run-stale-affinity",
+               issue_id: "issue-stale-affinity",
+               issue_identifier: "MT-STALE-AFFINITY",
+               attempt: 2,
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-STALE-AFFINITY"
+             })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "run_runtime_ready",
                stage: "running",
                run_id: "run-stale-affinity",
                issue_id: "issue-stale-affinity",
