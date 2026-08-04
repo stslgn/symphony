@@ -738,6 +738,115 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_total_tokens == 14
   end
 
+  test "canonical token accounting derives a monotonic total and rejects malformed counters" do
+    {state, issue_id, run_id} = token_accounting_state("canonical")
+
+    state = apply_token_usage(state, issue_id, run_id, %{"input_tokens" => 8, "output_tokens" => 3})
+    assert_token_usage(state, issue_id, 8, 3, 11, true)
+
+    duplicate = apply_token_usage(state, issue_id, run_id, %{"input_tokens" => 8, "output_tokens" => 3})
+    assert_token_usage(duplicate, issue_id, 8, 3, 11, true)
+    assert duplicate.codex_totals.total_tokens == 11
+
+    increased =
+      apply_token_usage(duplicate, issue_id, run_id, %{
+        "input_tokens" => 10,
+        "output_tokens" => 5
+      })
+
+    assert_token_usage(increased, issue_id, 10, 5, 15, true)
+
+    reset = apply_token_usage(increased, issue_id, run_id, %{"input_tokens" => 2, "output_tokens" => 1})
+    assert_token_usage(reset, issue_id, 10, 5, 15, true)
+
+    mismatched =
+      apply_token_usage(reset, issue_id, run_id, %{
+        "input_tokens" => 20,
+        "output_tokens" => 5,
+        "total_tokens" => 12
+      })
+
+    assert_token_usage(mismatched, issue_id, 20, 5, 25, true)
+
+    malformed =
+      apply_token_usage(mismatched, issue_id, run_id, %{
+        "input_tokens" => 30,
+        "output_tokens" => 10,
+        "total_tokens" => "40-trailing"
+      })
+
+    assert_token_usage(malformed, issue_id, 20, 5, 25, true)
+
+    overflow =
+      apply_token_usage(malformed, issue_id, run_id, %{
+        "input_tokens" => 9_223_372_036_854_775_807,
+        "output_tokens" => 1
+      })
+
+    assert_token_usage(overflow, issue_id, 20, 5, 25, true)
+    assert overflow.codex_totals == mismatched.codex_totals
+  end
+
+  test "one-sided token telemetry stays unenforceable and attempts keep independent high-water marks" do
+    {first_state, issue_id, first_run_id} = token_accounting_state("attempt-isolation")
+
+    one_sided =
+      apply_token_usage(first_state, issue_id, first_run_id, %{"input_tokens" => 40})
+
+    assert_token_usage(one_sided, issue_id, 40, 0, 0, false)
+
+    first_attempt =
+      apply_token_usage(one_sided, issue_id, first_run_id, %{
+        "input_tokens" => 40,
+        "output_tokens" => 10
+      })
+
+    assert_token_usage(first_attempt, issue_id, 40, 10, 50, true)
+
+    second_run_id = "run-attempt-isolation-2"
+    second_entry = token_running_entry(issue_id, second_run_id, max_tokens: nil)
+
+    second_state = %{
+      first_attempt
+      | running: %{issue_id => second_entry},
+        claimed: MapSet.new([issue_id])
+    }
+
+    stale =
+      apply_token_usage(second_state, issue_id, first_run_id, %{
+        "input_tokens" => 90,
+        "output_tokens" => 10
+      })
+
+    assert_token_usage(stale, issue_id, 0, 0, 0, false)
+
+    current =
+      apply_token_usage(stale, issue_id, second_run_id, %{
+        "input_tokens" => 4,
+        "output_tokens" => 6
+      })
+
+    assert_token_usage(current, issue_id, 4, 6, 10, true)
+    assert current.codex_totals.total_tokens == 60
+  end
+
+  test "derived canonical totals enforce exact and coarse token-budget crossings" do
+    for {tag, usage} <- [
+          {"exact", %{"input_tokens" => 80, "output_tokens" => 20}},
+          {"overshoot", %{"input_tokens" => 130, "output_tokens" => 70}}
+        ] do
+      {state, issue_id, run_id} = token_accounting_state(tag, max_tokens: 100)
+      parked = apply_token_usage(state, issue_id, run_id, usage)
+
+      refute Map.has_key?(parked.running, issue_id)
+
+      assert %{
+               reason: "run_budget_exhausted",
+               terminal_reason: "token_budget_exhausted"
+             } = parked.parked[issue_id]
+    end
+  end
+
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
     issue_id = "issue-last-token-ignored"
 
@@ -1969,5 +2078,88 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {next_tokens, [{timestamp, next_tokens} | acc]}
     end)
     |> elem(1)
+  end
+
+  defp token_accounting_state(tag, opts \\ []) do
+    issue_id = "issue-token-#{tag}"
+    run_id = "run-token-#{tag}"
+    running_entry = token_running_entry(issue_id, run_id, opts)
+
+    state = %Orchestrator.State{
+      runner_generation: "runner-token-accounting",
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    {state, issue_id, run_id}
+  end
+
+  defp token_running_entry(issue_id, run_id, opts) do
+    agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    on_exit(fn ->
+      if Process.alive?(agent_pid), do: Process.exit(agent_pid, :kill)
+    end)
+
+    %{
+      pid: agent_pid,
+      ref: nil,
+      run_id: run_id,
+      retry_attempt: 1,
+      identifier: String.upcase(issue_id),
+      issue: %Issue{id: issue_id, identifier: String.upcase(issue_id), state: "In Progress"},
+      started_at: DateTime.utc_now(),
+      session_id: nil,
+      session_title: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_token_telemetry_observed: false,
+      turn_count: 0,
+      run_budget: %{max_turns: 20, max_tokens: Keyword.get(opts, :max_tokens), max_seconds: nil},
+      run_budget_timer_ref: nil,
+      worker_host: nil,
+      workspace_path: nil,
+      workspace_root: nil
+    }
+  end
+
+  defp apply_token_usage(state, issue_id, run_id, usage) do
+    update = %{
+      event: :notification,
+      timestamp: DateTime.utc_now(),
+      run_id: run_id,
+      payload: %{
+        "method" => "thread/tokenUsage/updated",
+        "params" => %{"tokenUsage" => %{"total" => usage}}
+      }
+    }
+
+    assert {:noreply, updated_state} =
+             Orchestrator.handle_info({:codex_worker_update, issue_id, update}, state)
+
+    updated_state
+  end
+
+  defp assert_token_usage(state, issue_id, input, output, total, telemetry_observed?) do
+    entry = state.running[issue_id]
+    assert entry.codex_input_tokens == input
+    assert entry.codex_output_tokens == output
+    assert entry.codex_total_tokens == total
+
+    assert {:reply, snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, state)
+
+    [row] = snapshot.running
+    assert row.budget.tokens.telemetry_observed == telemetry_observed?
+    assert row.budget.tokens.used == if(telemetry_observed?, do: total)
   end
 end

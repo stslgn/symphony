@@ -167,7 +167,11 @@ Notes:
 - `agent.max_turns` is a hard attempt limit on back-to-back Codex turns. If the final allowed turn
   completes while the issue is still active, Symphony parks the run instead of scheduling an
   automatic continuation. Default: `20`.
-- `agent.max_run_tokens` optionally caps cumulative Codex tokens observed during one attempt.
+- `agent.max_run_tokens` optionally caps cumulative Codex tokens observed during one attempt. An
+  explicit cumulative total is accepted; when it is absent, Symphony derives a checked total only
+  when both cumulative input and output counters are present. One-sided or malformed telemetry does
+  not claim enforceable usage, while duplicate and decreasing/reset counters cannot reduce the
+  attempt's monotonic high-water mark or reopen the budget.
 - `agent.max_run_seconds` optionally caps wall-clock seconds for one attempt and can stop an
   in-flight turn.
 - Reaching any run budget preserves the workspace and creates a durable

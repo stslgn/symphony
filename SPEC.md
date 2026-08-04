@@ -1552,9 +1552,15 @@ Token accounting rules:
   - `thread/tokenUsage/updated` payloads
   - `total_token_usage` within token-count wrapper events
 - Ignore delta-style payloads such as `last_token_usage` for dashboard/API totals.
-- Extract input/output/total token counts leniently from common field names within the selected
-  payload.
-- For absolute totals, track deltas relative to last reported totals to avoid double-counting.
+- Extract non-negative, bounded input/output/total token counts from common field names within the
+  selected payload. Reject malformed values and checked-sum overflow.
+- Canonicalize exactly one cumulative total per attempt. Use the explicit total when it is the only
+  enforceable total; when both cumulative input and output are present, derive their checked sum.
+  If explicit and derived totals disagree, use the larger bounded value so the budget fails closed.
+- Treat token telemetry as enforceably observed only when that canonical cumulative total exists.
+  A one-sided input or output counter remains visible but MUST NOT claim verified total usage.
+- Track deltas relative to the attempt's monotonic high-water marks. Duplicate or decreasing/reset
+  counters MUST NOT double-count, reduce recorded use, or reopen an exhausted allowance.
 - Do not treat generic `usage` maps as cumulative totals unless the event type defines them that
   way.
 - Accumulate aggregate totals in orchestrator state.

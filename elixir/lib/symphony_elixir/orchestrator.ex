@@ -25,6 +25,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @max_cumulative_token_count 9_223_372_036_854_775_807
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -3476,46 +3477,105 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp extract_token_delta(running_entry, %{event: _, timestamp: _} = update) do
-    usage = extract_token_usage(update)
+    case canonical_token_usage(extract_token_usage(update)) do
+      {:ok, usage} -> token_delta_from_canonical_usage(running_entry, usage)
+      :invalid -> empty_token_delta(running_entry)
+    end
+  end
 
-    telemetry_observed =
-      Enum.any?([:input, :output, :total], fn token_key ->
-        is_integer(get_token_usage(usage, token_key))
-      end)
-
-    {
+  defp token_delta_from_canonical_usage(running_entry, usage) do
+    input =
       compute_token_delta(
         running_entry,
         :input,
         usage,
         :codex_last_reported_input_tokens
-      ),
+      )
+
+    output =
       compute_token_delta(
         running_entry,
         :output,
         usage,
         :codex_last_reported_output_tokens
-      ),
+      )
+
+    total =
       compute_token_delta(
         running_entry,
         :total,
         usage,
         :codex_last_reported_total_tokens
       )
+
+    %{
+      input_tokens: input.delta,
+      output_tokens: output.delta,
+      total_tokens: total.delta,
+      input_reported: input.reported,
+      output_reported: output.reported,
+      total_reported: total.reported,
+      telemetry_observed: is_integer(get_token_usage(usage, :total))
     }
-    |> Tuple.to_list()
-    |> then(fn [input, output, total] ->
-      %{
-        input_tokens: input.delta,
-        output_tokens: output.delta,
-        total_tokens: total.delta,
-        input_reported: input.reported,
-        output_reported: output.reported,
-        total_reported: total.reported,
-        telemetry_observed: telemetry_observed
-      }
-    end)
   end
+
+  defp empty_token_delta(running_entry) do
+    %{
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      input_reported: Map.get(running_entry, :codex_last_reported_input_tokens, 0),
+      output_reported: Map.get(running_entry, :codex_last_reported_output_tokens, 0),
+      total_reported: Map.get(running_entry, :codex_last_reported_total_tokens, 0),
+      telemetry_observed: false
+    }
+  end
+
+  defp canonical_token_usage(usage) when is_map(usage) do
+    with {:ok, input} <- normalized_token_component(usage, token_fields(:input)),
+         {:ok, output} <- normalized_token_component(usage, token_fields(:output)),
+         {:ok, explicit_total} <- normalized_token_component(usage, token_fields(:total)),
+         {:ok, derived_total} <- checked_token_sum(input, output) do
+      {:ok,
+       %{
+         input: input,
+         output: output,
+         total: canonical_total(explicit_total, derived_total)
+       }}
+    else
+      :invalid -> :invalid
+    end
+  end
+
+  defp canonical_token_usage(_usage), do: :invalid
+
+  defp normalized_token_component(usage, fields) do
+    values =
+      fields
+      |> Enum.filter(&Map.has_key?(usage, &1))
+      |> Enum.map(&integer_like(Map.get(usage, &1)))
+
+    cond do
+      values == [] -> {:ok, nil}
+      Enum.any?(values, &is_nil/1) -> :invalid
+      true -> {:ok, Enum.max(values)}
+    end
+  end
+
+  defp checked_token_sum(input, output) when is_integer(input) and is_integer(output) do
+    if input <= @max_cumulative_token_count - output do
+      {:ok, input + output}
+    else
+      :invalid
+    end
+  end
+
+  defp checked_token_sum(_input, _output), do: {:ok, nil}
+
+  defp canonical_total(nil, nil), do: nil
+  defp canonical_total(total, nil), do: total
+  defp canonical_total(nil, derived), do: derived
+  defp canonical_total(total, derived), do: max(total, derived)
 
   defp compute_token_delta(running_entry, token_key, usage, reported_key) do
     next_total = get_token_usage(usage, token_key)
@@ -3657,28 +3717,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp map_at_path(_payload, _path), do: nil
 
   defp integer_token_map?(payload) do
-    token_fields = [
-      :input_tokens,
-      :output_tokens,
-      :total_tokens,
-      :prompt_tokens,
-      :completion_tokens,
-      :inputTokens,
-      :outputTokens,
-      :totalTokens,
-      :promptTokens,
-      :completionTokens,
-      "input_tokens",
-      "output_tokens",
-      "total_tokens",
-      "prompt_tokens",
-      "completion_tokens",
-      "inputTokens",
-      "outputTokens",
-      "totalTokens",
-      "promptTokens",
-      "completionTokens"
-    ]
+    token_fields = token_fields(:input) ++ token_fields(:output) ++ token_fields(:total)
 
     token_fields
     |> Enum.any?(fn field ->
@@ -3688,44 +3727,53 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp get_token_usage(usage, :input),
-    do:
-      payload_get(usage, [
-        "input_tokens",
-        "prompt_tokens",
-        :input_tokens,
-        :prompt_tokens,
-        :input,
-        "promptTokens",
-        :promptTokens,
-        "inputTokens",
-        :inputTokens
-      ])
+    do: payload_get(usage, token_fields(:input))
 
   defp get_token_usage(usage, :output),
-    do:
-      payload_get(usage, [
-        "output_tokens",
-        "completion_tokens",
-        :output_tokens,
-        :completion_tokens,
-        :output,
-        :completion,
-        "outputTokens",
-        :outputTokens,
-        "completionTokens",
-        :completionTokens
-      ])
+    do: payload_get(usage, token_fields(:output))
 
   defp get_token_usage(usage, :total),
-    do:
-      payload_get(usage, [
-        "total_tokens",
-        "total",
-        :total_tokens,
-        :total,
-        "totalTokens",
-        :totalTokens
-      ])
+    do: payload_get(usage, token_fields(:total))
+
+  defp token_fields(:input) do
+    [
+      "input_tokens",
+      "prompt_tokens",
+      :input_tokens,
+      :prompt_tokens,
+      :input,
+      "promptTokens",
+      :promptTokens,
+      "inputTokens",
+      :inputTokens
+    ]
+  end
+
+  defp token_fields(:output) do
+    [
+      "output_tokens",
+      "completion_tokens",
+      :output_tokens,
+      :completion_tokens,
+      :output,
+      :completion,
+      "outputTokens",
+      :outputTokens,
+      "completionTokens",
+      :completionTokens
+    ]
+  end
+
+  defp token_fields(:total) do
+    [
+      "total_tokens",
+      "total",
+      :total_tokens,
+      :total,
+      "totalTokens",
+      :totalTokens
+    ]
+  end
 
   defp payload_get(payload, fields) when is_list(fields) do
     Enum.find_value(fields, fn field -> map_integer_value(payload, field) end)
@@ -3768,11 +3816,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp running_seconds(_started_at, _now), do: 0
 
-  defp integer_like(value) when is_integer(value) and value >= 0, do: value
+  defp integer_like(value)
+       when is_integer(value) and value >= 0 and value <= @max_cumulative_token_count,
+       do: value
 
   defp integer_like(value) when is_binary(value) do
     case Integer.parse(String.trim(value)) do
-      {num, _} when num >= 0 -> num
+      {num, ""} when num >= 0 and num <= @max_cumulative_token_count -> num
       _ -> nil
     end
   end
