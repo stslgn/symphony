@@ -566,7 +566,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     )
 
     snapshot = GenServer.call(pid, :snapshot)
-    assert snapshot.rate_limits == rate_limits
+
+    assert snapshot.rate_limits == %{
+             limit_id: "codex",
+             primary: %{remaining: 90, limit: 100},
+             credits: %{has_credits: false, unlimited: false}
+           }
   end
 
   test "orchestrator token accounting prefers total_token_usage over last_token_usage in token_count payloads" do

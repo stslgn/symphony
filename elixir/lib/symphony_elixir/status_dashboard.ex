@@ -6,7 +6,7 @@ defmodule SymphonyElixir.StatusDashboard do
   use GenServer
   require Logger
 
-  alias SymphonyElixir.{Config, HttpServer, ObservabilitySanitizer}
+  alias SymphonyElixir.{Config, HttpServer, ObservabilitySanitizer, RateLimitTelemetry}
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixirWeb.ObservabilityPubSub
 
@@ -917,88 +917,66 @@ defmodule SymphonyElixir.StatusDashboard do
   defp in_bucket?(timestamp, bucket_start, bucket_end, false),
     do: timestamp >= bucket_start and timestamp < bucket_end
 
-  defp format_rate_limits(nil), do: colorize("unavailable", @ansi_gray)
+  defp format_rate_limits(rate_limits) do
+    case RateLimitTelemetry.project(rate_limits) do
+      %{limit_id: limit_id} = projected ->
+        primary = format_rate_limit_bucket(Map.get(projected, :primary))
+        secondary = format_rate_limit_bucket(Map.get(projected, :secondary))
+        credits = format_rate_limit_credits(Map.get(projected, :credits))
 
-  defp format_rate_limits(rate_limits) when is_map(rate_limits) do
-    limit_id =
-      map_value(rate_limits, ["limit_id", :limit_id, "limit_name", :limit_name]) ||
-        "unknown"
+        colorize(limit_id, @ansi_yellow) <>
+          colorize(" | ", @ansi_gray) <>
+          colorize("primary #{primary}", @ansi_cyan) <>
+          colorize(" | ", @ansi_gray) <>
+          colorize("secondary #{secondary}", @ansi_cyan) <>
+          colorize(" | ", @ansi_gray) <>
+          colorize(credits, @ansi_green)
 
-    primary = format_rate_limit_bucket(map_value(rate_limits, ["primary", :primary]))
-    secondary = format_rate_limit_bucket(map_value(rate_limits, ["secondary", :secondary]))
-    credits = format_rate_limit_credits(map_value(rate_limits, ["credits", :credits]))
-
-    colorize(to_string(limit_id), @ansi_yellow) <>
-      colorize(" | ", @ansi_gray) <>
-      colorize("primary #{primary}", @ansi_cyan) <>
-      colorize(" | ", @ansi_gray) <>
-      colorize("secondary #{secondary}", @ansi_cyan) <>
-      colorize(" | ", @ansi_gray) <>
-      colorize(credits, @ansi_green)
-  end
-
-  defp format_rate_limits(other) do
-    other
-    |> inspect(limit: 10)
-    |> truncate(80)
-    |> colorize(@ansi_gray)
+      nil ->
+        colorize("unavailable", @ansi_gray)
+    end
   end
 
   defp format_rate_limit_bucket(nil), do: "n/a"
 
   defp format_rate_limit_bucket(bucket) when is_map(bucket) do
-    remaining = map_value(bucket, ["remaining", :remaining])
-    limit = map_value(bucket, ["limit", :limit])
-
-    reset_value =
-      map_value(bucket, [
-        "reset_in_seconds",
-        :reset_in_seconds,
-        "resetInSeconds",
-        :resetInSeconds,
-        "reset_at",
-        :reset_at,
-        "resetAt",
-        :resetAt,
-        "resets_at",
-        :resets_at,
-        "resetsAt",
-        :resetsAt
-      ])
+    remaining = Map.get(bucket, :remaining)
+    limit = Map.get(bucket, :limit)
+    used_percent = Map.get(bucket, :used_percent)
+    window_duration_mins = Map.get(bucket, :window_duration_mins)
 
     base =
       cond do
-        integer_like?(remaining) and integer_like?(limit) ->
+        is_integer(remaining) and is_integer(limit) ->
           "#{format_count(remaining)}/#{format_count(limit)}"
 
-        integer_like?(remaining) ->
+        is_integer(remaining) ->
           "remaining #{format_count(remaining)}"
 
-        integer_like?(limit) ->
+        is_integer(limit) ->
           "limit #{format_count(limit)}"
 
-        map_size(bucket) == 0 ->
-          "n/a"
+        is_number(used_percent) ->
+          "#{format_number(used_percent)}% used"
 
         true ->
-          bucket |> inspect(limit: 6) |> truncate(40)
+          "n/a"
       end
 
-    if is_nil(reset_value) do
-      base
-    else
-      "#{base} reset #{format_reset_value(reset_value)}"
-    end
+    base
+    |> append_window_duration(window_duration_mins)
+    |> append_reset_in_seconds(Map.get(bucket, :reset_in_seconds))
+    |> append_reset_at(Map.get(bucket, :reset_at))
   end
 
-  defp format_rate_limit_bucket(other), do: to_string(other)
+  defp format_rate_limit_bucket(_other), do: "n/a"
 
   defp format_rate_limit_credits(nil), do: "credits n/a"
 
   defp format_rate_limit_credits(credits) when is_map(credits) do
-    unlimited = map_value(credits, ["unlimited", :unlimited]) == true
-    has_credits = map_value(credits, ["has_credits", :has_credits]) == true
-    balance = map_value(credits, ["balance", :balance])
+    unlimited = Map.get(credits, :unlimited) == true
+    has_credits = Map.get(credits, :has_credits)
+    balance = Map.get(credits, :balance)
 
     cond do
       unlimited ->
@@ -1007,19 +985,37 @@ defmodule SymphonyElixir.StatusDashboard do
       has_credits and is_number(balance) ->
         "credits #{format_number(balance)}"
 
-      has_credits ->
+      has_credits == true ->
         "credits available"
 
-      true ->
+      has_credits == false ->
         "credits none"
+
+      is_number(balance) ->
+        "credits #{format_number(balance)}"
+
+      true ->
+        "credits n/a"
     end
   end
 
-  defp format_rate_limit_credits(other), do: "credits #{to_string(other)}"
+  defp format_rate_limit_credits(_other), do: "credits n/a"
 
-  defp format_reset_value(value) when is_integer(value), do: "#{format_count(value)}s"
-  defp format_reset_value(value) when is_binary(value), do: value
-  defp format_reset_value(value), do: to_string(value)
+  defp append_window_duration(base, value) when is_integer(value),
+    do: "#{base} window #{format_count(value)}m"
+
+  defp append_window_duration(base, _value), do: base
+
+  defp append_reset_in_seconds(base, value) when is_integer(value),
+    do: "#{base} reset #{format_count(value)}s"
+
+  defp append_reset_in_seconds(base, _value), do: base
+
+  defp append_reset_at(base, value) when is_integer(value),
+    do: "#{base} reset at #{format_count(value)}"
+
+  defp append_reset_at(base, value) when is_binary(value), do: "#{base} reset at #{value}"
+  defp append_reset_at(base, _value), do: base
 
   defp format_number(value) when is_integer(value), do: format_count(value)
 
@@ -1034,9 +1030,6 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp map_value(_map, _keys), do: nil
-
-  defp integer_like?(value) when is_integer(value), do: true
-  defp integer_like?(_value), do: false
 
   defp status_dot(color_code) do
     colorize("●", color_code)
@@ -1556,28 +1549,27 @@ defmodule SymphonyElixir.StatusDashboard do
   defp append_usage_part(parts, _label, value) when not is_integer(value), do: parts
   defp append_usage_part(parts, label, value), do: parts ++ ["#{label} #{format_count(value)}"]
 
-  defp format_rate_limits_summary(nil), do: "n/a"
+  defp format_rate_limits_summary(rate_limits) do
+    case RateLimitTelemetry.project(rate_limits) do
+      %{} = projected ->
+        primary_text = format_rate_limit_bucket_summary(Map.get(projected, :primary))
+        secondary_text = format_rate_limit_bucket_summary(Map.get(projected, :secondary))
 
-  defp format_rate_limits_summary(rate_limits) when is_map(rate_limits) do
-    primary = map_value(rate_limits, ["primary", :primary])
-    secondary = map_value(rate_limits, ["secondary", :secondary])
+        cond do
+          primary_text != nil and secondary_text != nil -> "primary #{primary_text}; secondary #{secondary_text}"
+          primary_text != nil -> "primary #{primary_text}"
+          secondary_text != nil -> "secondary #{secondary_text}"
+          true -> "n/a"
+        end
 
-    primary_text = format_rate_limit_bucket_summary(primary)
-    secondary_text = format_rate_limit_bucket_summary(secondary)
-
-    cond do
-      primary_text != nil and secondary_text != nil -> "primary #{primary_text}; secondary #{secondary_text}"
-      primary_text != nil -> "primary #{primary_text}"
-      secondary_text != nil -> "secondary #{secondary_text}"
-      true -> "n/a"
+      nil ->
+        "n/a"
     end
   end
 
-  defp format_rate_limits_summary(_rate_limits), do: "n/a"
-
   defp format_rate_limit_bucket_summary(bucket) when is_map(bucket) do
-    used_percent = map_value(bucket, ["usedPercent", :usedPercent])
-    window_mins = map_value(bucket, ["windowDurationMins", :windowDurationMins])
+    used_percent = Map.get(bucket, :used_percent)
+    window_mins = Map.get(bucket, :window_duration_mins)
 
     cond do
       is_number(used_percent) and is_integer(window_mins) ->

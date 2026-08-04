@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Orchestrator do
     ObservabilitySanitizer,
     OperatorCommand,
     OperatorWait,
+    RateLimitTelemetry,
     RunBudget,
     RunLedger,
     StatusDashboard,
@@ -2582,15 +2583,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp rate_limits_from_payload(payload) when is_map(payload) do
     direct = Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits)
 
-    cond do
-      rate_limits_map?(direct) ->
-        direct
-
-      rate_limits_map?(payload) ->
-        payload
-
-      true ->
-        rate_limit_payloads(payload)
+    case RateLimitTelemetry.normalize(direct) || RateLimitTelemetry.normalize(payload) do
+      %{} = rate_limits -> rate_limits
+      nil -> rate_limit_payloads(payload)
     end
   end
 
@@ -2627,24 +2622,6 @@ defmodule SymphonyElixir.Orchestrator do
         {:halt, result}
     end)
   end
-
-  defp rate_limits_map?(payload) when is_map(payload) do
-    limit_id =
-      Map.get(payload, "limit_id") ||
-        Map.get(payload, :limit_id) ||
-        Map.get(payload, "limit_name") ||
-        Map.get(payload, :limit_name)
-
-    has_buckets =
-      Enum.any?(
-        ["primary", :primary, "secondary", :secondary, "credits", :credits],
-        &Map.has_key?(payload, &1)
-      )
-
-    !is_nil(limit_id) and has_buckets
-  end
-
-  defp rate_limits_map?(_payload), do: false
 
   defp explicit_map_at_paths(payload, paths) when is_map(payload) and is_list(paths) do
     Enum.find_value(paths, fn path ->

@@ -5,6 +5,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
+  alias SymphonyElixir.RateLimitTelemetry
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
@@ -114,7 +115,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           </div>
 
-          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
+          <pre class="code-panel"><%= format_rate_limits(@payload.rate_limits) %></pre>
         </section>
 
         <section class="section-card">
@@ -325,6 +326,73 @@ defmodule SymphonyElixirWeb.DashboardLive do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)
   end
 
-  defp pretty_value(nil), do: "n/a"
-  defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
+  defp format_rate_limits(rate_limits) do
+    case RateLimitTelemetry.project(rate_limits) do
+      %{limit_id: limit_id} = projected ->
+        [
+          "limit_id: #{limit_id}",
+          format_rate_limit_bucket("primary", Map.get(projected, :primary)),
+          format_rate_limit_bucket("secondary", Map.get(projected, :secondary)),
+          format_rate_limit_credits(Map.get(projected, :credits))
+        ]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.join("\n")
+
+      nil ->
+        "n/a"
+    end
+  end
+
+  defp format_rate_limit_bucket(_label, nil), do: nil
+
+  defp format_rate_limit_bucket(label, bucket) when is_map(bucket) do
+    details =
+      []
+      |> append_rate_limit_integer("remaining", Map.get(bucket, :remaining))
+      |> append_rate_limit_integer("limit", Map.get(bucket, :limit))
+      |> append_rate_limit_number("used_percent", Map.get(bucket, :used_percent))
+      |> append_rate_limit_integer("window_duration_mins", Map.get(bucket, :window_duration_mins))
+      |> append_rate_limit_integer("reset_in_seconds", Map.get(bucket, :reset_in_seconds))
+      |> append_rate_limit_reset_at(Map.get(bucket, :reset_at))
+
+    "#{label}: #{Enum.join(details, ", ")}"
+  end
+
+  defp format_rate_limit_credits(nil), do: nil
+
+  defp format_rate_limit_credits(credits) when is_map(credits) do
+    details =
+      []
+      |> append_rate_limit_boolean("has_credits", Map.get(credits, :has_credits))
+      |> append_rate_limit_boolean("unlimited", Map.get(credits, :unlimited))
+      |> append_rate_limit_number("balance", Map.get(credits, :balance))
+
+    "credits: #{Enum.join(details, ", ")}"
+  end
+
+  defp append_rate_limit_integer(parts, label, value) when is_integer(value),
+    do: parts ++ ["#{label}=#{Integer.to_string(value)}"]
+
+  defp append_rate_limit_integer(parts, _label, _value), do: parts
+
+  defp append_rate_limit_number(parts, label, value) when is_integer(value),
+    do: parts ++ ["#{label}=#{Integer.to_string(value)}"]
+
+  defp append_rate_limit_number(parts, label, value) when is_float(value),
+    do: parts ++ ["#{label}=#{:erlang.float_to_binary(value, [:compact, decimals: 2])}"]
+
+  defp append_rate_limit_number(parts, _label, _value), do: parts
+
+  defp append_rate_limit_boolean(parts, label, value) when is_boolean(value),
+    do: parts ++ ["#{label}=#{if(value, do: "true", else: "false")}"]
+
+  defp append_rate_limit_boolean(parts, _label, _value), do: parts
+
+  defp append_rate_limit_reset_at(parts, value) when is_integer(value),
+    do: parts ++ ["reset_at=#{Integer.to_string(value)}"]
+
+  defp append_rate_limit_reset_at(parts, value) when is_binary(value),
+    do: parts ++ ["reset_at=#{value}"]
+
+  defp append_rate_limit_reset_at(parts, _value), do: parts
 end

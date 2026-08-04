@@ -446,7 +446,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
+             "rate_limits" => %{
+               "limit_id" => "codex",
+               "primary" => %{"remaining" => 11}
+             }
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
@@ -540,6 +543,160 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert json_response(get(build_conn(), "/api/v1/pause"), 200) == %{
              "dispatch_paused" => true
            }
+  end
+
+  test "rate-limit telemetry is allowlisted across every observability surface" do
+    sentinel = "SENSITIVE-RATE-LIMIT-DO-NOT-EXPOSE<script>"
+    issue_id = "issue-rate-limit-boundary"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-RATE",
+      title: "Rate-limit boundary",
+      description: "Exercise rate-limit observability projections",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-RATE"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :RateLimitBoundaryOrchestrator)
+    {:ok, orchestrator_pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator_pid), do: Process.exit(orchestrator_pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(orchestrator_pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(orchestrator_pid, fn _state ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    raw_rate_limits = %{
+      "limit_id" => "codex",
+      "limit_name" => sentinel,
+      "provider_payload" => sentinel,
+      "primary" => %{
+        "remaining" => 90,
+        "limit" => 1_000_000_000_001,
+        "reset_in_seconds" => 30,
+        "resetAt" => sentinel,
+        "provider_note" => sentinel
+      },
+      "secondary" => %{
+        "usedPercent" => 12.5,
+        "windowDurationMins" => 60,
+        "resetsAt" => 2_000_000_000,
+        "provider_note" => sentinel
+      },
+      "credits" => %{
+        "hasCredits" => true,
+        "unlimited" => false,
+        "balance" => 42.5,
+        "provider_note" => sentinel
+      }
+    }
+
+    send(
+      orchestrator_pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/token_count",
+           "params" => %{
+             "msg" => %{
+               "type" => "event_msg",
+               "payload" => %{
+                 "type" => "token_count",
+                 "provider_payload" => sentinel,
+                 "rate_limits" => raw_rate_limits
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    send(
+      orchestrator_pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "account/rateLimits/updated",
+           "params" => %{
+             "rateLimits" => %{
+               "limit_id" => sentinel,
+               "primary" => %{"remaining" => 1, "provider_note" => sentinel}
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+
+    expected_rate_limits = %{
+      limit_id: "codex",
+      primary: %{remaining: 90, reset_in_seconds: 30},
+      secondary: %{
+        used_percent: 12.5,
+        window_duration_mins: 60,
+        reset_at: 2_000_000_000
+      },
+      credits: %{has_credits: true, unlimited: false, balance: 42.5}
+    }
+
+    assert snapshot.rate_limits == expected_rate_limits
+    refute inspect(snapshot) =~ sentinel
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    terminal =
+      StatusDashboard.format_snapshot_content_for_test({:ok, snapshot}, 0.0, 115)
+
+    assert state_payload["rate_limits"] == %{
+             "limit_id" => "codex",
+             "primary" => %{"remaining" => 90, "reset_in_seconds" => 30},
+             "secondary" => %{
+               "used_percent" => 12.5,
+               "window_duration_mins" => 60,
+               "reset_at" => 2_000_000_000
+             },
+             "credits" => %{"has_credits" => true, "unlimited" => false, "balance" => 42.5}
+           }
+
+    assert html =~ "limit_id: codex"
+    assert terminal =~ "codex"
+
+    for surface <- [Jason.encode!(state_payload), html, terminal] do
+      refute surface =~ sentinel
+    end
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -1010,7 +1167,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         mcp_elicitation_auto_approve: []
       },
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
-      rate_limits: %{"primary" => %{"remaining" => 11}}
+      rate_limits: %{limit_id: "codex", primary: %{remaining: 11}}
     }
   end
 

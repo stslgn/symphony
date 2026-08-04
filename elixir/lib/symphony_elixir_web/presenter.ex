@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, ObservabilitySanitizer, Orchestrator}
+  alias SymphonyElixir.{Config, ObservabilitySanitizer, Orchestrator, RateLimitTelemetry}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -31,7 +31,7 @@ defmodule SymphonyElixirWeb.Presenter do
               mcp_elicitation_auto_approve: []
             }),
           codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: RateLimitTelemetry.project(snapshot.rate_limits)
         }
 
       :timeout ->
