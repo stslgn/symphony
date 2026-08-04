@@ -93,6 +93,12 @@ cursor. An eligible issue is then redispatched with an incremented attempt and
 a new run id. Interrupted attempts keep a durable recovery entry containing the
 original worker host and canonical workspace path until the next claim.
 
+Persisted operator waits reject invalid UTF-8, Unicode controls, empty values,
+and oversized fields before append and recovery. Wait/issue/run ids are capped
+at 128 bytes, issue identifiers at 96, tracker state at 128, worker host at 255,
+and exact workspace path/root affinity at 4096 bytes. Exact affinity is never
+truncated before resume or cleanup.
+
 Human Review and Human Clarification transitions are recorded as durable
 `waiting_owner` operator waits; Deploy Ready is recorded as
 `waiting_live_approval`. The same typed wait model supports secret,
@@ -311,7 +317,11 @@ The observability UI now runs on a minimal Phoenix stack:
   `retrying` also includes durable `resume_queued` and `recovery_queued` rows
   with their next attempt and host/path affinity,
   and parked rows include the stable wait id, typed reason, allowed actions,
-  issue/run identity, worker host, and canonical workspace path.
+  issue/run identity, worker host, and canonical workspace path. JSON and
+  LiveView share one control-safe, stably sorted parked projection with
+  per-field display bounds, a 100-row/65536-byte collection cap, and exact
+  total/returned/omitted truncation metadata; the internal cleanup path remains
+  exact and separate.
 - The state payload and terminal header expose `control.dispatch_paused`.
 - The same state payload exposes the effective capability allowlist names, but
   never credentials, tool arguments, prompts, or response bodies.

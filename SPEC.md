@@ -314,7 +314,17 @@ Fields:
 - `allowed_actions` (bounded list derived from the reason)
 - `issue_id`, `identifier`, `run_id`, and `attempt`
 - `stage`, `tracker_state`, `terminal_reason`, and `parked_at`
-- `worker_host` and canonical `workspace_path` for safe resume on the same execution host
+- `worker_host`, canonical `workspace_path`, and captured `workspace_root` for safe resume or cleanup
+  on the same execution host
+
+Every persisted text field MUST be valid UTF-8, non-empty when present, free of Unicode control
+codepoints, and bounded by encoded byte length. The limits are: `wait_id`, `issue_id`, and `run_id`
+128 bytes each; `identifier` 96 bytes; `tracker_state` 128 bytes; `worker_host` 255 bytes; and exact
+`workspace_path` and `workspace_root` 4096 bytes each. Typed reason/action/stage/terminal fields MUST
+come from their defined allowlists. Invalid or oversized waits MUST be rejected before ledger append
+and during recovery. Exact host/path/root affinity within those limits MUST remain byte-for-byte
+unchanged for resume and destructive cleanup; display projections MUST NOT replace or truncate the
+internal cleanup target.
 
 Operator waits MUST NOT contain prompts, agent output, secrets, private data, or tracker comments.
 
@@ -1532,6 +1542,8 @@ SHOULD return:
   available; any exposed catalog MUST follow the credential-safe bounded contract in Section 10.2
 - `retrying` (list of retry queue rows)
 - `parked` (list of typed operator waits)
+  - Operator surfaces SHOULD share one control-safe, stably sorted projection with per-field byte
+    limits, a row cap, an encoded-row byte cap, and exact total/returned/omitted metadata.
 - `control`
   - `dispatch_paused` (boolean)
 - `capabilities` (effective allowlist names only; no credentials, arguments, prompts, or results)
@@ -1626,6 +1638,10 @@ If implemented:
 - Dashboard and API projections MUST expose categorical event names, bounded identifiers, counts,
   and sanitized error codes only. They MUST NOT expose raw coding-agent payloads, prompts,
   reasoning/message deltas, command arguments, response bodies, or free-form provider errors.
+- Parked-wait projections MUST be shared by the dashboard and JSON API, stably sorted, and bounded
+  independently from the exact internal cleanup affinity. The state count MUST report the exact
+  number of unresolved waits even when the returned list is truncated, and explicit metadata MUST
+  report the row/byte limits plus returned and omitted counts.
 
 Extension config:
 
@@ -1730,6 +1746,15 @@ Minimum endpoints:
           "parked_at": "2026-02-24T20:15:00Z"
         }
       ],
+      "parked_meta": {
+        "total_count": 1,
+        "returned_count": 1,
+        "omitted_count": 0,
+        "truncated": false,
+        "row_limit": 100,
+        "byte_limit": 65536,
+        "returned_bytes": 356
+      },
       "codex_totals": {
         "input_tokens": 5000,
         "output_tokens": 2400,

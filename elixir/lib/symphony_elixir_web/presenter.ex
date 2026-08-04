@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, ObservabilitySanitizer, Orchestrator, RateLimitTelemetry}
+  alias SymphonyElixir.{Config, ObservabilitySanitizer, Orchestrator, ParkedProjection, RateLimitTelemetry}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -12,6 +12,7 @@ defmodule SymphonyElixirWeb.Presenter do
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
         parked = Map.get(snapshot, :parked, [])
+        %{rows: parked_rows, metadata: parked_metadata} = ParkedProjection.collection(parked)
 
         %{
           generated_at: generated_at,
@@ -22,7 +23,8 @@ defmodule SymphonyElixirWeb.Presenter do
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
-          parked: Enum.map(parked, &parked_entry_payload/1),
+          parked: parked_rows,
+          parked_meta: parked_metadata,
           control: Map.get(snapshot, :control, %{dispatch_paused: false}),
           capabilities:
             Map.get(snapshot, :capabilities, %{
@@ -53,7 +55,14 @@ defmodule SymphonyElixirWeb.Presenter do
         if is_nil(running) and is_nil(retry) and is_nil(parked) do
           {:error, :issue_not_found}
         else
-          {:ok, issue_payload_body(issue_identifier, running, retry, parked)}
+          {:ok,
+           issue_payload_body(
+             issue_identifier,
+             running,
+             retry,
+             parked,
+             parked && ParkedProjection.row(parked)
+           )}
         end
 
       _ ->
@@ -102,14 +111,14 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry, parked) do
+  defp issue_payload_body(issue_identifier, running, retry, parked, parked_payload) do
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry, parked),
+      issue_id: issue_id_from_entries(running, retry, parked_payload),
       status: issue_status(running, retry, parked),
       workspace: %{
-        path: workspace_path(issue_identifier, running, retry, parked),
-        host: workspace_host(running, retry, parked)
+        path: workspace_path(issue_identifier, running, retry, parked_payload),
+        host: workspace_host(running, retry, parked_payload)
       },
       attempts: %{
         restart_count: restart_count(retry),
@@ -117,7 +126,7 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       running: running && running_issue_payload(running),
       retry: retry && retry_issue_payload(retry),
-      parked: parked && parked_issue_payload(parked),
+      parked: parked_payload,
       logs: %{
         codex_session_logs: []
       },
@@ -178,24 +187,6 @@ defmodule SymphonyElixirWeb.Presenter do
     maybe_add_durable_queue_metadata(payload, entry)
   end
 
-  defp parked_entry_payload(entry) do
-    %{
-      issue_id: entry.issue_id,
-      issue_identifier: entry.identifier,
-      wait_id: entry.wait_id,
-      reason: entry.reason,
-      allowed_actions: entry.allowed_actions,
-      tracker_state: entry.tracker_state,
-      run_id: entry.run_id,
-      attempt: entry.attempt,
-      stage: entry.stage,
-      terminal_reason: Map.get(entry, :terminal_reason),
-      worker_host: Map.get(entry, :worker_host),
-      workspace_path: Map.get(entry, :workspace_path),
-      parked_at: iso8601(entry.parked_at)
-    }
-  end
-
   defp running_issue_payload(running) do
     %{
       worker_host: Map.get(running, :worker_host),
@@ -245,22 +236,6 @@ defmodule SymphonyElixirWeb.Presenter do
       resolved: Map.get(entry, :resolved_model),
       reasoning_effort: Map.get(entry, :reasoning_effort),
       catalog_source: Map.get(entry, :model_catalog_source)
-    }
-  end
-
-  defp parked_issue_payload(parked) do
-    %{
-      wait_id: parked.wait_id,
-      reason: parked.reason,
-      allowed_actions: parked.allowed_actions,
-      tracker_state: parked.tracker_state,
-      run_id: parked.run_id,
-      attempt: parked.attempt,
-      stage: parked.stage,
-      terminal_reason: Map.get(parked, :terminal_reason),
-      worker_host: Map.get(parked, :worker_host),
-      workspace_path: Map.get(parked, :workspace_path),
-      parked_at: iso8601(parked.parked_at)
     }
   end
 

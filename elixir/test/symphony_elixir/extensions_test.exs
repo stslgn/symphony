@@ -455,9 +455,19 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "terminal_reason" => "turn_budget_exhausted",
                  "worker_host" => nil,
                  "workspace_path" => nil,
-                 "parked_at" => state_payload["parked"] |> List.first() |> Map.fetch!("parked_at")
+                 "parked_at" => state_payload["parked"] |> List.first() |> Map.fetch!("parked_at"),
+                 "truncated_fields" => []
                }
              ],
+             "parked_meta" => %{
+               "total_count" => 1,
+               "returned_count" => 1,
+               "omitted_count" => 0,
+               "truncated" => false,
+               "row_limit" => 100,
+               "byte_limit" => 65_536,
+               "returned_bytes" => state_payload["parked_meta"]["returned_bytes"]
+             },
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -1230,6 +1240,136 @@ defmodule SymphonyElixir.ExtensionsTest do
       rendered =~ "MT-PARKED-REFRESHED" and rendered =~ "wait-refreshed" and
         not String.contains?(rendered, "MT-PARKED</span>")
     end)
+  end
+
+  test "parked API and LiveView share bounded control-safe sorted collection projection" do
+    orchestrator_name = Module.concat(__MODULE__, :BoundedParkedDashboardOrchestrator)
+    long_path = "/srv/" <> String.duplicate("long-segment/", 80)
+
+    regular_waits =
+      for index <- 1..127 do
+        %{
+          issue_id: "issue-#{index}",
+          identifier: "MT-#{String.pad_leading(Integer.to_string(index), 3, "0")}",
+          wait_id: "wait-#{index}",
+          reason: "waiting_owner",
+          allowed_actions: ["approve", "reject"],
+          tracker_state: "Human Review",
+          run_id: "run-#{index}",
+          attempt: index,
+          stage: "parked",
+          terminal_reason: nil,
+          worker_host: "worker-a",
+          workspace_path: "/srv/symphony/MT-#{index}",
+          parked_at: DateTime.utc_now()
+        }
+      end
+
+    adversarial_waits = [
+      %{
+        issue_id: "issue-control",
+        identifier: "AB\nCONTROL",
+        wait_id: "wait-control",
+        reason: "free_form_reason",
+        allowed_actions: ["destroy"],
+        tracker_state: "Human\e]0;title",
+        run_id: "run-control",
+        attempt: -1,
+        stage: "free_form_stage",
+        terminal_reason: "free_form_terminal",
+        worker_host: "worker\tcontrol",
+        workspace_path: <<0xFF>>,
+        parked_at: DateTime.utc_now()
+      },
+      %{
+        issue_id: "issue-bounded",
+        identifier: "AA-BOUNDED",
+        wait_id: "wait-bounded",
+        reason: "waiting_infrastructure",
+        allowed_actions: ["retry", "reject"],
+        tracker_state: "Blocked",
+        run_id: "run-bounded",
+        attempt: 2,
+        stage: "parked",
+        terminal_reason: "time_budget_exhausted",
+        worker_host: "worker-b",
+        workspace_path: long_path,
+        parked_at: DateTime.utc_now()
+      },
+      %{
+        issue_id: "issue-sort-first",
+        identifier: "AA-000",
+        wait_id: "wait-sort-first",
+        reason: "waiting_secret",
+        allowed_actions: ["retry", "reject"],
+        tracker_state: "Blocked",
+        run_id: "run-sort-first",
+        attempt: 1,
+        stage: "parked",
+        terminal_reason: nil,
+        parked_at: DateTime.utc_now()
+      }
+    ]
+
+    snapshot =
+      static_snapshot()
+      |> Map.put(:running, [])
+      |> Map.put(:retrying, [])
+      |> Map.put(:parked, regular_waits ++ adversarial_waits)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    assert state_payload["counts"]["parked"] == 130
+
+    assert state_payload["parked_meta"] == %{
+             "total_count" => 130,
+             "returned_count" => 100,
+             "omitted_count" => 30,
+             "truncated" => true,
+             "row_limit" => 100,
+             "byte_limit" => 65_536,
+             "returned_bytes" => state_payload["parked_meta"]["returned_bytes"]
+           }
+
+    assert state_payload["parked_meta"]["returned_bytes"] <= 65_536
+    assert length(state_payload["parked"]) == 100
+    assert hd(state_payload["parked"])["issue_identifier"] == "AA-000"
+
+    control_row = Enum.find(state_payload["parked"], &(&1["wait_id"] == "wait-control"))
+    assert control_row["issue_identifier"] == "AB\\nCONTROL"
+    assert control_row["tracker_state"] == "Human\\u{1B}]0;title"
+    assert control_row["worker_host"] == "worker\\tcontrol"
+    assert control_row["workspace_path"] == "invalid-utf8"
+    assert control_row["reason"] == nil
+    assert control_row["allowed_actions"] == []
+    assert control_row["attempt"] == nil
+    assert control_row["stage"] == nil
+    assert control_row["terminal_reason"] == nil
+
+    bounded_issue = json_response(get(build_conn(), "/api/v1/AA-BOUNDED"), 200)
+    assert byte_size(bounded_issue["parked"]["workspace_path"]) <= 512
+    assert bounded_issue["workspace"]["path"] == bounded_issue["parked"]["workspace_path"]
+    assert "workspace_path" in bounded_issue["parked"]["truncated_fields"]
+    refute bounded_issue["parked"]["workspace_path"] == long_path
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "Showing 100 of 130 parked waits; 30 omitted by the bounded projection."
+    assert html =~ "AA-000"
+    assert html =~ "AB\\nCONTROL"
+    assert html =~ "invalid-utf8"
+    assert html =~ "display truncated"
+    refute html =~ long_path
+    refute html =~ <<0xFF>>
+    refute html =~ "destroy"
+    refute html =~ "free_form_reason"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do

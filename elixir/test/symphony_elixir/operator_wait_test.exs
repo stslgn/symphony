@@ -59,6 +59,55 @@ defmodule SymphonyElixir.OperatorWaitTest do
     assert {:error, :invalid_wait_reason} = OperatorWait.new(nil, %{})
   end
 
+  test "rejects oversized, control-bearing, invalid UTF-8, and untyped wait fields" do
+    assert OperatorWait.persisted_field_limits() == %{
+             "issue_id" => 128,
+             "issue_identifier" => 96,
+             "run_id" => 128,
+             "tracker_state" => 128,
+             "wait_id" => 128,
+             "worker_host" => 255,
+             "workspace_path" => 4_096,
+             "workspace_root" => 4_096
+           }
+
+    valid = %{
+      wait_id: "wait-bounded",
+      issue_id: "issue-bounded",
+      identifier: "DUD-BOUNDED",
+      run_id: "run-bounded",
+      attempt: 1,
+      tracker_state: "Human Review",
+      worker_host: "worker-a",
+      workspace_path: "/srv/symphony/DUD-BOUNDED",
+      workspace_root: "/srv/symphony"
+    }
+
+    exact_path = "/" <> String.duplicate("p", 4_095)
+    assert {:ok, wait} = OperatorWait.new("waiting_owner", %{valid | workspace_path: exact_path})
+    assert wait.workspace_path == exact_path
+
+    invalid_fields = [
+      {:wait_id, String.duplicate("w", 129), "wait_id"},
+      {:identifier, "DUD-\nCONTROL", "issue_identifier"},
+      {:tracker_state, <<0xFF>>, "tracker_state"},
+      {:worker_host, String.duplicate("h", 256), "worker_host"},
+      {:workspace_path, "/tmp/unsafe\e]0;title", "workspace_path"},
+      {:workspace_root, String.duplicate("r", 4_097), "workspace_root"}
+    ]
+
+    Enum.each(invalid_fields, fn {field, value, persisted_field} ->
+      assert {:error, {:invalid_wait_field, ^persisted_field}} =
+               OperatorWait.new("waiting_owner", Map.put(valid, field, value))
+    end)
+
+    assert {:error, {:invalid_wait_field, "stage"}} =
+             OperatorWait.new("waiting_owner", Map.put(valid, :stage, "retrying"))
+
+    assert {:error, {:invalid_wait_field, "terminal_reason"}} =
+             OperatorWait.new("waiting_owner", Map.put(valid, :terminal_reason, "free_form"))
+  end
+
   test "restores only complete ledger waits with valid timestamps" do
     event = %{
       "parked_reason" => "waiting_owner",
@@ -67,7 +116,7 @@ defmodule SymphonyElixir.OperatorWaitTest do
       "issue_identifier" => "DUD-1",
       "run_id" => "run-1",
       "attempt" => 1,
-      "stage" => "human_review",
+      "stage" => "parked",
       "tracker_state" => "Human Review",
       "terminal_reason" => "turn_budget_exhausted",
       "worker_host" => "worker-a",

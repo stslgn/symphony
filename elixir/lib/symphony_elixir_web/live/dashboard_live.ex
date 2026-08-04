@@ -226,6 +226,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <%= if @payload.parked == [] do %>
             <p class="empty-state">No unresolved operator waits.</p>
           <% else %>
+            <p :if={@payload.parked_meta.truncated} class="empty-state">
+              Showing <%= @payload.parked_meta.returned_count %> of <%= @payload.parked_meta.total_count %> parked waits; <%= @payload.parked_meta.omitted_count %> omitted by the bounded projection.
+            </p>
             <div class="table-wrap">
               <table class="data-table data-table-parked">
                 <thead>
@@ -265,6 +268,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <span class="mono bounded-value" title={entry.workspace_path || "n/a"}>
                         <%= entry.workspace_path || "n/a" %>
+                      </span>
+                      <span :if={"workspace_path" in entry.truncated_fields} class="muted">
+                        display truncated
                       </span>
                     </td>
                     <td class="mono"><%= entry.parked_at || "n/a" %></td>

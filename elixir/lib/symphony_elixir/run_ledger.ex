@@ -788,7 +788,14 @@ defmodule SymphonyElixir.RunLedger do
         {:error, {:invalid_field, "allowed_actions"}}
 
       true ->
-        :ok
+        validate_wait_persisted_fields(event)
+    end
+  end
+
+  defp validate_wait_persisted_fields(event) do
+    case SymphonyElixir.OperatorWait.validate_persisted_fields(event) do
+      :ok -> :ok
+      {:error, {:invalid_wait_field, field}} -> {:error, {:invalid_field, field}}
     end
   end
 

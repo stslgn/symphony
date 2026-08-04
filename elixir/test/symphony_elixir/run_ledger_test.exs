@@ -136,6 +136,37 @@ defmodule SymphonyElixir.RunLedgerTest do
              RunLedger.reconcile_startup(path, "runner-new")
   end
 
+  test "rejects unsafe parked fields before append and during recovery" do
+    invalid_events = [
+      {:tracker_state, "tracker_state", <<0xFF>>},
+      {:worker_host, "worker_host", "worker\ncontrol"},
+      {:workspace_path, "workspace_path", String.duplicate("p", 4_097)},
+      {:workspace_root, "workspace_root", "/tmp/root\e]0;title"}
+    ]
+
+    Enum.each(invalid_events, fn {field, persisted_field, value} ->
+      path = ledger_path()
+      append_parked_predecessors!(path, "run-unsafe", "issue-unsafe")
+
+      event = Map.put(valid_parked_event("run-unsafe", "issue-unsafe"), field, value)
+      assert {:error, {:invalid_field, ^persisted_field}} = RunLedger.append(path, event)
+      assert {:ok, [_claim, _started]} = RunLedger.read_events(path)
+    end)
+
+    path = ledger_path()
+    append_parked_run!(path, "run-oversized-recovery", "issue-oversized-recovery")
+    [claim, started, parked] = valid_records(path)
+
+    rewrite_records!(path, [
+      claim,
+      started,
+      Map.put(parked, "workspace_path", String.duplicate("p", 4_097))
+    ])
+
+    assert {:error, {:invalid_ledger_record, 3, {:invalid_field, "workspace_path"}}} =
+             RunLedger.reconcile_startup(path, "runner-new")
+  end
+
   test "fails startup closed when a terminal tail record is corrupted" do
     path = ledger_path()
 
@@ -889,24 +920,31 @@ defmodule SymphonyElixir.RunLedgerTest do
   end
 
   defp append_parked_run!(path, run_id, issue_id) do
+    append_parked_predecessors!(path, run_id, issue_id)
+
+    assert :ok = RunLedger.append(path, valid_parked_event(run_id, issue_id))
+  end
+
+  defp append_parked_predecessors!(path, run_id, issue_id) do
     assert :ok =
              append_claim!(path, run_id, issue_id, "DUD-SEMANTIC-MIDDLE", 1)
 
     assert :ok =
              append_started!(path, run_id, issue_id, "DUD-SEMANTIC-MIDDLE", 1)
+  end
 
-    assert :ok =
-             RunLedger.append(path, %{
-               transition: "run_parked",
-               stage: "parked",
-               run_id: run_id,
-               issue_id: issue_id,
-               issue_identifier: "DUD-SEMANTIC-MIDDLE",
-               attempt: 1,
-               wait_id: "wait-semantic-middle",
-               parked_reason: "waiting_owner",
-               allowed_actions: ["approve", "reject"]
-             })
+  defp valid_parked_event(run_id, issue_id) do
+    %{
+      transition: "run_parked",
+      stage: "parked",
+      run_id: run_id,
+      issue_id: issue_id,
+      issue_identifier: "DUD-SEMANTIC-MIDDLE",
+      attempt: 1,
+      wait_id: "wait-semantic-middle",
+      parked_reason: "waiting_owner",
+      allowed_actions: ["approve", "reject"]
+    }
   end
 
   defp append_claim!(path, run_id, issue_id, issue_identifier, attempt, opts \\ []) do
