@@ -959,10 +959,16 @@ defmodule SymphonyElixir.CoreTest do
       File.mkdir_p!(test_root)
       File.mkdir_p!(workspace)
 
+      parent = self()
+      shutdown_marker = Path.join(workspace, "worker-shutdown-established")
+
       agent_pid =
         spawn(fn ->
+          Process.flag(:trap_exit, true)
+
           receive do
-            :stop -> :ok
+            {:EXIT, _from, :shutdown} ->
+              send(parent, {:worker_shutdown_write, File.write(shutdown_marker, "stopped")})
           end
         end)
 
@@ -992,6 +998,7 @@ defmodule SymphonyElixir.CoreTest do
 
       updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
 
+      assert_receive {:worker_shutdown_write, :ok}
       refute Map.has_key?(updated_state.running, issue_id)
       refute MapSet.member?(updated_state.claimed, issue_id)
       refute Process.alive?(agent_pid)
@@ -1080,7 +1087,18 @@ defmodule SymphonyElixir.CoreTest do
       )
 
       File.mkdir_p!(workspace)
-      agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+      parent = self()
+      shutdown_marker = Path.join(workspace, "worker-shutdown-established")
+
+      agent_pid =
+        spawn(fn ->
+          Process.flag(:trap_exit, true)
+
+          receive do
+            {:EXIT, _from, :shutdown} ->
+              send(parent, {:worker_shutdown_write, File.write(shutdown_marker, "stopped")})
+          end
+        end)
 
       running_entry = %{
         pid: agent_pid,
@@ -1115,6 +1133,7 @@ defmodule SymphonyElixir.CoreTest do
         |> Map.put(:run_ledger_path, valid_path)
         |> Orchestrator.retry_pending_terminal_transitions_for_test()
 
+      assert_receive {:worker_shutdown_write, :ok}
       refute Map.has_key?(recovered_state.running, issue_id)
       refute MapSet.member?(recovered_state.claimed, issue_id)
       refute Process.alive?(agent_pid)

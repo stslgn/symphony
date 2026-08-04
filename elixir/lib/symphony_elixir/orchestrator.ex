@@ -167,7 +167,12 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       issue_id ->
-        running_entry = Map.fetch!(state.running, issue_id)
+        running_entry =
+          state.running
+          |> Map.fetch!(issue_id)
+          |> Map.put(:worker_exit_established, true)
+
+        state = %{state | running: Map.put(state.running, issue_id, running_entry)}
         session_id = running_entry_session_id(running_entry)
 
         state =
@@ -636,7 +641,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp stop_running_entry(running_entry) do
     cancel_run_budget_timer(running_entry)
-    if is_pid(running_entry[:pid]), do: terminate_task(running_entry.pid)
+
+    if is_pid(running_entry[:pid]) and
+         not Map.get(running_entry, :worker_exit_established, false) and
+         Process.alive?(running_entry.pid) do
+      :ok = terminate_task(running_entry.pid)
+    end
+
     if is_reference(running_entry[:ref]), do: Process.demonitor(running_entry.ref, [:flush])
     :ok
   end
@@ -756,16 +767,35 @@ defmodule SymphonyElixir.Orchestrator do
   defp last_activity_timestamp(_running_entry), do: nil
 
   defp terminate_task(pid) when is_pid(pid) do
+    exit_ref = Process.monitor(pid)
+
     case Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, pid) do
       :ok ->
-        :ok
+        await_worker_exit(pid, exit_ref)
 
       {:error, :not_found} ->
         Process.exit(pid, :shutdown)
+        await_worker_exit(pid, exit_ref)
     end
   end
 
   defp terminate_task(_pid), do: :ok
+
+  defp await_worker_exit(pid, exit_ref) do
+    receive do
+      {:DOWN, ^exit_ref, :process, ^pid, _reason} ->
+        :ok
+    after
+      5_000 ->
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^exit_ref, :process, ^pid, _reason} -> :ok
+        after
+          1_000 -> {:error, :worker_exit_timeout}
+        end
+    end
+  end
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
@@ -2018,6 +2048,7 @@ defmodule SymphonyElixir.Orchestrator do
     updated_entry =
       running_entry
       |> Map.put(:worker_exited_while_terminal_pending, true)
+      |> Map.put(:worker_exit_established, true)
       |> Map.put(:run_budget_timer_ref, nil)
 
     %{state | running: Map.put(state.running, issue_id, updated_entry)}
@@ -2048,6 +2079,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp apply_terminal_success(state, issue_id, running_entry, action) do
+    stop_running_entry(running_entry)
     {_popped_entry, state} = pop_running_entry(state, issue_id)
     state = record_session_completion_totals(state, running_entry)
 
@@ -2066,8 +2098,6 @@ defmodule SymphonyElixir.Orchestrator do
         if cleanup_workspace do
           cleanup_issue_workspace(running_entry.identifier, worker_host)
         end
-
-        stop_running_entry(running_entry)
 
         state = %{
           state
