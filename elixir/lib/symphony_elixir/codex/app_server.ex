@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.Codex.{CapabilityPolicy, DynamicTool}
+  alias SymphonyElixir.Codex.{CapabilityPolicy, DynamicTool, ModelCatalog}
   alias SymphonyElixir.{Config, PathSafety, SSH}
 
   @initialize_id 1
@@ -23,6 +23,9 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
+          resolved_model: String.t() | nil,
+          reasoning_effort: String.t() | nil,
+          model_catalog: ModelCatalog.t(),
           session_title: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil
@@ -72,8 +75,16 @@ defmodule SymphonyElixir.Codex.AppServer do
       metadata = port |> port_metadata(worker_host) |> Map.put(:session_title, session_title)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies, session_title) do
+           {:ok, thread} <- do_start_session(port, expanded_workspace, session_policies, session_title) do
         capability_policy = CapabilityPolicy.new(session_policies)
+
+        metadata =
+          Map.merge(metadata, %{
+            resolved_model: thread.resolved_model,
+            reasoning_effort: thread.reasoning_effort,
+            model_catalog_source: Atom.to_string(thread.model_catalog.source),
+            model_catalog: ModelCatalog.payload(thread.model_catalog)
+          })
 
         {:ok,
          %{
@@ -84,7 +95,10 @@ defmodule SymphonyElixir.Codex.AppServer do
            capability_policy: capability_policy,
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
-           thread_id: thread_id,
+           thread_id: thread.thread_id,
+           resolved_model: thread.resolved_model,
+           reasoning_effort: thread.reasoning_effort,
+           model_catalog: thread.model_catalog,
            session_title: session_title,
            workspace: expanded_workspace,
            worker_host: worker_host
@@ -107,6 +121,9 @@ defmodule SymphonyElixir.Codex.AppServer do
           capability_policy: capability_policy,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
+          resolved_model: resolved_model,
+          reasoning_effort: reasoning_effort,
+          model_catalog: model_catalog,
           session_title: session_title,
           workspace: workspace
         },
@@ -140,7 +157,11 @@ defmodule SymphonyElixir.Codex.AppServer do
             session_id: session_id,
             thread_id: thread_id,
             turn_id: turn_id,
-            session_title: session_title
+            session_title: session_title,
+            resolved_model: resolved_model,
+            reasoning_effort: reasoning_effort,
+            model_catalog_source: Atom.to_string(model_catalog.source),
+            model_catalog: ModelCatalog.payload(model_catalog)
           },
           metadata
         )
@@ -155,7 +176,10 @@ defmodule SymphonyElixir.Codex.AppServer do
                session_id: session_id,
                thread_id: thread_id,
                turn_id: turn_id,
-               session_title: session_title
+               session_title: session_title,
+               resolved_model: resolved_model,
+               reasoning_effort: reasoning_effort,
+               model_catalog: ModelCatalog.payload(model_catalog)
              }}
 
           {:error, reason} ->
@@ -313,9 +337,37 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp do_start_session(port, workspace, session_policies, session_title) do
-    case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies, session_title)
-      {:error, reason} -> {:error, reason}
+    with :ok <- send_initialize(port),
+         model_catalog <- discover_model_catalog(port),
+         {:ok, thread} <- start_thread(port, workspace, session_policies, session_title),
+         :ok <-
+           ModelCatalog.validate_resolution(
+             model_catalog,
+             thread.resolved_model,
+             thread.reasoning_effort
+           ) do
+      {:ok, Map.put(thread, :model_catalog, model_catalog)}
+    end
+  end
+
+  defp discover_model_catalog(port) do
+    if Application.get_env(:symphony_elixir, :codex_model_discovery_enabled, true) do
+      request_fun = fn request_id, method, params ->
+        send_message(port, %{"method" => method, "id" => request_id, "params" => params})
+        await_response(port, request_id)
+      end
+
+      case ModelCatalog.discover(request_fun) do
+        {:ok, catalog} ->
+          catalog
+
+        {:error, reason} ->
+          error_code = ModelCatalog.error_code(reason)
+          Logger.warning("Codex model discovery unavailable: reason=#{error_code}")
+          ModelCatalog.unavailable(reason)
+      end
+    else
+      ModelCatalog.unavailable(:disabled)
     end
   end
 
@@ -342,10 +394,18 @@ defmodule SymphonyElixir.Codex.AppServer do
     })
 
     case await_response(port, @thread_start_id) do
-      {:ok, %{"thread" => thread_payload}} ->
+      {:ok, %{"thread" => thread_payload} = response} ->
         case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
+          %{"id" => thread_id} ->
+            {:ok,
+             %{
+               thread_id: thread_id,
+               resolved_model: bounded_runtime_value(Map.get(response, "model"), 160),
+               reasoning_effort: bounded_runtime_value(Map.get(response, "reasoningEffort"), 64)
+             }}
+
+          _ ->
+            {:error, {:invalid_thread_payload, thread_payload}}
         end
 
       other ->
@@ -1336,6 +1396,19 @@ defmodule SymphonyElixir.Codex.AppServer do
       value
     end
   end
+
+  defp bounded_runtime_value(value, max_length) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    if trimmed != "" and String.length(trimmed) <= max_length and
+         not String.contains?(trimmed, ["\n", "\r", <<0>>]) do
+      trimmed
+    else
+      nil
+    end
+  end
+
+  defp bounded_runtime_value(_value, _max_length), do: nil
 
   defp stop_port(port) when is_port(port) do
     case :erlang.port_info(port) do

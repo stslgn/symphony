@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.RunLedger
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -46,6 +48,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     started_at = DateTime.utc_now()
 
     running_entry = %{
+      run_id: "run-model-snapshot",
       pid: self(),
       ref: make_ref(),
       identifier: issue.identifier,
@@ -73,6 +76,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
        %{
          event: :session_started,
          session_id: "thread-live-turn-live",
+         resolved_model: "gpt-live",
+         reasoning_effort: "high",
+         model_catalog_source: "live",
+         model_catalog: %{
+           source: "live",
+           default_model: "gpt-live",
+           fetched_at: "2026-08-04T07:00:00Z",
+           error: nil,
+           models: []
+         },
          timestamp: now
        }}
     )
@@ -91,6 +104,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert %{running: [snapshot_entry]} = snapshot
     assert snapshot_entry.issue_id == issue_id
     assert snapshot_entry.session_id == "thread-live-turn-live"
+    assert snapshot_entry.resolved_model == "gpt-live"
+    assert snapshot_entry.reasoning_effort == "high"
+    assert snapshot_entry.model_catalog_source == "live"
+    assert snapshot_entry.model_catalog.source == "live"
     assert snapshot_entry.turn_count == 1
     assert snapshot_entry.last_codex_timestamp == now
 
@@ -99,6 +116,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              message: %{method: "some-event"},
              timestamp: now
            }
+
+    assert {:ok, events} = RunLedger.read_events(initial_state.run_ledger_path)
+
+    assert Enum.any?(events, fn event ->
+             event["transition"] == "model_resolved" and
+               event["run_id"] == "run-model-snapshot" and
+               event["resolved_model"] == "gpt-live" and
+               event["reasoning_effort"] == "high" and
+               event["model_catalog_source"] == "live"
+           end)
   end
 
   test "orchestrator ignores stale worker updates from a previous run id" do

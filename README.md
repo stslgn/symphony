@@ -18,6 +18,12 @@ The Elixir implementation also supports durable operator commands and a global
 dispatch pause so operators can stop or resume work without losing restart
 reconciliation or bypassing normal eligibility checks.
 
+At worker startup it discovers the authenticated Codex model catalog from the
+live app-server, records the model and reasoning effort actually selected for
+the thread, and rejects an incompatible live pair before sending the first
+prompt. Catalog discovery is best-effort so older app-server versions remain
+usable.
+
 ## Running Symphony
 
 ### Requirements

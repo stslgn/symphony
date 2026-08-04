@@ -84,8 +84,9 @@ Optional flags:
 Symphony also writes an append-only `run-ledger.jsonl` beside the application
 log. The file is kept at mode `0600` and contains only bounded run identity,
 attempt, stage, workspace, terminal-reason, operator-command outcome/cursor,
-and dispatch-control fields. It never stores prompts, agent output, credentials,
-or comment bodies. At startup, Symphony closes unfinished attempts from the
+dispatch-control, and resolved model fields. It never stores prompts, agent
+output, credentials, catalog response details, or comment bodies. At startup,
+Symphony closes unfinished attempts from the
 previous runner generation before the first poll, restores unresolved waits and
 dispatch pause, and resumes each operator comment cursor. An eligible issue is
 then redispatched with an incremented attempt and a new run id.
@@ -147,6 +148,15 @@ Notes:
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
   unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
   Symphony validation.
+- After app-server initialization, Symphony requests the authenticated `model/list` catalog on the
+  same connection. It then records the model and reasoning effort returned by `thread/start` and,
+  when the catalog is live, validates that pair before the first `turn/start`.
+- Catalog discovery is best-effort: unavailable, malformed, or unsupported `model/list` responses
+  are reported as `source=unavailable` and do not prevent older app-server versions from running.
+  A successfully fetched live catalog is authoritative for the current session.
+- Model observability is intentionally limited to model identifiers, supported reasoning efforts,
+  default/upgrade metadata, and a bounded failure code. Symphony never calls app-server
+  `config/read` for discovery because effective config can contain MCP credentials.
 - `agent.max_turns` is a hard attempt limit on back-to-back Codex turns. If the final allowed turn
   completes while the issue is still active, Symphony parks the run instead of scheduling an
   automatic continuation. Default: `20`.

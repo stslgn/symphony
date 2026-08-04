@@ -14,12 +14,18 @@ defmodule SymphonyElixir.RunLedgerTest do
                issue_id: "issue-1",
                issue_identifier: "DUD-1",
                attempt: 0,
+               resolved_model: "gpt-live",
+               reasoning_effort: "high",
+               model_catalog_source: "live",
                error_summary: "provider response must not persist",
                raw_prompt: "must not persist"
              })
 
     assert {:ok, [event]} = RunLedger.read_events(path)
     assert event["transition"] == "run_started"
+    assert event["resolved_model"] == "gpt-live"
+    assert event["reasoning_effort"] == "high"
+    assert event["model_catalog_source"] == "live"
     refute Map.has_key?(event, "error_summary")
     refute Map.has_key?(event, "raw_prompt")
 

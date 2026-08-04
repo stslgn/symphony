@@ -239,6 +239,7 @@ defmodule SymphonyElixir.Orchestrator do
 
           state =
             state
+            |> maybe_record_model_resolution(running_entry, updated_running_entry)
             |> apply_codex_token_delta(token_delta)
             |> apply_codex_rate_limits(update)
             |> Map.put(:running, Map.put(running, issue_id, updated_running_entry))
@@ -1012,6 +1013,10 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: nil,
           session_id: nil,
           session_title: nil,
+          resolved_model: nil,
+          reasoning_effort: nil,
+          model_catalog_source: nil,
+          model_catalog: nil,
           last_codex_message: nil,
           last_codex_timestamp: nil,
           last_codex_event: nil,
@@ -1616,6 +1621,10 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
           session_title: Map.get(metadata, :session_title),
+          resolved_model: Map.get(metadata, :resolved_model),
+          reasoning_effort: Map.get(metadata, :reasoning_effort),
+          model_catalog_source: Map.get(metadata, :model_catalog_source),
+          model_catalog: Map.get(metadata, :model_catalog),
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
@@ -1726,6 +1735,10 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
         session_title: session_title_for_update(Map.get(running_entry, :session_title), update),
+        resolved_model: resolved_model_for_update(Map.get(running_entry, :resolved_model), update),
+        reasoning_effort: reasoning_effort_for_update(Map.get(running_entry, :reasoning_effort), update),
+        model_catalog_source: model_catalog_source_for_update(Map.get(running_entry, :model_catalog_source), update),
+        model_catalog: model_catalog_for_update(Map.get(running_entry, :model_catalog), update),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
@@ -1742,6 +1755,21 @@ defmodule SymphonyElixir.Orchestrator do
       token_delta
     }
   end
+
+  defp maybe_record_model_resolution(
+         %State{} = state,
+         previous_running_entry,
+         %{resolved_model: resolved_model} = updated_running_entry
+       )
+       when is_binary(resolved_model) do
+    if is_binary(Map.get(previous_running_entry, :resolved_model)) do
+      state
+    else
+      record_run_event(state, updated_running_entry, "model_resolved", "running")
+    end
+  end
+
+  defp maybe_record_model_resolution(%State{} = state, _previous, _updated), do: state
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),
@@ -1765,6 +1793,23 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_title
 
   defp session_title_for_update(existing, _update), do: existing
+
+  defp resolved_model_for_update(_existing, %{resolved_model: model}) when is_binary(model), do: model
+  defp resolved_model_for_update(existing, _update), do: existing
+
+  defp reasoning_effort_for_update(_existing, %{reasoning_effort: effort}) when is_binary(effort),
+    do: effort
+
+  defp reasoning_effort_for_update(existing, _update), do: existing
+
+  defp model_catalog_source_for_update(_existing, %{model_catalog_source: source})
+       when is_binary(source),
+       do: source
+
+  defp model_catalog_source_for_update(existing, _update), do: existing
+
+  defp model_catalog_for_update(_existing, %{model_catalog: catalog}) when is_map(catalog), do: catalog
+  defp model_catalog_for_update(existing, _update), do: existing
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,
@@ -1852,6 +1897,9 @@ defmodule SymphonyElixir.Orchestrator do
       attempt: Map.get(running_entry, :retry_attempt, 0),
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
+      resolved_model: Map.get(running_entry, :resolved_model),
+      reasoning_effort: Map.get(running_entry, :reasoning_effort),
+      model_catalog_source: Map.get(running_entry, :model_catalog_source),
       terminal_reason: Keyword.get(extra, :terminal_reason)
     }
   end
@@ -2342,8 +2390,6 @@ defmodule SymphonyElixir.Orchestrator do
         state
     end
   end
-
-  defp apply_codex_rate_limits(state, _update), do: state
 
   defp apply_token_delta(codex_totals, token_delta) do
     input_tokens = Map.get(codex_totals, :input_tokens, 0) + token_delta.input_tokens
