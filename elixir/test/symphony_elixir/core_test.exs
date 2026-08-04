@@ -983,6 +983,133 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "completion ledger failure retains claim and blocks continuation until persisted" do
+    issue_id = "issue-terminal-completion"
+    ref = make_ref()
+    blocked_path = blocked_ledger_path()
+    valid_path = ledger_path("completion-retry")
+    state = terminal_transition_state(issue_id, ref, blocked_path, retry_attempt: 3)
+
+    assert {:noreply, blocked_state} =
+             Orchestrator.handle_info({:DOWN, ref, :process, self(), :normal}, state)
+
+    assert blocked_state.running[issue_id].terminal_pending.transition == "run_completed"
+    assert MapSet.member?(blocked_state.claimed, issue_id)
+    refute MapSet.member?(blocked_state.completed, issue_id)
+    refute Map.has_key?(blocked_state.retry_attempts, issue_id)
+
+    recovered_state =
+      blocked_state
+      |> Map.put(:run_ledger_path, valid_path)
+      |> Orchestrator.retry_pending_terminal_transitions_for_test()
+
+    refute Map.has_key?(recovered_state.running, issue_id)
+    assert MapSet.member?(recovered_state.completed, issue_id)
+    assert recovered_state.retry_attempts[issue_id].attempt == 1
+
+    assert {:ok, events} = RunLedger.read_events(valid_path)
+    assert Enum.map(events, & &1["transition"]) == ["run_completed", "retry_scheduled"]
+
+    Process.cancel_timer(recovered_state.retry_attempts[issue_id].timer_ref)
+  end
+
+  test "failure ledger failure retains claim and blocks retry until persisted" do
+    issue_id = "issue-terminal-failure"
+    ref = make_ref()
+    blocked_path = blocked_ledger_path()
+    valid_path = ledger_path("failure-retry")
+    state = terminal_transition_state(issue_id, ref, blocked_path, retry_attempt: 3)
+
+    assert {:noreply, blocked_state} =
+             Orchestrator.handle_info({:DOWN, ref, :process, self(), :worker_crashed}, state)
+
+    assert blocked_state.running[issue_id].terminal_pending.transition == "run_failed"
+    assert MapSet.member?(blocked_state.claimed, issue_id)
+    refute Map.has_key?(blocked_state.retry_attempts, issue_id)
+
+    recovered_state =
+      blocked_state
+      |> Map.put(:run_ledger_path, valid_path)
+      |> Orchestrator.retry_pending_terminal_transitions_for_test()
+
+    refute Map.has_key?(recovered_state.running, issue_id)
+    assert recovered_state.retry_attempts[issue_id].attempt == 4
+
+    assert {:ok, events} = RunLedger.read_events(valid_path)
+    assert Enum.map(events, & &1["transition"]) == ["run_failed", "retry_scheduled"]
+
+    Process.cancel_timer(recovered_state.retry_attempts[issue_id].timer_ref)
+  end
+
+  test "tracker terminal ledger failure blocks worker stop cleanup and claim release" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-ledger-block-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-terminal-ledger-block"
+    issue_identifier = "MT-TERMINAL-BLOCK"
+    workspace = Path.join(test_root, issue_identifier)
+    blocked_path = blocked_ledger_path()
+    valid_path = ledger_path("tracker-terminal-retry")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress"],
+        tracker_terminal_states: ["Closed"]
+      )
+
+      File.mkdir_p!(workspace)
+      agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+      running_entry = %{
+        pid: agent_pid,
+        ref: nil,
+        run_id: "run-terminal-ledger-block",
+        retry_attempt: 2,
+        identifier: issue_identifier,
+        issue: %Issue{id: issue_id, identifier: issue_identifier, state: "In Progress"},
+        worker_host: nil,
+        workspace_path: workspace,
+        started_at: DateTime.utc_now()
+      }
+
+      state = %Orchestrator.State{
+        run_ledger_path: blocked_path,
+        runner_generation: "runner-terminal-ledger-block",
+        running: %{issue_id => running_entry},
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+      }
+
+      terminal_issue = %Issue{id: issue_id, identifier: issue_identifier, state: "Closed"}
+      blocked_state = Orchestrator.reconcile_issue_states_for_test([terminal_issue], state)
+
+      assert blocked_state.running[issue_id].terminal_pending.transition == "run_stopped"
+      assert MapSet.member?(blocked_state.claimed, issue_id)
+      assert Process.alive?(agent_pid)
+      assert File.exists?(workspace)
+
+      recovered_state =
+        blocked_state
+        |> Map.put(:run_ledger_path, valid_path)
+        |> Orchestrator.retry_pending_terminal_transitions_for_test()
+
+      refute Map.has_key?(recovered_state.running, issue_id)
+      refute MapSet.member?(recovered_state.claimed, issue_id)
+      refute Process.alive?(agent_pid)
+      refute File.exists?(workspace)
+
+      assert {:ok, [event]} = RunLedger.read_events(valid_path)
+      assert event["transition"] == "run_stopped"
+      assert event["terminal_reason"] == "tracker_terminal"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "missing running issues stop active agents without cleaning the workspace" do
     test_root =
       Path.join(
@@ -2781,5 +2908,61 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp terminal_transition_state(issue_id, ref, run_ledger_path, opts) do
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-TERMINAL",
+      state: "In Progress",
+      title: "Terminal persistence test"
+    }
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      run_id: "run-#{issue_id}",
+      retry_attempt: Keyword.fetch!(opts, :retry_attempt),
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: nil,
+      workspace_path: nil,
+      session_id: nil,
+      started_at: DateTime.utc_now(),
+      run_budget_timer_ref: nil
+    }
+
+    %Orchestrator.State{
+      run_ledger_path: run_ledger_path,
+      runner_generation: "runner-terminal-test",
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+  end
+
+  defp blocked_ledger_path do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-blocked-ledger-#{System.unique_integer([:positive])}"
+      )
+
+    blocking_file = Path.join(root, "not-a-directory")
+    File.mkdir_p!(root)
+    File.write!(blocking_file, "blocked")
+    on_exit(fn -> File.rm_rf(root) end)
+    Path.join(blocking_file, "events.jsonl")
+  end
+
+  defp ledger_path(tag) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-#{tag}-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+    Path.join(root, "events.jsonl")
   end
 end

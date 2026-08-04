@@ -160,41 +160,14 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       issue_id ->
-        {running_entry, state} = pop_running_entry(state, issue_id)
-        state = record_session_completion_totals(state, running_entry)
+        running_entry = Map.fetch!(state.running, issue_id)
         session_id = running_entry_session_id(running_entry)
 
         state =
-          case reason do
-            :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> record_run_event(running_entry, "run_completed", "released", terminal_reason: "worker_completed")
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                previous_run_id: Map.get(running_entry, :run_id),
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
-
-            _ ->
-              error_code = ObservabilitySanitizer.error_code(reason, "agent_exit")
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} error_code=#{error_code}; scheduling retry")
-
-              next_attempt = next_retry_attempt_from_running(running_entry)
-
-              state
-              |> record_run_event(running_entry, "run_failed", "released", terminal_reason: "worker_exit")
-              |> schedule_issue_retry(issue_id, next_attempt, %{
-                identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}",
-                previous_run_id: Map.get(running_entry, :run_id),
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+          if Map.has_key?(running_entry, :terminal_pending) do
+            mark_pending_worker_exited(state, issue_id, running_entry)
+          else
+            finish_worker_run(state, issue_id, running_entry, reason, session_id)
           end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id}")
@@ -373,8 +346,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_running_issues(%State{} = state) do
-    state = reconcile_stalled_running_issues(state)
-    running_ids = Map.keys(state.running)
+    state = state |> retry_pending_terminal_transitions() |> reconcile_stalled_running_issues()
+
+    running_ids =
+      state.running
+      |> Enum.reject(fn {_issue_id, running_entry} ->
+        Map.has_key?(running_entry, :terminal_pending)
+      end)
+      |> Enum.map(&elem(&1, 0))
 
     if running_ids == [] do
       state
@@ -463,6 +442,12 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, preferred_worker_host)
   end
 
+  @doc false
+  @spec retry_pending_terminal_transitions_for_test(term()) :: term()
+  def retry_pending_terminal_transitions_for_test(%State{} = state) do
+    retry_pending_terminal_transitions(state)
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -548,6 +533,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp park_running_issue(%State{} = state, %Issue{} = issue, reason, opts \\ []) do
     case Map.get(state.running, issue.id) do
       nil ->
+        state
+
+      %{terminal_pending: _pending} ->
         state
 
       running_entry ->
@@ -676,32 +664,21 @@ defmodule SymphonyElixir.Orchestrator do
          %State{} = state,
          issue_id,
          cleanup_workspace,
-         terminal_reason
+         terminal_reason,
+         opts \\ []
        ) do
     case Map.get(state.running, issue_id) do
       nil ->
         release_issue_claim(state, issue_id)
 
-      %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
-        state = record_session_completion_totals(state, running_entry)
-        state = record_run_event(state, running_entry, "run_stopped", "released", terminal_reason: terminal_reason)
-        worker_host = Map.get(running_entry, :worker_host)
-
-        if cleanup_workspace do
-          cleanup_issue_workspace(identifier, worker_host)
-        end
-
-        stop_running_entry(%{running_entry | pid: pid, ref: ref})
-
-        %{
-          state
-          | running: Map.delete(state.running, issue_id),
-            claimed: MapSet.delete(state.claimed, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
+      running_entry ->
+        pending = %{
+          transition: "run_stopped",
+          terminal_reason: terminal_reason,
+          action: {:stop, cleanup_workspace, Keyword.get(opts, :retry)}
         }
 
-      _ ->
-        release_issue_claim(state, issue_id)
+        persist_or_block_terminal(state, issue_id, running_entry, pending)
     end
   end
 
@@ -727,7 +704,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
     elapsed_ms = stall_elapsed_ms(running_entry, now)
 
-    if is_integer(elapsed_ms) and elapsed_ms > timeout_ms do
+    if not Map.has_key?(running_entry, :terminal_pending) and is_integer(elapsed_ms) and
+         elapsed_ms > timeout_ms do
       identifier = Map.get(running_entry, :identifier, issue_id)
       session_id = running_entry_session_id(running_entry)
 
@@ -735,13 +713,18 @@ defmodule SymphonyElixir.Orchestrator do
 
       next_attempt = next_retry_attempt_from_running(running_entry)
 
-      state
-      |> terminate_running_issue(issue_id, false, "stall_timeout")
-      |> schedule_issue_retry(issue_id, next_attempt, %{
-        identifier: identifier,
-        error: "stalled for #{elapsed_ms}ms without codex activity",
-        previous_run_id: Map.get(running_entry, :run_id)
-      })
+      terminate_running_issue(state, issue_id, false, "stall_timeout",
+        retry: %{
+          attempt: next_attempt,
+          metadata: %{
+            identifier: identifier,
+            error: "stalled for #{elapsed_ms}ms without codex activity",
+            previous_run_id: Map.get(running_entry, :run_id),
+            worker_host: Map.get(running_entry, :worker_host),
+            workspace_path: Map.get(running_entry, :workspace_path)
+          }
+        }
+      )
     else
       state
     end
@@ -1088,21 +1071,31 @@ defmodule SymphonyElixir.Orchestrator do
 
         failed_entry = %{
           run_id: run_id,
+          pid: nil,
+          ref: nil,
           identifier: issue.identifier,
           issue: issue,
           worker_host: worker_host,
           workspace_path: nil,
-          retry_attempt: normalized_attempt
+          retry_attempt: normalized_attempt,
+          started_at: DateTime.utc_now()
         }
 
-        state
-        |> record_run_event(failed_entry, "run_failed", "released", terminal_reason: "spawn_failed")
-        |> schedule_issue_retry(issue.id, next_attempt, %{
-          identifier: issue.identifier,
-          error: "failed to spawn agent: #{inspect(reason)}",
-          previous_run_id: run_id,
-          worker_host: worker_host
-        })
+        pending = %{
+          transition: "run_failed",
+          terminal_reason: "spawn_failed",
+          action:
+            {:retry, next_attempt,
+             %{
+               identifier: issue.identifier,
+               error: "failed to spawn agent: #{inspect(reason)}",
+               previous_run_id: run_id,
+               worker_host: worker_host
+             }}
+        }
+
+        state = %{state | claimed: MapSet.put(state.claimed, issue.id)}
+        persist_or_block_terminal(state, issue.id, failed_entry, pending)
     end
   end
 
@@ -1639,32 +1632,37 @@ defmodule SymphonyElixir.Orchestrator do
     running =
       state.running
       |> Enum.map(fn {issue_id, metadata} ->
+        terminal_pending = Map.get(metadata, :terminal_pending)
+        issue = Map.get(metadata, :issue)
+
         %{
           issue_id: issue_id,
           run_id: Map.get(metadata, :run_id),
           attempt: Map.get(metadata, :retry_attempt, 0),
-          stage: "running",
-          identifier: metadata.identifier,
-          state: metadata.issue.state,
+          stage: if(is_map(terminal_pending), do: "terminal_pending", else: "running"),
+          terminal_transition: if(is_map(terminal_pending), do: terminal_pending.transition),
+          terminal_reason: if(is_map(terminal_pending), do: terminal_pending.terminal_reason),
+          identifier: Map.get(metadata, :identifier),
+          state: if(is_map(issue), do: Map.get(issue, :state)),
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
-          session_id: metadata.session_id,
+          session_id: Map.get(metadata, :session_id),
           session_title: Map.get(metadata, :session_title),
           resolved_model: Map.get(metadata, :resolved_model),
           reasoning_effort: Map.get(metadata, :reasoning_effort),
           model_catalog_source: Map.get(metadata, :model_catalog_source),
           model_catalog: Map.get(metadata, :model_catalog),
-          codex_app_server_pid: metadata.codex_app_server_pid,
-          codex_input_tokens: metadata.codex_input_tokens,
-          codex_output_tokens: metadata.codex_output_tokens,
-          codex_total_tokens: metadata.codex_total_tokens,
+          codex_app_server_pid: Map.get(metadata, :codex_app_server_pid),
+          codex_input_tokens: Map.get(metadata, :codex_input_tokens, 0),
+          codex_output_tokens: Map.get(metadata, :codex_output_tokens, 0),
+          codex_total_tokens: Map.get(metadata, :codex_total_tokens, 0),
           turn_count: Map.get(metadata, :turn_count, 0),
           budget: run_budget_snapshot(metadata, now),
-          started_at: metadata.started_at,
-          last_codex_timestamp: metadata.last_codex_timestamp,
-          last_codex_message: metadata.last_codex_message,
-          last_codex_event: metadata.last_codex_event,
-          runtime_seconds: running_seconds(metadata.started_at, now)
+          started_at: Map.get(metadata, :started_at),
+          last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
+          last_codex_message: Map.get(metadata, :last_codex_message),
+          last_codex_event: Map.get(metadata, :last_codex_event),
+          runtime_seconds: running_seconds(Map.get(metadata, :started_at), now)
         }
       end)
 
@@ -1925,6 +1923,159 @@ defmodule SymphonyElixir.Orchestrator do
     running_entry = Map.get(state.running, issue_id)
     cancel_run_budget_timer(running_entry)
     {running_entry, %{state | running: Map.delete(state.running, issue_id)}}
+  end
+
+  defp finish_worker_run(state, issue_id, running_entry, :normal, session_id) do
+    Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; persisting completion before continuation")
+
+    pending = %{
+      transition: "run_completed",
+      terminal_reason: "worker_completed",
+      action:
+        {:continuation, 1,
+         %{
+           identifier: running_entry.identifier,
+           delay_type: :continuation,
+           previous_run_id: Map.get(running_entry, :run_id),
+           worker_host: Map.get(running_entry, :worker_host),
+           workspace_path: Map.get(running_entry, :workspace_path)
+         }}
+    }
+
+    persist_or_block_terminal(state, issue_id, running_entry, pending)
+  end
+
+  defp finish_worker_run(state, issue_id, running_entry, reason, session_id) do
+    error_code = ObservabilitySanitizer.error_code(reason, "agent_exit")
+
+    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} error_code=#{error_code}; persisting failure before retry")
+
+    pending = %{
+      transition: "run_failed",
+      terminal_reason: "worker_exit",
+      action:
+        {:retry, next_retry_attempt_from_running(running_entry),
+         %{
+           identifier: running_entry.identifier,
+           error: "agent exited: #{inspect(reason)}",
+           previous_run_id: Map.get(running_entry, :run_id),
+           worker_host: Map.get(running_entry, :worker_host),
+           workspace_path: Map.get(running_entry, :workspace_path)
+         }}
+    }
+
+    persist_or_block_terminal(state, issue_id, running_entry, pending)
+  end
+
+  defp persist_or_block_terminal(state, issue_id, running_entry, pending) do
+    event =
+      run_event(
+        running_entry,
+        pending.transition,
+        "released",
+        terminal_reason: pending.terminal_reason
+      )
+
+    case append_run_event(state, event) do
+      :ok ->
+        apply_terminal_success(state, issue_id, running_entry, pending.action)
+
+      {:error, reason} ->
+        Logger.error("Failed to append terminal Symphony run ledger event issue_id=#{issue_id} transition=#{pending.transition}: #{inspect(reason)}; retaining blocked claim")
+
+        block_terminal_transition(state, issue_id, running_entry, pending)
+    end
+  end
+
+  defp block_terminal_transition(state, issue_id, running_entry, pending) do
+    if not running_entry_alive?(running_entry) do
+      cancel_run_budget_timer(running_entry)
+    end
+
+    blocked_entry =
+      running_entry
+      |> Map.put(:terminal_pending, Map.put(pending, :failed_at, DateTime.utc_now()))
+      |> maybe_clear_terminal_timer()
+
+    %{
+      state
+      | running: Map.put(state.running, issue_id, blocked_entry),
+        claimed: MapSet.put(state.claimed, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+  end
+
+  defp mark_pending_worker_exited(state, issue_id, running_entry) do
+    cancel_run_budget_timer(running_entry)
+
+    updated_entry =
+      running_entry
+      |> Map.put(:worker_exited_while_terminal_pending, true)
+      |> Map.put(:run_budget_timer_ref, nil)
+
+    %{state | running: Map.put(state.running, issue_id, updated_entry)}
+  end
+
+  defp running_entry_alive?(running_entry) do
+    case Map.get(running_entry, :pid) do
+      pid when is_pid(pid) -> Process.alive?(pid)
+      _other -> false
+    end
+  end
+
+  defp maybe_clear_terminal_timer(running_entry) do
+    if running_entry_alive?(running_entry) do
+      running_entry
+    else
+      Map.put(running_entry, :run_budget_timer_ref, nil)
+    end
+  end
+
+  defp retry_pending_terminal_transitions(%State{} = state) do
+    Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+      case Map.get(running_entry, :terminal_pending) do
+        nil -> state_acc
+        pending -> persist_or_block_terminal(state_acc, issue_id, running_entry, pending)
+      end
+    end)
+  end
+
+  defp apply_terminal_success(state, issue_id, running_entry, action) do
+    {_popped_entry, state} = pop_running_entry(state, issue_id)
+    state = record_session_completion_totals(state, running_entry)
+
+    case action do
+      {:continuation, attempt, metadata} ->
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, attempt, metadata)
+
+      {:retry, attempt, metadata} ->
+        schedule_issue_retry(state, issue_id, attempt, metadata)
+
+      {:stop, cleanup_workspace, retry} ->
+        worker_host = Map.get(running_entry, :worker_host)
+
+        if cleanup_workspace do
+          cleanup_issue_workspace(running_entry.identifier, worker_host)
+        end
+
+        stop_running_entry(running_entry)
+
+        state = %{
+          state
+          | claimed: MapSet.delete(state.claimed, issue_id),
+            retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        }
+
+        case retry do
+          %{attempt: attempt, metadata: metadata} ->
+            schedule_issue_retry(state, issue_id, attempt, metadata)
+
+          _other ->
+            state
+        end
+    end
   end
 
   defp record_run_event(%State{} = state, running_entry, transition, stage, extra \\ [])
