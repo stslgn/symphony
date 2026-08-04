@@ -19,5 +19,5 @@
 │
 \e[1m├─ Parked waits\e[0m
 │
-│  MT-454 wait=wait-owner-approval reason=waiting_owner attempt=3 host=worker-b path=/srv/symphony/workspaces/MT...
+│  MT-454 wait=wait-owner-approval reason=waiting_owner attempt=3 host=worker-b path=/srv/symphony/workspaces/...
 ╰─

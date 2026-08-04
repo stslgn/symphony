@@ -35,19 +35,6 @@ defmodule SymphonyElixir.StatusDashboard do
   @parked_host_columns 32
   @parked_path_columns 64
   @parked_actions_columns 32
-  @wide_codepoint_ranges [
-    0x1100..0x115F,
-    0x2329..0x232A,
-    0x2E80..0xA4CF,
-    0xAC00..0xD7A3,
-    0xF900..0xFAFF,
-    0xFE10..0xFE19,
-    0xFE30..0xFE6F,
-    0xFF00..0xFF60,
-    0xFFE0..0xFFE6,
-    0x1F300..0x1FAFF,
-    0x20000..0x3FFFD
-  ]
 
   @ansi_reset IO.ANSI.reset()
   @ansi_bold IO.ANSI.bright()
@@ -779,10 +766,6 @@ defmodule SymphonyElixir.StatusDashboard do
     format_parked_summary(wait, terminal_columns)
   end
 
-  @doc false
-  @spec terminal_width_for_test(String.t()) :: non_neg_integer()
-  def terminal_width_for_test(value) when is_binary(value), do: terminal_width(value)
-
   defp parked_actions(actions) when is_list(actions) do
     Enum.map_join(actions, "|", &parked_value/1)
   end
@@ -822,7 +805,11 @@ defmodule SymphonyElixir.StatusDashboard do
   defp escape_terminal_codepoint(codepoint) when codepoint in 0x80..0x9F,
     do: "\\u{" <> codepoint_hex(codepoint, 4) <> "}"
 
-  defp escape_terminal_codepoint(codepoint), do: <<codepoint::utf8>>
+  defp escape_terminal_codepoint(codepoint) when codepoint in 0x20..0x7E,
+    do: <<codepoint::utf8>>
+
+  defp escape_terminal_codepoint(codepoint),
+    do: "\\u{" <> codepoint_hex(codepoint, 4) <> "}"
 
   defp codepoint_hex(codepoint, width) do
     codepoint
@@ -858,7 +845,7 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp take_grapheme_within_bounds(grapheme, {kept, columns, bytes}, column_budget, byte_budget) do
-    next_columns = columns + grapheme_width(grapheme)
+    next_columns = columns + byte_size(grapheme)
     next_bytes = bytes + byte_size(grapheme)
 
     if next_columns <= column_budget and next_bytes <= byte_budget,
@@ -866,21 +853,7 @@ defmodule SymphonyElixir.StatusDashboard do
       else: {:halt, {kept, columns, bytes}}
   end
 
-  defp terminal_width(value) do
-    value
-    |> String.graphemes()
-    |> Enum.reduce(0, fn grapheme, width -> width + grapheme_width(grapheme) end)
-  end
-
-  defp grapheme_width(grapheme) do
-    grapheme
-    |> String.to_charlist()
-    |> List.first()
-    |> wide_codepoint?()
-    |> if(do: 2, else: 1)
-  end
-
-  defp wide_codepoint?(codepoint), do: Enum.any?(@wide_codepoint_ranges, &(codepoint in &1))
+  defp terminal_width(value), do: byte_size(value)
 
   defp format_durable_queue_summary(retry_entry, identifier, attempt, label, error) do
     worker_host = Map.get(retry_entry, :worker_host) || "local"

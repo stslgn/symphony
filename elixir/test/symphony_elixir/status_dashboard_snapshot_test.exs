@@ -184,22 +184,53 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     row = StatusDashboard.format_parked_summary_for_test(parked_wait, @terminal_columns)
 
     refute Enum.any?(String.to_charlist(row), &(&1 in 0..31 or &1 in 127..159))
-    assert StatusDashboard.terminal_width_for_test(row) <= @terminal_columns
+    assert parked_row_display_width(row) <= @terminal_columns
     assert byte_size(row) <= 384
     assert row =~ "\\n\\r\\t\\e\\x07\\u{009B}"
 
     narrow_row = StatusDashboard.format_parked_summary_for_test(parked_wait, 12)
-    assert StatusDashboard.terminal_width_for_test(narrow_row) <= 12
+    assert parked_row_display_width(narrow_row) <= 12
 
     invalid_utf8_row =
       StatusDashboard.format_parked_summary_for_test(%{parked_wait | identifier: <<0xFF>>}, @terminal_columns)
 
     assert invalid_utf8_row =~ "invalid-utf8"
+    assert parked_row_display_width(invalid_utf8_row) <= @terminal_columns
 
     Snapshot.assert_snapshot!(
       "status_dashboard_snapshots/parked_wait_adversarial.snapshot.txt",
       row
     )
+  end
+
+  test "parked wait width remains bounded for Unicode presentation sequences" do
+    cases = [
+      {"watch", "\u231A", "\\u{231A}"},
+      {"hot beverage with variation selector", "\u2615\uFE0F", "\\u{2615}\\u{FE0F}"},
+      {"zero-width joiner emoji", "\u{1F469}\u200D\u{1F4BB}", "\\u{200D}"},
+      {"combining mark", "e\u0301", "e\\u{0301}"}
+    ]
+
+    for {label, value, expected_escape} <- cases do
+      parked_wait = %{
+        identifier: value,
+        wait_id: "wait-#{label}",
+        reason: "waiting_owner",
+        attempt: 1,
+        worker_host: "worker-a",
+        workspace_path: "/remote/workspace",
+        allowed_actions: ["approve"]
+      }
+
+      row_80 = StatusDashboard.format_parked_summary_for_test(parked_wait, 80)
+      row_12 = StatusDashboard.format_parked_summary_for_test(parked_wait, 12)
+
+      assert row_80 =~ expected_escape
+      assert parked_row_display_width(row_80) <= 80
+      assert parked_row_display_width(row_12) <= 12
+      assert byte_size(row_80) <= 384
+      assert byte_size(row_12) <= 384
+    end
   end
 
   test "backoff queue row exposes only a categorical error code" do
@@ -318,6 +349,16 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
       },
       overrides
     )
+  end
+
+  defp parked_row_display_width(row) do
+    ascii_row = String.replace_prefix(row, "│", "|")
+
+    assert ascii_row
+           |> :binary.bin_to_list()
+           |> Enum.all?(&(&1 in 0x20..0x7E))
+
+    byte_size(ascii_row)
   end
 
   defp turn_started_message do
