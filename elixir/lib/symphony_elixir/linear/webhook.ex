@@ -25,7 +25,7 @@ defmodule SymphonyElixir.Linear.Webhook do
          :ok <- verify_delivery_id(delivery_id),
          :ok <- verify_timestamp(params["webhookTimestamp"], now_ms),
          :ok <- verify_event_identity(event, params["type"]) do
-      if event == "Issue" do
+      if event == "Issue" or (event == "Comment" and params["action"] == "create") do
         {:ok, %{delivery_id: delivery_id, event: event}}
       else
         {:ignore, :unsupported_event}

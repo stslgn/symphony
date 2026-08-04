@@ -4,7 +4,8 @@ defmodule SymphonyElixir.Linear.Client do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, Linear.Issue}
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.Linear.{Comment, Issue}
 
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
@@ -95,6 +96,36 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @comments_query """
+  query SymphonyIssueComments($id: String!, $createdAfter: DateTimeOrDuration!, $first: Int!, $after: String) {
+    issue(id: $id) {
+      comments(
+        first: $first
+        after: $after
+        filter: {createdAt: {gte: $createdAfter}}
+        orderBy: createdAt
+      ) {
+        nodes {
+          id
+          body
+          createdAt
+          user {
+            id
+            isMe
+          }
+          externalThread {
+            type
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+  """
+
   @viewer_query """
   query SymphonyLinearViewer {
     viewer {
@@ -158,6 +189,13 @@ defmodule SymphonyElixir.Linear.Client do
           do_fetch_issue_states(ids, assignee_filter)
         end
     end
+  end
+
+  @spec fetch_comments_since(String.t(), DateTime.t()) ::
+          {:ok, [Comment.t()]} | {:error, term()}
+  def fetch_comments_since(issue_id, %DateTime{} = created_after)
+      when is_binary(issue_id) do
+    do_fetch_comments_since(issue_id, created_after, &graphql/2)
   end
 
   @spec graphql(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -236,6 +274,17 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
+  @doc false
+  @spec fetch_comments_since_for_test(
+          String.t(),
+          DateTime.t(),
+          (String.t(), map() -> {:ok, map()} | {:error, term()})
+        ) :: {:ok, [Comment.t()]} | {:error, term()}
+  def fetch_comments_since_for_test(issue_id, %DateTime{} = created_after, graphql_fun)
+      when is_binary(issue_id) and is_function(graphql_fun, 2) do
+    do_fetch_comments_since(issue_id, created_after, graphql_fun)
+  end
+
   defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
     do_fetch_by_states_page(project_slug, state_names, assignee_filter, nil, [])
   end
@@ -304,6 +353,47 @@ defmodule SymphonyElixir.Linear.Client do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp do_fetch_comments_since(issue_id, created_after, graphql_fun) do
+    do_fetch_comments_since_page(issue_id, created_after, graphql_fun, nil, [])
+  end
+
+  defp do_fetch_comments_since_page(
+         issue_id,
+         created_after,
+         graphql_fun,
+         after_cursor,
+         acc_comments
+       ) do
+    variables = %{
+      id: issue_id,
+      createdAfter: DateTime.to_iso8601(created_after),
+      first: @issue_page_size,
+      after: after_cursor
+    }
+
+    with {:ok, body} <- graphql_fun.(@comments_query, variables),
+         {:ok, comments, page_info} <- decode_comment_page_response(body) do
+      updated_acc = Enum.reverse(comments, acc_comments)
+
+      case next_page_cursor(page_info) do
+        {:ok, next_cursor} ->
+          do_fetch_comments_since_page(
+            issue_id,
+            created_after,
+            graphql_fun,
+            next_cursor,
+            updated_acc
+          )
+
+        :done ->
+          {:ok, Enum.reverse(updated_acc)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
@@ -437,6 +527,32 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp decode_linear_page_response(response, assignee_filter), do: decode_linear_response(response, assignee_filter)
 
+  defp decode_comment_page_response(%{
+         "data" => %{
+           "issue" => %{
+             "comments" => %{
+               "nodes" => nodes,
+               "pageInfo" => %{
+                 "hasNextPage" => has_next_page,
+                 "endCursor" => end_cursor
+               }
+             }
+           }
+         }
+       })
+       when is_list(nodes) do
+    comments = nodes |> Enum.map(&normalize_comment/1) |> Enum.reject(&is_nil/1)
+    {:ok, comments, %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
+  end
+
+  defp decode_comment_page_response(%{"data" => %{"issue" => nil}}),
+    do: {:error, :linear_issue_not_found}
+
+  defp decode_comment_page_response(%{"errors" => errors}),
+    do: {:error, {:linear_graphql_errors, errors}}
+
+  defp decode_comment_page_response(_response), do: {:error, :linear_unknown_payload}
+
   defp next_page_cursor(%{has_next_page: true, end_cursor: end_cursor})
        when is_binary(end_cursor) and byte_size(end_cursor) > 0 do
     {:ok, end_cursor}
@@ -467,6 +583,24 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp normalize_issue(_issue, _assignee_filter), do: nil
+
+  defp normalize_comment(comment) when is_map(comment) do
+    with id when is_binary(id) <- comment["id"],
+         %DateTime{} = created_at <- parse_datetime(comment["createdAt"]) do
+      %Comment{
+        id: id,
+        body: comment["body"],
+        created_at: created_at,
+        author_id: get_in(comment, ["user", "id"]),
+        author_is_me: get_in(comment, ["user", "isMe"]) == true,
+        external_thread_type: get_in(comment, ["externalThread", "type"])
+      }
+    else
+      _ -> nil
+    end
+  end
+
+  defp normalize_comment(_comment), do: nil
 
   defp assignee_field(%{} = assignee, field) when is_binary(field), do: assignee[field]
   defp assignee_field(_assignee, _field), do: nil

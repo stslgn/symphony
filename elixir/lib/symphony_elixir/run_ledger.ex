@@ -19,8 +19,11 @@ defmodule SymphonyElixir.RunLedger do
   @allowed_fields MapSet.new([
                     :allowed_actions,
                     :attempt,
+                    :comment_created_at,
+                    :comment_id,
                     :issue_id,
                     :issue_identifier,
+                    :operator_command,
                     :parked_reason,
                     :run_id,
                     :runner_generation,
@@ -61,18 +64,19 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   @spec reconcile_startup(Path.t(), String.t()) ::
-          {:ok, %{recovered_attempts: map(), parked: map()}} | {:error, term()}
+          {:ok, map()} | {:error, term()}
   def reconcile_startup(path, runner_generation) do
     reconcile_startup(path, runner_generation, [])
   end
 
   @spec reconcile_startup(Path.t(), String.t(), keyword()) ::
-          {:ok, %{recovered_attempts: map(), parked: map()}} | {:error, term()}
+          {:ok, map()} | {:error, term()}
   def reconcile_startup(path, runner_generation, opts)
       when is_binary(path) and is_binary(runner_generation) and is_list(opts) do
     append_fn = Keyword.get(opts, :append_fn, &append/2)
 
-    with {:ok, %{stale_runs: stale_runs, parked: parked}} <- recovery_state(path),
+    with {:ok, recovery} <- recovery_state(path),
+         %{stale_runs: stale_runs, parked: parked} = recovery,
          :ok <- append_interrupted_runs(path, stale_runs, runner_generation, append_fn),
          :ok <-
            append_fn.(path, %{
@@ -87,7 +91,14 @@ defmodule SymphonyElixir.RunLedger do
           Map.update(acc, issue_id, next_attempt, &max(&1, next_attempt))
         end)
 
-      {:ok, %{recovered_attempts: recovered_attempts, parked: parked}}
+      {:ok,
+       %{
+         recovered_attempts: recovered_attempts,
+         parked: parked,
+         dispatch_paused: recovery.dispatch_paused,
+         processed_operator_comment_ids: recovery.processed_operator_comment_ids,
+         operator_comment_cursors: recovery.operator_comment_cursors
+       }}
     end
   end
 
@@ -152,7 +163,22 @@ defmodule SymphonyElixir.RunLedger do
 
       parked = Enum.reduce(events, %{}, &update_parked_state/2)
 
-      {:ok, %{stale_runs: unfinished, parked: parked}}
+      dispatch_paused = Enum.reduce(events, false, &update_dispatch_pause_state/2)
+
+      processed_operator_comment_ids =
+        Enum.reduce(events, MapSet.new(), &update_processed_operator_comments/2)
+
+      operator_comment_cursors =
+        Enum.reduce(events, %{}, &update_operator_comment_cursor/2)
+
+      {:ok,
+       %{
+         stale_runs: unfinished,
+         parked: parked,
+         dispatch_paused: dispatch_paused,
+         processed_operator_comment_ids: processed_operator_comment_ids,
+         operator_comment_cursors: operator_comment_cursors
+       }}
     end
   end
 
@@ -186,6 +212,67 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp update_parked_state(_event, acc), do: acc
+
+  defp update_dispatch_pause_state(%{"transition" => "dispatch_paused"}, _paused),
+    do: true
+
+  defp update_dispatch_pause_state(%{"transition" => "dispatch_resumed"}, _paused),
+    do: false
+
+  defp update_dispatch_pause_state(_event, paused), do: paused
+
+  defp update_processed_operator_comments(
+         %{"transition" => transition, "comment_id" => comment_id},
+         processed
+       )
+       when transition in ["operator_command_applied", "operator_command_rejected"] and
+              is_binary(comment_id) do
+    MapSet.put(processed, comment_id)
+  end
+
+  defp update_processed_operator_comments(_event, processed), do: processed
+
+  defp update_operator_comment_cursor(
+         %{
+           "transition" => transition,
+           "issue_id" => issue_id,
+           "comment_created_at" => created_at
+         } = event,
+         cursors
+       )
+       when transition in ["operator_cursor_initialized", "operator_cursor_advanced"] and
+              is_binary(issue_id) and is_binary(created_at) do
+    comment_id = event["comment_id"]
+
+    updated_cursor =
+      case Map.get(cursors, issue_id) do
+        %{created_at: current_created_at, comment_ids: comment_ids}
+        when created_at == current_created_at ->
+          %{
+            created_at: created_at,
+            comment_ids: maybe_put_comment_id(comment_ids, comment_id)
+          }
+
+        %{created_at: current_created_at} = current_cursor
+        when created_at < current_created_at ->
+          current_cursor
+
+        _cursor ->
+          %{
+            created_at: created_at,
+            comment_ids: maybe_put_comment_id(MapSet.new(), comment_id)
+          }
+      end
+
+    Map.put(cursors, issue_id, updated_cursor)
+  end
+
+  defp update_operator_comment_cursor(_event, cursors), do: cursors
+
+  defp maybe_put_comment_id(comment_ids, comment_id) when is_binary(comment_id),
+    do: MapSet.put(comment_ids, comment_id)
+
+  defp maybe_put_comment_id(comment_ids, _comment_id), do: comment_ids
 
   defp append_interrupted_runs(path, stale_runs, runner_generation, append_fn) do
     Enum.reduce_while(stale_runs, :ok, fn {run_id, event}, :ok ->

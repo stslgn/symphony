@@ -1053,7 +1053,25 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
 
     assert rendered =~ "https://linear.app/project/project/issues"
+    assert rendered =~ "Dispatch:"
+    assert rendered =~ "running"
     refute rendered =~ "Dashboard:"
+  end
+
+  test "status dashboard renders global dispatch pause" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil,
+         control: %{dispatch_paused: true}
+       }}
+
+    rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
+    assert rendered =~ "Dispatch:"
+    assert rendered =~ "paused"
   end
 
   test "status dashboard renders dashboard url on its own line when server port is configured" do

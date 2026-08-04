@@ -25,6 +25,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:ok, issue_ids}
     end
 
+    def fetch_comments_since(issue_id, created_after) do
+      send(self(), {:fetch_comments_since_called, issue_id, created_after})
+      {:ok, [:comment]}
+    end
+
     def graphql(query, variables) do
       send(self(), {:graphql_called, query, variables})
 
@@ -78,6 +83,25 @@ defmodule SymphonyElixir.ExtensionsTest do
       end
 
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
+    end
+
+    def handle_call({:set_dispatch_paused, paused}, _from, state) do
+      if recipient = Keyword.get(state, :pause_recipient) do
+        send(recipient, {:dispatch_paused, paused})
+      end
+
+      snapshot =
+        state
+        |> Keyword.fetch!(:snapshot)
+        |> Map.put(:control, %{dispatch_paused: paused})
+
+      payload = %{
+        dispatch_paused: paused,
+        changed: true,
+        requested_at: DateTime.utc_now()
+      }
+
+      {:reply, {:ok, payload}, Keyword.put(state, :snapshot, snapshot)}
     end
   end
 
@@ -221,6 +245,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, ["issue-1"]} = Adapter.fetch_issue_states_by_ids(["issue-1"])
     assert_receive {:fetch_issue_states_by_ids_called, ["issue-1"]}
 
+    created_after = ~U[2026-08-03 10:00:00Z]
+    assert {:ok, [:comment]} = Adapter.fetch_comments_since("issue-1", created_after)
+    assert_receive {:fetch_comments_since_called, "issue-1", ^created_after}
+
     Process.put(
       {FakeLinearClient, :graphql_result},
       {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
@@ -336,7 +364,8 @@ defmodule SymphonyElixir.ExtensionsTest do
           coalesced: false,
           requested_at: DateTime.utc_now(),
           operations: ["poll", "reconcile"]
-        }
+        },
+        pause_recipient: self()
       )
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
@@ -347,6 +376,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
              "counts" => %{"running" => 1, "retrying" => 1, "parked" => 1},
+             "control" => %{"dispatch_paused" => false},
              "capabilities" => %{
                "dynamic_tools" => ["linear_graphql"],
                "mcp_tool_auto_approve" => [],
@@ -484,6 +514,19 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+
+    assert json_response(get(build_conn(), "/api/v1/pause"), 200) == %{
+             "dispatch_paused" => false
+           }
+
+    assert %{"dispatch_paused" => true, "changed" => true} =
+             json_response(post(build_conn(), "/api/v1/pause", %{"paused" => true}), 202)
+
+    assert_receive {:dispatch_paused, true}
+
+    assert json_response(get(build_conn(), "/api/v1/pause"), 200) == %{
+             "dispatch_paused" => true
+           }
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -494,6 +537,9 @@ defmodule SymphonyElixir.ExtensionsTest do
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(get(build_conn(), "/api/v1/refresh"), 405) ==
+             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+
+    assert json_response(put(build_conn(), "/api/v1/pause", %{}), 405) ==
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(get(build_conn(), "/api/v1/webhooks/linear"), 405) ==
@@ -521,6 +567,32 @@ defmodule SymphonyElixir.ExtensionsTest do
                "error" => %{
                  "code" => "orchestrator_unavailable",
                  "message" => "Orchestrator is unavailable"
+               }
+             }
+
+    assert json_response(post(build_conn(), "/api/v1/pause", %{"paused" => true}), 503) ==
+             %{
+               "error" => %{
+                 "code" => "orchestrator_unavailable",
+                 "message" => "Orchestrator is unavailable"
+               }
+             }
+
+    assert json_response(post(build_conn(), "/api/v1/pause", %{"paused" => "yes"}), 422) ==
+             %{
+               "error" => %{
+                 "code" => "invalid_pause_request",
+                 "message" => "paused must be a boolean"
+               }
+             }
+
+    remote_conn = %{build_conn() | remote_ip: {203, 0, 113, 9}}
+
+    assert json_response(post(remote_conn, "/api/v1/pause", %{"paused" => true}), 403) ==
+             %{
+               "error" => %{
+                 "code" => "operator_access_denied",
+                 "message" => "Operator controls require loopback access"
                }
              }
   end
@@ -597,7 +669,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute_receive :refresh_requested
   end
 
-  test "verified non-Issue webhook is acknowledged without wake-up" do
+  test "verified Linear Comment webhook wakes operator-command reconciliation" do
     webhook_secret = "synthetic-webhook-secret"
     configure_webhook_secret(webhook_secret)
 
@@ -606,7 +678,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     orchestrator_opts = [
       name: orchestrator_name,
       snapshot: static_snapshot(),
-      refresh: :unavailable,
+      refresh: %{
+        queued: true,
+        coalesced: false,
+        requested_at: DateTime.utc_now(),
+        operations: ["poll", "reconcile"]
+      },
       refresh_recipient: self()
     ]
 
@@ -617,13 +694,13 @@ defmodule SymphonyElixir.ExtensionsTest do
     body = linear_webhook_body("Comment", System.system_time(:millisecond), "create")
     conn = post_linear_webhook(body, webhook_secret, event: "Comment")
 
-    assert json_response(conn, 200) == %{
+    assert %{
              "accepted" => true,
-             "ignored" => true,
-             "reason" => "unsupported_event"
-           }
+             "queued" => true,
+             "source" => "linear_webhook"
+           } = json_response(conn, 200)
 
-    refute_receive :refresh_requested
+    assert_receive :refresh_requested
   end
 
   test "Linear webhook fails closed when its secret is not configured" do
@@ -909,6 +986,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           parked_at: DateTime.utc_now()
         }
       ],
+      control: %{dispatch_paused: false},
       capabilities: %{
         dynamic_tools: ["linear_graphql"],
         mcp_tool_auto_approve: [],

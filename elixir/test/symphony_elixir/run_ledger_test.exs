@@ -42,8 +42,12 @@ defmodule SymphonyElixir.RunLedgerTest do
                workspace_path: "/tmp/workspaces/DUD-2"
              })
 
-    assert {:ok, %{recovered_attempts: %{"issue-stale" => 3}, parked: %{}}} =
-             RunLedger.reconcile_startup(path, "runner-new")
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-new")
+    assert recovery.recovered_attempts == %{"issue-stale" => 3}
+    assert recovery.parked == %{}
+    refute recovery.dispatch_paused
+    assert recovery.processed_operator_comment_ids == MapSet.new()
+    assert recovery.operator_comment_cursors == %{}
 
     assert {:ok, events} = RunLedger.read_events(path)
 
@@ -58,8 +62,9 @@ defmodule SymphonyElixir.RunLedgerTest do
                event["runner_generation"] == "runner-new"
            end)
 
-    assert {:ok, %{recovered_attempts: %{}, parked: %{}}} =
-             RunLedger.reconcile_startup(path, "runner-next")
+    assert {:ok, next_recovery} = RunLedger.reconcile_startup(path, "runner-next")
+    assert next_recovery.recovered_attempts == %{}
+    assert next_recovery.parked == %{}
   end
 
   test "ignores malformed trailing records during recovery" do
@@ -67,8 +72,9 @@ defmodule SymphonyElixir.RunLedgerTest do
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "{\"transition\":\"run_started\"\n")
 
-    assert {:ok, %{recovered_attempts: %{}, parked: %{}}} =
-             RunLedger.reconcile_startup(path, "runner-new")
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-new")
+    assert recovery.recovered_attempts == %{}
+    assert recovery.parked == %{}
   end
 
   test "ignores non-object records and defaults malformed attempts" do
@@ -90,8 +96,9 @@ defmodule SymphonyElixir.RunLedgerTest do
       ]
     )
 
-    assert {:ok, %{recovered_attempts: %{"issue-malformed-attempt" => 1}, parked: %{}}} =
-             RunLedger.reconcile_startup(path, "runner-new")
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-new")
+    assert recovery.recovered_attempts == %{"issue-malformed-attempt" => 1}
+    assert recovery.parked == %{}
   end
 
   test "startup reconciliation restores parked waits until they are resumed" do
@@ -111,8 +118,9 @@ defmodule SymphonyElixir.RunLedgerTest do
                tracker_state: "Human Review"
              })
 
-    assert {:ok, %{recovered_attempts: %{}, parked: %{"issue-parked" => parked}}} =
-             RunLedger.reconcile_startup(path, "runner-new")
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-new")
+    assert %{"issue-parked" => parked} = recovery.parked
+    assert recovery.recovered_attempts == %{}
 
     assert parked["wait_id"] == "wait-parked"
     assert parked["parked_reason"] == "waiting_owner"
@@ -125,8 +133,74 @@ defmodule SymphonyElixir.RunLedgerTest do
                wait_id: "wait-parked"
              })
 
-    assert {:ok, %{recovered_attempts: %{}, parked: %{}}} =
-             RunLedger.reconcile_startup(path, "runner-next")
+    assert {:ok, next_recovery} = RunLedger.reconcile_startup(path, "runner-next")
+    assert next_recovery.recovered_attempts == %{}
+    assert next_recovery.parked == %{}
+  end
+
+  test "startup reconciliation restores global pause and operator command cursors" do
+    path = ledger_path()
+
+    assert :ok = RunLedger.append(path, %{transition: "dispatch_paused", stage: "operator"})
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "operator_cursor_initialized",
+               stage: "operator",
+               issue_id: "issue-1",
+               comment_created_at: "2026-08-03T09:59:59.000Z"
+             })
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "operator_cursor_advanced",
+               stage: "operator",
+               issue_id: "issue-1",
+               comment_id: "comment-1",
+               comment_created_at: "2026-08-03T10:00:00.000Z"
+             })
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "operator_cursor_advanced",
+               stage: "operator",
+               issue_id: "issue-1",
+               comment_id: "comment-2",
+               comment_created_at: "2026-08-03T10:00:00.000Z"
+             })
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "operator_cursor_advanced",
+               stage: "operator",
+               issue_id: "issue-1",
+               comment_id: "comment-old",
+               comment_created_at: "2026-08-03T09:59:58.000Z"
+             })
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "operator_command_applied",
+               stage: "operator",
+               issue_id: "issue-1",
+               comment_id: "comment-1",
+               operator_command: "retry"
+             })
+
+    assert {:ok, paused_recovery} = RunLedger.reconcile_startup(path, "runner-paused")
+    assert paused_recovery.dispatch_paused
+    assert paused_recovery.processed_operator_comment_ids == MapSet.new(["comment-1"])
+
+    assert paused_recovery.operator_comment_cursors == %{
+             "issue-1" => %{
+               created_at: "2026-08-03T10:00:00.000Z",
+               comment_ids: MapSet.new(["comment-1", "comment-2"])
+             }
+           }
+
+    assert :ok = RunLedger.append(path, %{transition: "dispatch_resumed", stage: "operator"})
+    assert {:ok, resumed_recovery} = RunLedger.reconcile_startup(path, "runner-resumed")
+    refute resumed_recovery.dispatch_paused
   end
 
   test "returns filesystem read and create errors" do

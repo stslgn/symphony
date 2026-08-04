@@ -289,6 +289,9 @@ Fields:
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
+- `dispatch_paused` (durable boolean dispatch kill-switch; in-flight work is not stopped)
+- `processed_operator_comment_ids` (bounded identities recovered from durable command outcomes)
+- `operator_comment_cursors` (per-issue timestamp plus same-timestamp comment IDs)
 
 #### 4.1.9 Operator Wait
 
@@ -299,7 +302,7 @@ Fields:
 - `wait_id` (stable unique string)
 - `reason` (`waiting_owner`, `waiting_secret`, `waiting_live_approval`,
   `waiting_infrastructure`, `review_cap_reached`, `auth_reconnect_required`, or
-  `run_budget_exhausted`)
+  `run_budget_exhausted`, or `operator_stopped`)
 - `allowed_actions` (bounded list derived from the reason)
 - `issue_id`, `identifier`, `run_id`, and `attempt`
 - `stage`, `tracker_state`, `terminal_reason`, and `parked_at`
@@ -401,6 +404,11 @@ Fields:
     `LINEAR_WEBHOOK_SECRET`.
   - Enables authenticated Linear webhook wake-up when the HTTP server is also enabled.
   - MUST NOT be exposed in logs, status, ledger events, or API responses.
+- `operator_user_ids` (list of strings, default `[]`)
+  - Exact Linear user IDs authorized to submit bounded operator comment commands.
+  - Empty disables comment commands.
+  - The identity associated with `tracker.api_key` MUST remain rejected even if listed, because a
+    worker can publish comments through the same credential.
 - `project_slug` (string)
   - REQUIRED for dispatch when `tracker.kind == "linear"`.
 - `active_states` (list of strings)
@@ -642,6 +650,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
 - `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
 - `tracker.webhook_secret`: optional `$VAR`; when omitted, canonical env `LINEAR_WEBHOOK_SECRET`
+- `tracker.operator_user_ids`: list of exact Linear user IDs, default `[]`
 - `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
@@ -760,7 +769,20 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Update live session fields, token counters, and rate limits.
 
 - `Retry Timer Fired`
-  - Re-fetch active candidates and attempt re-dispatch, or release claim if no longer eligible.
+  - When dispatch is active, re-fetch candidates and attempt re-dispatch, or release the claim if
+    no longer eligible.
+  - While globally paused, keep the retry attempt queued without incrementing it.
+
+- `Operator Comment Observed`
+  - Parse only the bounded command vocabulary from native, non-self-authored tracker comments.
+  - Apply only actions allowed by the issue's current running/parked context.
+  - Durably record the bounded outcome and advance the comment cursor without storing its body.
+
+- `Global Dispatch Pause/Resume`
+  - Persist the control transition before acknowledging it.
+  - Pause prevents new candidate and retry dispatch but does not stop in-flight work or
+    reconciliation.
+  - Resume wakes queued retries and schedules an immediate poll/reconcile cycle.
 
 - `Reconciliation State Refresh`
   - Stop runs whose issue states are terminal or no longer active.
@@ -778,6 +800,7 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - Startup reconciliation marks every unfinished run from the previous runner generation as
   `interrupted_by_restart` before scheduling the first poll.
 - Startup reconciliation restores unresolved operator waits before dispatch.
+- Startup reconciliation restores global dispatch pause and per-issue operator comment cursors.
 - A parked issue is excluded from automatic retry and pickup even when its tracker state is active.
 - Resuming a wait removes only the runner-side park; normal exact-state eligibility still applies.
 - A redispatched issue continues with an incremented attempt and a new run id.
@@ -795,20 +818,22 @@ The effective poll interval SHOULD be updated when workflow config changes are r
 Tick sequence:
 
 1. Reconcile running and parked issues.
-2. Run dispatch preflight validation.
-3. Fetch candidate issues from tracker using active states.
-4. Sort issues by dispatch priority.
-5. Dispatch eligible issues while slots remain.
-6. Notify observability/status consumers of state changes.
+2. Fetch and idempotently process operator comments for tracked running/parked issues.
+3. If global dispatch is paused, skip candidate dispatch for this tick.
+4. Run dispatch preflight validation.
+5. Fetch candidate issues from tracker using active states.
+6. Sort issues by dispatch priority.
+7. Dispatch eligible issues while slots remain.
+8. Notify observability/status consumers of state changes.
 
 If per-tick validation fails, dispatch is skipped for that tick, but reconciliation still happens
 first.
 
-Webhook wake-up is an optional latency optimization. A verified webhook MUST only queue or coalesce
-this same poll/reconcile cycle. Payload fields MUST NOT directly dispatch, stop, retry, park, release,
-or otherwise mutate orchestrator state. Canonical tracker state is re-fetched before any transition,
-so duplicate or out-of-order deliveries remain safe. Fixed polling remains enabled to recover from
-lost deliveries.
+Webhook wake-up is an optional latency optimization. A verified Issue or Comment-create webhook MUST
+only queue or coalesce this same poll/reconcile cycle. Payload fields MUST NOT directly dispatch,
+stop, retry, park, release, execute a command, or otherwise mutate orchestrator state. Canonical
+tracker state and comments are re-fetched before any transition, so duplicate or out-of-order
+deliveries remain safe. Fixed polling remains enabled to recover from lost deliveries.
 
 ### 8.2 Candidate Selection Rules
 
@@ -819,6 +844,7 @@ An issue is dispatch-eligible only if all are true:
 - It is not already in `running`.
 - It is not in `parked`.
 - It is not already in `claimed`.
+- Global dispatch is not paused.
 - Global concurrency slots are available.
 - Per-state concurrency slots are available.
 - Blocker rule for `Todo` state passes:
@@ -858,13 +884,16 @@ Backoff formula:
 
 Retry handling behavior:
 
-1. Fetch active candidate issues (not all issues).
-2. Find the specific issue by `issue_id`.
-3. If not found, release claim.
-4. If found and still candidate-eligible:
+1. If global dispatch is paused, retain the retry entry and attempt number and defer it.
+2. Fetch active candidate issues (not all issues).
+3. Find the specific issue by `issue_id`.
+4. If not found, release claim.
+5. If found and still candidate-eligible:
    - Dispatch if slots are available.
    - Otherwise requeue with error `no available orchestrator slots`.
-5. If found but no longer active, release claim.
+6. If found but no longer active, release claim.
+
+On resume, queued retries SHOULD be made immediately due without incrementing their attempt.
 
 Note:
 
@@ -900,7 +929,44 @@ Part B: Tracker state refresh
   parked issues remain ineligible until explicitly resumed.
 - If state refresh fails, keep workers running and try again on the next tick.
 
-### 8.6 Startup Terminal Workspace Cleanup
+### 8.6 Operator Commands and Global Dispatch Pause
+
+Operator comment input is untrusted. Implementations that support comment commands MUST:
+
+- inspect only comments belonging to currently running or parked issues;
+- accept only native comments from exact `tracker.operator_user_ids` actors;
+- reject comments authored by the `tracker.api_key` identity even when it appears in the allowlist;
+- reject comments with an external-thread marker;
+- recognize commands only at the beginning of a bounded-size body;
+- ignore free-form text and unsupported or prefix-colliding commands;
+- never persist or log the raw comment body; and
+- process comments in stable creation-time/id order from a durable per-issue cursor.
+
+When upgrading an existing ledger that contains parked waits but no operator cursors, the
+implementation MUST initialize each missing cursor at upgrade/runtime observation time. It MUST NOT
+execute historical comments retroactively.
+
+The bounded vocabulary is:
+
+- `$stop`: durably park a matching active run as `operator_stopped`, terminate its worker, and
+  preserve its workspace;
+- `$retry`: resolve only a parked wait whose allowed actions contain `retry`;
+- `$approve` or `$approved`: resolve only a parked wait whose allowed actions contain `approve`;
+- standalone thumbs-up: equivalent to approve; and
+- `$reject`: record rejection only for a parked wait whose allowed actions contain `reject`, leaving
+  the wait parked.
+
+An out-of-context command MUST have no scheduling effect. Applied/rejected outcomes and comment
+cursors MUST be durable and idempotent across duplicate webhook delivery, repeated polling, and
+restart. A verified webhook is only a wake-up hint; the command MUST be re-fetched through the
+tracker client before parsing.
+
+Global dispatch pause is an orthogonal scheduler control, not an issue state. It MUST be persisted
+before acknowledgment. While paused, existing workers, state reconciliation, operator-comment
+processing, and observability continue, but no candidate or queued retry may launch. Resume MUST
+preserve retry attempt numbers and SHOULD make queued retries immediately due.
+
+### 8.7 Startup Terminal Workspace Cleanup
 
 When the service starts:
 
@@ -1400,6 +1466,8 @@ SHOULD return:
 - each running row SHOULD include `turn_count`
 - `retrying` (list of retry queue rows)
 - `parked` (list of typed operator waits)
+- `control`
+  - `dispatch_paused` (boolean)
 - `capabilities` (effective allowlist names only; no credentials, arguments, prompts, or results)
 - `codex_totals`
   - `input_tokens`
@@ -1513,6 +1581,9 @@ Minimum endpoints:
     ```json
     {
       "generated_at": "2026-02-24T20:15:30Z",
+      "control": {
+        "dispatch_paused": false
+      },
       "counts": {
         "running": 2,
         "retrying": 1,
@@ -1579,6 +1650,17 @@ Minimum endpoints:
       "rate_limits": null
     }
     ```
+
+- `GET /api/v1/pause`
+  - Returns the current durable global dispatch-pause state.
+  - MUST be restricted to loopback callers or an equivalently authenticated operator channel.
+
+- `POST /api/v1/pause`
+  - Accepts `{"paused": true}` or `{"paused": false}`.
+  - Persists the transition before acknowledging it and returns whether the state changed.
+  - MUST be restricted to loopback callers or an equivalently authenticated operator channel.
+  - Invalid bodies return `422`; an unavailable orchestrator returns `503`; unauthorized callers
+    return `403`.
 
 - `GET /api/v1/<issue_identifier>`
   - Returns issue-specific runtime/debug details for the identified issue, including any information
@@ -1657,9 +1739,9 @@ Minimum endpoints:
     comparison.
   - Requires a UUID `Linear-Delivery`, matching body/header event identity, and a signed
     `webhookTimestamp` within 60 seconds of local time.
-  - A verified `Issue` delivery queues or coalesces the same poll/reconcile cycle as `/refresh` and
-    responds `200 OK` without echoing the request body.
-  - A verified non-Issue delivery is acknowledged with `200 OK` and ignored.
+  - A verified `Issue` or `Comment`-create delivery queues or coalesces the same poll/reconcile
+    cycle as `/refresh` and responds `200 OK` without echoing the request body.
+  - Other verified delivery types/actions are acknowledged with `200 OK` and ignored.
   - Missing configuration returns `503`; missing, malformed, stale, or invalid authentication fails
     closed and MUST NOT wake the orchestrator.
 
@@ -1667,7 +1749,11 @@ API design notes:
 
 - The JSON shapes above are the RECOMMENDED baseline for interoperability and debugging ergonomics.
 - Implementations MAY add fields, but SHOULD avoid breaking existing fields within a version.
-- Endpoints SHOULD be read-only except for operational triggers like `/refresh`.
+- Endpoints SHOULD be read-only except for bounded operational controls like `/refresh` and
+  `/pause`.
+- A public ingress used for tracker webhooks MUST expose only the authenticated webhook route, not
+  loopback operator endpoints. A local reverse proxy can otherwise make a remote caller appear to
+  be loopback.
 - Unsupported methods on defined routes SHOULD return `405 Method Not Allowed`.
 - API errors SHOULD use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.
 - If the dashboard is a client-side app, it SHOULD consume this API rather than duplicating state
@@ -2137,6 +2223,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Linear query uses the specified project filter field (`slugId`)
 - Empty `fetch_issues_by_states([])` returns empty without API call
 - Pagination preserves order across multiple pages
+- Comment pagination fetches bounded comment records from a supplied creation-time cursor
+- Comment normalization marks self-authored and mirrored external-thread comments for rejection by
+  the operator-command parser
 - Blockers are normalized from inverse relations of type `blocks`
 - Labels are normalized to lowercase
 - Issue state refresh by ID returns minimal normalized issues
@@ -2151,8 +2240,17 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Active-state issue refresh updates running entry state
 - Non-active state stops running agent without workspace cleanup
 - Human Review parks a running agent with `waiting_owner` and no retry
+- `$stop` parks a matching active run with `operator_stopped` and preserves its workspace
 - Parked issues are excluded from dispatch until a matching wait is resumed
 - Unresolved waits are restored from the run ledger after restart
+- Native operator comments accept only the bounded approve/retry/reject/stop vocabulary
+- Free-form, non-allowlisted, API-key/self-authored, mirrored external-thread, and oversized comments
+  cannot steer the runner
+- Operator command outcomes and per-issue cursors are durable and duplicate-safe without storing
+  comment bodies
+- Global pause is durable, idempotent, and blocks candidate/retry dispatch without stopping
+  in-flight reconciliation
+- Resume wakes deferred retry entries without incrementing their attempt
 - Terminal state stops running agent and cleans workspace
 - Reconciliation with no running issues is a no-op
 - Normal worker exit schedules a short continuation retry (attempt 1)
@@ -2161,8 +2259,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry
 - Slot exhaustion requeues retries with explicit error reason
-- If a snapshot API is implemented, it returns running rows, retry rows, parked waits, token totals,
-  and rate limits
+- If a snapshot API is implemented, it returns running rows, retry rows, parked waits, dispatch
+  control, token totals, and rate limits
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
 
 ### 17.5 Coding-Agent App-Server Client
@@ -2256,6 +2354,8 @@ Use the same validation profiles as Section 17:
 - Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
 - Reconciliation that stops runs on terminal/non-active tracker states
 - Durable typed operator waits with restart restoration and dispatch exclusion
+- Durable bounded operator commands with idempotent comment reconciliation
+- Durable global dispatch pause with fail-closed persistence and retry deferral
 - Workspace cleanup for terminal issues (startup sweep + active transition)
 - Structured logs with `issue_id`, `issue_identifier`, and `session_id`
 - Operator-visible observability (structured logs; OPTIONAL snapshot/status surface)

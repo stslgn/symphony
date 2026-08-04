@@ -13,7 +13,8 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls Linear for candidate work and can accept verified Linear webhooks as immediate wake-up hints
+1. Polls Linear for candidate work and can accept verified Linear issue/comment webhooks as
+   immediate wake-up hints
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
@@ -82,19 +83,20 @@ Optional flags:
 
 Symphony also writes an append-only `run-ledger.jsonl` beside the application
 log. The file is kept at mode `0600` and contains only bounded run identity,
-attempt, stage, workspace, and terminal-reason fields. It never stores prompts,
-agent output, credentials, or external comments. At startup, Symphony closes
-unfinished attempts from the previous runner generation before the first poll;
-an eligible issue is then redispatched with an incremented attempt and a new
-run id.
+attempt, stage, workspace, terminal-reason, operator-command outcome/cursor,
+and dispatch-control fields. It never stores prompts, agent output, credentials,
+or comment bodies. At startup, Symphony closes unfinished attempts from the
+previous runner generation before the first poll, restores unresolved waits and
+dispatch pause, and resumes each operator comment cursor. An eligible issue is
+then redispatched with an incremented attempt and a new run id.
 
 Human Review and Human Clarification transitions are recorded as durable
 `waiting_owner` operator waits; Deploy Ready is recorded as
 `waiting_live_approval`. The same typed wait model supports secret,
-infrastructure, review-cap, and authentication pauses. Parked issues have no
-retry timer, are excluded from automatic pickup, and are restored from the
-ledger after restart. Resuming a wait does not bypass the normal exact Linear
-state eligibility check.
+infrastructure, review-cap, authentication, and explicit `operator_stopped`
+pauses. Parked issues have no retry timer, are excluded from automatic pickup,
+and are restored from the ledger after restart. Resuming a wait does not bypass
+the normal exact Linear state eligibility check.
 
 Run-budget stops use the same durable model with reason
 `run_budget_exhausted` and exact terminal reason `turn_budget_exhausted`,
@@ -112,6 +114,7 @@ Minimal example:
 tracker:
   kind: linear
   webhook_secret: $LINEAR_WEBHOOK_SECRET
+  operator_user_ids: []
   project_slug: "..."
 workspace:
   root: ~/code/workspaces
@@ -166,6 +169,10 @@ Notes:
 - `tracker.webhook_secret` accepts only an environment reference such as
   `$LINEAR_WEBHOOK_SECRET`. When omitted, it reads the canonical `LINEAR_WEBHOOK_SECRET`; without a
   resolved value the webhook endpoint fails closed.
+- `tracker.operator_user_ids` is the explicit Linear actor allowlist for comment commands and
+  defaults to `[]`, which disables comment commands. The API-key identity (`user.isMe`) is always
+  rejected even if listed, because workers can write comments with that same credential. Use a
+  separate runner/service identity for `LINEAR_API_KEY` and allowlist only human operator user IDs.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -201,19 +208,50 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, `/api/v1/refresh`, and
-  `/api/v1/webhooks/linear`.
+  `/api/v1/pause`, plus the webhook receiver at `/api/v1/webhooks/linear`.
 
 ### Linear webhook wake-up
 
-When both the HTTP server and `tracker.webhook_secret` are configured, point a Linear Issue webhook
-at `https://<public-host>/api/v1/webhooks/linear`. Linear requires a public HTTPS URL; place Symphony
-behind an HTTPS reverse proxy rather than exposing the local observability server directly.
+When both the HTTP server and `tracker.webhook_secret` are configured, point Linear Issue and
+Comment-create webhooks at `https://<public-host>/api/v1/webhooks/linear`. Linear requires a public
+HTTPS URL; place Symphony behind an HTTPS reverse proxy rather than exposing the local observability
+server directly.
 
 The endpoint verifies the HMAC-SHA256 signature over the exact raw body, delivery UUID, event
-identity, and a 60-second timestamp window. A valid Issue event only queues the normal serialized
-poll/reconcile cycle. Symphony then re-fetches Linear and uses existing running, claimed, parked,
-concurrency, and dispatch-revalidation guards. Duplicate or out-of-order deliveries therefore do not
-directly create transitions, and fixed polling remains the fallback for lost webhook delivery.
+identity, and a 60-second timestamp window. A valid Issue or Comment-create event only queues the
+normal serialized poll/reconcile cycle. Symphony then re-fetches Linear and uses existing running,
+claimed, parked, concurrency, command-cursor, and dispatch-revalidation guards. Duplicate or
+out-of-order deliveries therefore do not directly create transitions, and fixed polling remains the
+fallback for lost webhook delivery.
+
+### Operator commands and global pause
+
+For running or parked issues, Symphony recognizes this bounded vocabulary only when it appears at
+the start of a native Linear issue comment authored by a configured `tracker.operator_user_ids`
+actor:
+
+- `$stop` durably parks an active run as `operator_stopped` and preserves its workspace.
+- `$retry` resolves a matching wait that allows retry.
+- `$approve`, `$approved`, or a standalone `👍` resolves a matching wait that allows approval.
+- `$reject` records rejection for a matching wait and keeps the issue parked.
+
+Free-form text, unsupported commands, actors outside the allowlist, API-key/self-authored comments,
+mirrored external-thread comments, and oversized bodies are ignored. Commands are context-sensitive:
+an action that is not valid for the issue's current run/wait is recorded as rejected and has no
+scheduling effect. The durable ledger stores only bounded command identities, outcomes, and cursors,
+never the comment body. This makes repeated delivery and restart reconciliation idempotent.
+
+When an existing parked wait has no operator cursor during the first upgrade to this feature,
+Symphony initializes the cursor at upgrade time. Historical comments are not executed retroactively;
+only comments created after that migration boundary can act as operator commands.
+
+Global dispatch control is available locally through `GET /api/v1/pause` and
+`POST /api/v1/pause` with `{"paused": true}` or `{"paused": false}`. These endpoints accept only
+loopback callers. Pause is durable across restart and blocks new candidate and retry dispatch while
+letting in-flight runs, tracker reconciliation, and operator-command processing continue. Resume
+wakes queued retries and schedules an immediate reconcile. A public reverse proxy MUST forward only
+the authenticated webhook route, never the dashboard or operator API routes; a loopback proxy would
+otherwise itself satisfy the endpoint's local-caller check.
 
 ## Web dashboard
 
@@ -224,6 +262,7 @@ The observability UI now runs on a minimal Phoenix stack:
 - `/api/v1/state` exposes separate `running`, `retrying`, and `parked` lists;
   parked rows include the stable wait id, typed reason, allowed actions, and
   issue/run identity.
+- The state payload and terminal header expose `control.dispatch_paused`.
 - The same state payload exposes the effective capability allowlist names, but
   never credentials, tool arguments, prompts, or response bodies.
 - Bandit as the HTTP server

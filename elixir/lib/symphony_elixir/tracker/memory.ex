@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.Linear.{Comment, Issue}
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
@@ -32,6 +32,24 @@ defmodule SymphonyElixir.Tracker.Memory do
     {:ok,
      Enum.filter(issue_entries(), fn %Issue{id: id} ->
        MapSet.member?(wanted_ids, id)
+     end)}
+  end
+
+  @spec fetch_comments_since(String.t(), DateTime.t()) ::
+          {:ok, [Comment.t()]} | {:error, term()}
+  def fetch_comments_since(issue_id, %DateTime{} = created_after) do
+    comments =
+      :symphony_elixir
+      |> Application.get_env(:memory_tracker_comments, %{})
+      |> Map.get(issue_id, [])
+
+    {:ok,
+     Enum.filter(comments, fn
+       %Comment{created_at: %DateTime{} = created_at} ->
+         DateTime.compare(created_at, created_after) in [:eq, :gt]
+
+       _comment ->
+         false
      end)}
   end
 

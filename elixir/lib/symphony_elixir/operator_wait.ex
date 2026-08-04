@@ -10,7 +10,8 @@ defmodule SymphonyElixir.OperatorWait do
     "waiting_infrastructure" => ["retry", "reject"],
     "review_cap_reached" => ["approve", "reject"],
     "auth_reconnect_required" => ["retry", "reject"],
-    "run_budget_exhausted" => ["retry", "reject"]
+    "run_budget_exhausted" => ["retry", "reject"],
+    "operator_stopped" => ["retry", "reject"]
   }
 
   @spec reasons() :: [String.t()]
