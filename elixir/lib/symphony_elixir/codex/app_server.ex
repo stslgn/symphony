@@ -544,12 +544,26 @@ defmodule SymphonyElixir.Codex.AppServer do
       %{"method" => "turn/failed", "params" => params} = payload ->
         error_code = ObservabilitySanitizer.error_code(params, "turn_failed")
         reason = {:turn_failed, error_code}
-        emit_message(on_message, :turn_failed, %{error_code: error_code, reason: reason}, metadata_from_message(port, payload))
+
+        emit_message(
+          on_message,
+          :turn_failed,
+          %{error_code: error_code, reason: reason},
+          metadata_from_message(port, payload)
+        )
+
         {:error, reason}
 
       %{"method" => "turn/cancelled"} = payload ->
         reason = {:turn_cancelled, "cancelled"}
-        emit_message(on_message, :turn_cancelled, %{error_code: "cancelled", reason: reason}, metadata_from_message(port, payload))
+
+        emit_message(
+          on_message,
+          :turn_cancelled,
+          %{error_code: "cancelled", reason: reason},
+          metadata_from_message(port, payload)
+        )
+
         {:error, reason}
 
       %{"method" => "error"} = payload ->
