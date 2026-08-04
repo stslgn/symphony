@@ -24,16 +24,13 @@ defmodule SymphonyElixir.Workspace do
           {:ok, prepared_workspace()} | {:error, term()}
   def prepare_for_issue(issue_or_identifier, worker_host, opts) when is_list(opts) do
     issue_context = issue_context(issue_or_identifier)
-    expected_workspace_path = Keyword.get(opts, :expected_workspace_path)
 
     try do
       safe_id = safe_identifier(issue_context.issue_identifier)
 
-      with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
-           :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
-           :ok <- validate_expected_workspace_path(workspace, expected_workspace_path, worker_host) do
-        {:ok, %{path: workspace, root: Path.dirname(workspace), created?: created?}}
+      with {:ok, target} <- prepare_target(safe_id, worker_host, opts),
+           {:ok, workspace, created?} <- ensure_workspace(target.path, worker_host) do
+        {:ok, %{path: workspace, root: target.root, created?: created?}}
       end
     rescue
       error in [ArgumentError, ErlangError, File.Error] ->
@@ -298,6 +295,68 @@ defmodule SymphonyElixir.Workspace do
     {:ok, Path.join(Config.settings!().workspace.root, safe_id)}
   end
 
+  defp prepare_target(safe_id, worker_host, opts) do
+    expected_path = Keyword.get(opts, :expected_workspace_path)
+
+    if is_binary(expected_path) do
+      prepare_affinity_target(expected_path, worker_host, opts)
+    else
+      with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
+           :ok <- validate_workspace_path(workspace, worker_host),
+           {:ok, root} <- workspace_root(worker_host) do
+        {:ok, %{path: workspace, root: root}}
+      end
+    end
+  end
+
+  defp prepare_affinity_target(expected_path, worker_host, opts) do
+    expected_host = Keyword.get(opts, :expected_worker_host, worker_host)
+    expected_root = Keyword.get(opts, :expected_workspace_root) || Path.dirname(expected_path)
+
+    with :ok <- validate_expected_worker_host(expected_host, worker_host),
+         :ok <- validate_affinity_path(expected_path, worker_host),
+         :ok <- validate_affinity_path(expected_root, worker_host),
+         {:ok, target} <- canonical_affinity_target(expected_path, expected_root, worker_host),
+         :ok <- validate_path_against_root(target.path, target.root) do
+      {:ok, target}
+    end
+  end
+
+  defp validate_affinity_path(path, worker_host) when is_binary(path) do
+    if String.trim(path) != "" and not String.contains?(path, ["\n", "\r", <<0>>]) do
+      :ok
+    else
+      {:error, {:workspace_affinity_mismatch, path, :invalid_path, worker_host}}
+    end
+  end
+
+  defp validate_affinity_path(path, worker_host),
+    do: {:error, {:workspace_affinity_mismatch, path, :invalid_path, worker_host}}
+
+  defp canonical_affinity_target(expected_path, expected_root, nil)
+       when is_binary(expected_path) and is_binary(expected_root) do
+    with {:ok, path} <- PathSafety.canonicalize(expected_path),
+         {:ok, root} <- PathSafety.canonicalize(expected_root) do
+      {:ok, %{path: path, root: root}}
+    end
+  end
+
+  defp canonical_affinity_target(expected_path, expected_root, worker_host)
+       when is_binary(expected_path) and is_binary(expected_root) and is_binary(worker_host) do
+    {:ok, %{path: Path.expand(expected_path), root: Path.expand(expected_root)}}
+  end
+
+  defp canonical_affinity_target(expected_path, expected_root, worker_host),
+    do: {:error, {:workspace_affinity_mismatch, expected_path, expected_root, worker_host}}
+
+  defp validate_expected_worker_host(worker_host, worker_host), do: :ok
+
+  defp validate_expected_worker_host(expected_host, worker_host),
+    do: {:error, {:workspace_host_affinity_mismatch, expected_host, worker_host}}
+
+  defp workspace_root(nil), do: PathSafety.canonicalize(Config.settings!().workspace.root)
+  defp workspace_root(worker_host) when is_binary(worker_host), do: {:ok, Config.settings!().workspace.root}
+
   defp safe_identifier(identifier) do
     String.replace(identifier || "issue", ~r/[^a-zA-Z0-9._-]/, "_")
   end
@@ -490,33 +549,6 @@ defmodule SymphonyElixir.Workspace do
       true ->
         :ok
     end
-  end
-
-  defp validate_expected_workspace_path(_workspace, nil, _worker_host), do: :ok
-
-  defp validate_expected_workspace_path(workspace, expected, nil)
-       when is_binary(workspace) and is_binary(expected) do
-    with {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace),
-         {:ok, canonical_expected} <- PathSafety.canonicalize(expected) do
-      if canonical_workspace == canonical_expected do
-        :ok
-      else
-        {:error, {:workspace_affinity_mismatch, canonical_expected, canonical_workspace, nil}}
-      end
-    end
-  end
-
-  defp validate_expected_workspace_path(workspace, expected, worker_host)
-       when is_binary(workspace) and is_binary(expected) and is_binary(worker_host) do
-    if workspace == expected do
-      :ok
-    else
-      {:error, {:workspace_affinity_mismatch, expected, workspace, worker_host}}
-    end
-  end
-
-  defp validate_expected_workspace_path(workspace, expected, worker_host) do
-    {:error, {:workspace_affinity_mismatch, expected, workspace, worker_host}}
   end
 
   defp validate_path_against_root(workspace, root)

@@ -875,6 +875,7 @@ defmodule SymphonyElixir.Orchestrator do
           dispatch.attempt,
           dispatch.worker_host,
           dispatch.workspace_path,
+          dispatch.workspace_root,
           dispatch.affinity_required
         )
       else
@@ -1026,6 +1027,7 @@ defmodule SymphonyElixir.Orchestrator do
          attempt,
          preferred_worker_host,
          expected_workspace_path,
+         expected_workspace_root,
          affinity_required
        ) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
@@ -1036,6 +1038,7 @@ defmodule SymphonyElixir.Orchestrator do
           attempt,
           preferred_worker_host,
           expected_workspace_path,
+          expected_workspace_root,
           affinity_required
         )
 
@@ -1060,6 +1063,7 @@ defmodule SymphonyElixir.Orchestrator do
          attempt,
          preferred_worker_host,
          expected_workspace_path,
+         expected_workspace_root,
          affinity_required
        ) do
     recipient = self()
@@ -1084,7 +1088,9 @@ defmodule SymphonyElixir.Orchestrator do
             attempt,
             recipient,
             worker_host,
-            expected_workspace_path
+            expected_workspace_path,
+            expected_workspace_root,
+            preferred_worker_host
           )
         end
     end
@@ -1096,7 +1102,9 @@ defmodule SymphonyElixir.Orchestrator do
          attempt,
          recipient,
          worker_host,
-         expected_workspace_path
+         expected_workspace_path,
+         expected_workspace_root,
+         expected_worker_host
        ) do
     case Config.validate_runtime_capabilities() do
       :ok ->
@@ -1106,7 +1114,9 @@ defmodule SymphonyElixir.Orchestrator do
           attempt,
           recipient,
           worker_host,
-          expected_workspace_path
+          expected_workspace_path,
+          expected_workspace_root,
+          expected_worker_host
         )
 
       {:error, {:missing_required_dynamic_tools, tools}} ->
@@ -1125,9 +1135,15 @@ defmodule SymphonyElixir.Orchestrator do
          attempt,
          recipient,
          worker_host,
-         expected_workspace_path
+         expected_workspace_path,
+         expected_workspace_root,
+         expected_worker_host
        ) do
-    case Workspace.prepare_for_issue(issue, worker_host, expected_workspace_path: expected_workspace_path) do
+    case Workspace.prepare_for_issue(issue, worker_host,
+           expected_workspace_path: expected_workspace_path,
+           expected_workspace_root: expected_workspace_root,
+           expected_worker_host: expected_worker_host
+         ) do
       {:ok, prepared_workspace} ->
         claim_prepared_issue(
           state,
@@ -1622,6 +1638,7 @@ defmodule SymphonyElixir.Orchestrator do
          attempt,
          metadata[:worker_host],
          metadata[:workspace_path],
+         metadata[:workspace_root],
          affinity_required
        )}
     else
@@ -1800,6 +1817,7 @@ defmodule SymphonyElixir.Orchestrator do
         attempt: Map.get(dispatch, :attempt),
         worker_host: Map.get(dispatch, :worker_host),
         workspace_path: Map.get(dispatch, :workspace_path),
+        workspace_root: Map.get(dispatch, :workspace_root),
         affinity_required: map_size(dispatch) > 0
       }
     end)

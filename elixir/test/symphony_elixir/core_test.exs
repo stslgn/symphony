@@ -2306,10 +2306,130 @@ defmodule SymphonyElixir.CoreTest do
     File.rm_rf!(actual_workspace)
     File.rm(hook_marker)
 
-    assert {:error, {:workspace_affinity_mismatch, _expected, ^actual_workspace, nil}} =
-             Workspace.create_for_issue(issue, nil, expected_workspace_path: Path.join(workspace_root, "MT-OTHER"))
+    assert {:error, {:workspace_outside_root, _workspace, _root}} =
+             Workspace.create_for_issue(issue, nil,
+               expected_workspace_path: Path.join([test_root, "outside", issue.identifier]),
+               expected_workspace_root: workspace_root,
+               expected_worker_host: nil
+             )
 
     refute File.exists?(hook_marker)
+  end
+
+  test "persisted local affinity is selected before live-root filesystem mutation" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-local-prepare-root-change-#{System.unique_integer([:positive])}"
+      )
+
+    old_root = Path.join(test_root, "old-root")
+    new_root = Path.join(test_root, "new-root")
+    identifier = "MT-LOCAL-ROOT-CHANGE"
+    old_workspace = Path.join(old_root, identifier)
+    wrong_root_target = Path.join(new_root, identifier)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+    File.mkdir_p!(old_workspace)
+    File.mkdir_p!(new_root)
+    File.write!(Path.join(old_workspace, "preserved-work"), "old")
+    File.write!(wrong_root_target, "wrong-root-file-must-survive")
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: new_root)
+
+    assert {:ok, prepared} =
+             Workspace.prepare_for_issue(identifier, nil,
+               expected_workspace_path: old_workspace,
+               expected_workspace_root: old_root,
+               expected_worker_host: nil
+             )
+
+    assert {:ok, canonical_old_workspace} = SymphonyElixir.PathSafety.canonicalize(old_workspace)
+    assert {:ok, canonical_old_root} = SymphonyElixir.PathSafety.canonicalize(old_root)
+    assert prepared.path == canonical_old_workspace
+    assert prepared.root == canonical_old_root
+    assert File.read!(Path.join(old_workspace, "preserved-work")) == "old"
+    assert File.read!(wrong_root_target) == "wrong-root-file-must-survive"
+  end
+
+  test "persisted remote affinity selects exact root and rejects host mismatch before ssh" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-remote-prepare-root-change-#{System.unique_integer([:positive])}"
+      )
+
+    old_root = Path.join(test_root, "remote-old-root")
+    new_root = Path.join(test_root, "remote-new-root")
+    identifier = "MT-REMOTE-ROOT-CHANGE"
+    old_workspace = Path.join(old_root, identifier)
+    wrong_root_workspace = Path.join(new_root, identifier)
+    wrong_root_sentinel = Path.join(wrong_root_workspace, "must-survive")
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_sentinel = System.get_env("SYMP_TEST_WRONG_ROOT_SENTINEL")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      restore_env("SYMP_TEST_WRONG_ROOT_SENTINEL", previous_sentinel)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(wrong_root_workspace)
+    File.write!(wrong_root_sentinel, "wrong-root-directory-must-survive")
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("SYMP_TEST_WRONG_ROOT_SENTINEL", wrong_root_sentinel)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    printf 'ARGV:%s\n' "$*" >> "${SYMP_TEST_SSH_TRACE}"
+    case "$*" in
+      *#{old_workspace}*"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\t%s\t%s\n' '__SYMPHONY_WORKSPACE__' '0' '#{old_workspace}'
+        exit 0
+        ;;
+      *#{wrong_root_workspace}*"__SYMPHONY_WORKSPACE__"*)
+        rm -f "${SYMP_TEST_WRONG_ROOT_SENTINEL}"
+        printf '%s\t%s\t%s\n' '__SYMPHONY_WORKSPACE__' '0' '#{wrong_root_workspace}'
+        exit 0
+        ;;
+      *)
+        exit 75
+        ;;
+    esac
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: new_root)
+
+    assert {:ok, prepared} =
+             Workspace.prepare_for_issue(identifier, "worker-a",
+               expected_workspace_path: old_workspace,
+               expected_workspace_root: old_root,
+               expected_worker_host: "worker-a"
+             )
+
+    assert prepared.path == old_workspace
+    assert prepared.root == old_root
+    assert File.read!(wrong_root_sentinel) == "wrong-root-directory-must-survive"
+    assert File.read!(trace_file) =~ old_workspace
+    refute File.read!(trace_file) =~ wrong_root_workspace
+
+    File.write!(trace_file, "")
+
+    assert {:error, {:workspace_host_affinity_mismatch, "worker-a", "worker-b"}} =
+             Workspace.prepare_for_issue(identifier, "worker-b",
+               expected_workspace_path: old_workspace,
+               expected_workspace_root: old_root,
+               expected_worker_host: "worker-a"
+             )
+
+    assert File.read!(trace_file) == ""
+    assert File.read!(wrong_root_sentinel) == "wrong-root-directory-must-survive"
   end
 
   test "prepared affinity is acknowledged before workspace hooks or Codex" do
