@@ -48,6 +48,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       :run_ledger_path,
       :run_ledger_append_fn,
+      :task_start_fn,
       :runner_generation,
       dispatch_paused: false,
       running: %{},
@@ -278,7 +279,7 @@ defmodule SymphonyElixir.Orchestrator do
       if state.dispatch_paused do
         {:noreply, defer_retry_while_paused(state, issue_id, retry_token)}
       else
-        case pop_retry_attempt_state(state, issue_id, retry_token) do
+        case due_retry_attempt_state(state, issue_id, retry_token) do
           {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
           :missing -> {:noreply, state}
         end
@@ -489,6 +490,44 @@ defmodule SymphonyElixir.Orchestrator do
   @spec retry_pending_durable_retries_for_test(term()) :: term()
   def retry_pending_durable_retries_for_test(%State{} = state) do
     retry_pending_durable_retries(state)
+  end
+
+  @doc false
+  @spec claim_and_start_issue_for_test(
+          term(),
+          Issue.t(),
+          non_neg_integer(),
+          String.t() | nil,
+          Path.t() | nil,
+          Path.t() | nil,
+          String.t() | nil
+        ) :: term()
+  def claim_and_start_issue_for_test(
+        %State{} = state,
+        %Issue{} = issue,
+        attempt,
+        worker_host,
+        expected_workspace_path,
+        expected_workspace_root,
+        expected_worker_host
+      ) do
+    claim_and_start_issue(
+      state,
+      issue,
+      attempt,
+      self(),
+      worker_host,
+      expected_workspace_path,
+      expected_workspace_root,
+      expected_worker_host
+    )
+  end
+
+  @doc false
+  @spec due_retry_attempt_state_for_test(term(), String.t(), reference()) :: term()
+  def due_retry_attempt_state_for_test(%State{} = state, issue_id, retry_token)
+      when is_binary(issue_id) and is_reference(retry_token) do
+    due_retry_attempt_state(state, issue_id, retry_token)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -1121,11 +1160,11 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, {:missing_required_dynamic_tools, tools}} ->
         Logger.error("Runtime capability preflight blocked claim for #{issue_context(issue)}: missing_required_dynamic_tools=#{Enum.join(tools, ",")}")
-        state
+        defer_pending_dispatch(state, issue.id, :missing_required_dynamic_tools)
 
       {:error, reason} ->
         Logger.error("Runtime capability preflight failed for #{issue_context(issue)}: #{inspect(reason)}")
-        state
+        defer_pending_dispatch(state, issue.id, reason)
     end
   end
 
@@ -1156,7 +1195,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Workspace preparation blocked claim for #{issue_context(issue)}: #{inspect(reason)}")
-        state
+        defer_pending_dispatch(state, issue.id, reason)
     end
   end
 
@@ -1200,7 +1239,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Unable to record durable claim for #{issue_context(issue)}: #{inspect(reason)}")
-        state
+        defer_pending_dispatch(state, issue.id, reason)
     end
   end
 
@@ -1216,19 +1255,21 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
     run_budget = RunBudget.from_agent_config(Config.settings!().agent)
 
-    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient,
-             attempt: attempt,
-             worker_host: worker_host,
-             expected_workspace_path: prepared_workspace.path,
-             prepared_workspace: prepared_workspace,
-             runtime_ack_required: true,
-             run_id: run_id,
-             runner_generation: state.runner_generation,
-             stage: "running",
-             max_turns: run_budget.max_turns
-           )
-         end) do
+    task = fn ->
+      AgentRunner.run(issue, recipient,
+        attempt: attempt,
+        worker_host: worker_host,
+        expected_workspace_path: prepared_workspace.path,
+        prepared_workspace: prepared_workspace,
+        runtime_ack_required: true,
+        run_id: run_id,
+        runner_generation: state.runner_generation,
+        stage: "running",
+        max_turns: run_budget.max_turns
+      )
+    end
+
+    case start_agent_task(state, task) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
 
@@ -1290,7 +1331,7 @@ defmodule SymphonyElixir.Orchestrator do
             Logger.error("Unable to record durable run start for #{issue_context(issue)}: #{inspect(reason)}")
             terminate_task(pid)
             Process.demonitor(ref, [:flush])
-            state
+            fail_claimed_start(state, issue.id, running_entry, reason)
         end
 
       {:error, reason} ->
@@ -1329,6 +1370,36 @@ defmodule SymphonyElixir.Orchestrator do
         state = %{state | claimed: MapSet.put(state.claimed, issue.id)}
         persist_or_block_terminal(state, issue.id, failed_entry, pending)
     end
+  end
+
+  defp start_agent_task(%State{task_start_fn: task_start_fn}, task) when is_function(task_start_fn, 1),
+    do: task_start_fn.(task)
+
+  defp start_agent_task(_state, task),
+    do: Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, task)
+
+  defp fail_claimed_start(state, issue_id, running_entry, reason) do
+    attempt = Map.get(running_entry, :retry_attempt, 0)
+
+    pending = %{
+      transition: "run_failed",
+      terminal_reason: "spawn_failed",
+      action:
+        {:retry, attempt + 1,
+         %{
+           identifier: running_entry.identifier,
+           error: "failed to persist run start: #{inspect(reason)}",
+           previous_run_id: running_entry.run_id,
+           previous_attempt: attempt,
+           worker_host: running_entry.worker_host,
+           workspace_path: running_entry.workspace_path,
+           workspace_root: running_entry.workspace_root
+         }}
+    }
+
+    state
+    |> Map.put(:claimed, MapSet.put(state.claimed, issue_id))
+    |> persist_or_block_terminal(issue_id, running_entry, pending)
   end
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
@@ -1494,7 +1565,7 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
+  defp due_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
     case Map.get(state.retry_attempts, issue_id) do
       %{attempt: attempt, retry_token: ^retry_token} = retry_entry ->
         metadata = %{
@@ -1508,10 +1579,41 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_root: Map.get(retry_entry, :workspace_root)
         }
 
-        {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
+        dispatching_entry = %{
+          retry_entry
+          | timer_ref: nil,
+            retry_token: nil,
+            due_at_ms: nil,
+            status: :dispatching
+        }
+
+        {:ok, attempt, metadata, %{state | retry_attempts: Map.put(state.retry_attempts, issue_id, dispatching_entry)}}
 
       _ ->
         :missing
+    end
+  end
+
+  defp defer_pending_dispatch(%State{} = state, issue_id, reason) do
+    case Map.get(state.retry_attempts, issue_id) do
+      nil ->
+        state
+
+      retry ->
+        if is_reference(Map.get(retry, :timer_ref)), do: Process.cancel_timer(retry.timer_ref)
+
+        delay_ms = failure_retry_delay(max(Map.get(retry, :attempt, 1), 1))
+        retry_token = make_ref()
+
+        updated_retry =
+          retry
+          |> Map.put(:timer_ref, Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms))
+          |> Map.put(:retry_token, retry_token)
+          |> Map.put(:due_at_ms, System.monotonic_time(:millisecond) + delay_ms)
+          |> Map.put(:status, :scheduled)
+          |> Map.put(:error, ObservabilitySanitizer.error_code(reason, "dispatch_failed"))
+
+        %{state | retry_attempts: Map.put(state.retry_attempts, issue_id, updated_retry)}
     end
   end
 
@@ -1610,15 +1712,15 @@ defmodule SymphonyElixir.Orchestrator do
         handle_active_retry(state, issue, attempt, metadata)
 
       true ->
-        Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
+        Logger.debug("Issue left active states while retry was pending issue_id=#{issue_id} issue_identifier=#{issue.identifier}; keeping bounded dispatch visibility")
 
-        {:noreply, release_issue_claim(state, issue_id)}
+        {:noreply, defer_pending_dispatch(state, issue_id, :retry_issue_not_active)}
     end
   end
 
   defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, _metadata) do
-    Logger.debug("Issue no longer visible, removing claim issue_id=#{issue_id}")
-    {:noreply, release_issue_claim(state, issue_id)}
+    Logger.debug("Issue no longer visible while retry was pending issue_id=#{issue_id}; keeping bounded dispatch visibility")
+    {:noreply, defer_pending_dispatch(state, issue_id, :retry_issue_not_visible)}
   end
 
   defp notify_dashboard do
@@ -1682,6 +1784,7 @@ defmodule SymphonyElixir.Orchestrator do
     case append_workspace_cleanup_request(state, cleanup_entry) do
       :ok ->
         state
+        |> consume_pending_retry(issue_id)
         |> put_cleanup_pending(issue_id, %{cleanup_entry | status: :cleanup_pending})
         |> perform_workspace_cleanup(issue_id)
 
@@ -1712,6 +1815,10 @@ defmodule SymphonyElixir.Orchestrator do
       | cleanup_pending: Map.put(state.cleanup_pending, issue_id, entry),
         claimed: MapSet.put(state.claimed, issue_id)
     }
+  end
+
+  defp consume_pending_retry(state, issue_id) do
+    %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
   end
 
   defp retry_pending_workspace_cleanups(%State{} = state) do

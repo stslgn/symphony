@@ -1494,6 +1494,119 @@ defmodule SymphonyElixir.CoreTest do
     Process.cancel_timer(scheduled_state.retry_attempts[issue_id].timer_ref)
   end
 
+  test "preparation and claim failures keep durable retry dispatch visible across restart" do
+    {prepare_state, prepare_issue, prepare_path, prepare_root} =
+      pending_dispatch_fixture("prepare-failure")
+
+    outside_path = Path.join(Path.dirname(prepare_root), "outside/#{prepare_issue.identifier}")
+
+    prepare_state = due_dispatch_state(prepare_state, prepare_issue.id)
+
+    prepare_failed =
+      Orchestrator.claim_and_start_issue_for_test(
+        prepare_state,
+        prepare_issue,
+        2,
+        nil,
+        outside_path,
+        prepare_root,
+        nil
+      )
+
+    assert_pending_dispatch_visible(prepare_failed, prepare_issue.id, 2)
+    assert {:ok, prepare_recovery} = RunLedger.reconcile_startup(prepare_path, "runner-after-prepare")
+    assert prepare_recovery.recovered_attempts[prepare_issue.id] == 2
+
+    {claim_state, claim_issue, claim_path, claim_root} = pending_dispatch_fixture("claim-failure")
+    claim_workspace = Path.join(claim_root, claim_issue.identifier)
+
+    claim_failed =
+      claim_state
+      |> due_dispatch_state(claim_issue.id)
+      |> Map.put(:run_ledger_append_fn, fn ledger_path, event ->
+        if event.transition == "run_claimed",
+          do: {:error, :forced_claim_append_failure},
+          else: RunLedger.append(ledger_path, event)
+      end)
+      |> Orchestrator.claim_and_start_issue_for_test(
+        claim_issue,
+        2,
+        nil,
+        claim_workspace,
+        claim_root,
+        nil
+      )
+
+    assert_pending_dispatch_visible(claim_failed, claim_issue.id, 2)
+    assert {:ok, claim_recovery} = RunLedger.reconcile_startup(claim_path, "runner-after-claim")
+    assert claim_recovery.recovered_attempts[claim_issue.id] == 2
+
+    Process.cancel_timer(prepare_failed.retry_attempts[prepare_issue.id].timer_ref)
+    Process.cancel_timer(claim_failed.retry_attempts[claim_issue.id].timer_ref)
+  end
+
+  test "spawn and start append failures retain durable or surfaced claim ownership" do
+    {spawn_state, spawn_issue, spawn_path, spawn_root} = pending_dispatch_fixture("spawn-failure")
+    spawn_workspace = Path.join(spawn_root, spawn_issue.identifier)
+
+    spawn_failed =
+      spawn_state
+      |> due_dispatch_state(spawn_issue.id)
+      |> Map.put(:task_start_fn, fn _task -> {:error, :forced_spawn_failure} end)
+      |> Orchestrator.claim_and_start_issue_for_test(
+        spawn_issue,
+        2,
+        nil,
+        spawn_workspace,
+        spawn_root,
+        nil
+      )
+
+    refute Map.has_key?(spawn_failed.running, spawn_issue.id)
+    assert_pending_dispatch_visible(spawn_failed, spawn_issue.id, 3)
+    assert {:ok, spawn_recovery} = RunLedger.reconcile_startup(spawn_path, "runner-after-spawn")
+    assert spawn_recovery.recovered_attempts[spawn_issue.id] == 3
+
+    {start_state, start_issue, start_path, start_root} = pending_dispatch_fixture("start-failure")
+    start_workspace = Path.join(start_root, start_issue.identifier)
+
+    start_failed =
+      start_state
+      |> due_dispatch_state(start_issue.id)
+      |> Map.put(:task_start_fn, fn _task ->
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end)
+      |> Map.put(:run_ledger_append_fn, fn ledger_path, event ->
+        if event.transition in ["run_started", "run_failed"],
+          do: {:error, :forced_start_transition_failure},
+          else: RunLedger.append(ledger_path, event)
+      end)
+      |> Orchestrator.claim_and_start_issue_for_test(
+        start_issue,
+        2,
+        nil,
+        start_workspace,
+        start_root,
+        nil
+      )
+
+    assert MapSet.member?(start_failed.claimed, start_issue.id)
+    assert %{terminal_pending: %{transition: "run_failed"}} = start_failed.running[start_issue.id]
+    refute Map.has_key?(start_failed.retry_attempts, start_issue.id)
+
+    assert {:reply, start_snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, start_failed)
+
+    assert [%{issue_id: start_issue_id, stage: "terminal_pending"}] = start_snapshot.running
+    assert start_issue_id == start_issue.id
+    assert start_snapshot.retrying == []
+
+    assert {:ok, start_recovery} = RunLedger.reconcile_startup(start_path, "runner-after-start")
+    assert start_recovery.recovered_attempts[start_issue.id] == 3
+
+    Process.cancel_timer(spawn_failed.retry_attempts[spawn_issue.id].timer_ref)
+  end
+
   test "tracker terminal ledger failure blocks worker stop cleanup and claim release" do
     test_root =
       Path.join(
@@ -3633,6 +3746,139 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp pending_dispatch_fixture(tag) do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-pending-dispatch-#{tag}-#{System.unique_integer([:positive])}"
+      )
+
+    raw_workspace_root = Path.join(test_root, "workspaces")
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: raw_workspace_root)
+    File.mkdir_p!(raw_workspace_root)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    {:ok, workspace_root} = SymphonyElixir.PathSafety.canonicalize(raw_workspace_root)
+    issue_id = "issue-pending-#{tag}"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-PENDING-#{String.upcase(tag)}",
+      title: "Pending dispatch #{tag}",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    workspace = Path.join(workspace_root, issue.identifier)
+    ledger_path = Path.join(test_root, "events.jsonl")
+    previous_run_id = "run-previous-#{tag}"
+
+    seed_durable_retry_ledger!(
+      ledger_path,
+      previous_run_id,
+      issue,
+      workspace,
+      workspace_root
+    )
+
+    retry_token = make_ref()
+
+    retry = %{
+      attempt: 2,
+      timer_ref: nil,
+      retry_token: retry_token,
+      due_at_ms: nil,
+      identifier: issue.identifier,
+      error: "previous_failure",
+      previous_run_id: previous_run_id,
+      previous_attempt: 1,
+      next_action: "retry",
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: workspace_root,
+      pending_event: nil,
+      status: :scheduled
+    }
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 1_000,
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: &RunLedger.append/2,
+      runner_generation: "runner-pending-dispatch",
+      retry_attempts: %{issue_id => retry},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    {state, issue, ledger_path, workspace_root}
+  end
+
+  defp seed_durable_retry_ledger!(path, run_id, issue, workspace, workspace_root) do
+    base = %{
+      run_id: run_id,
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      attempt: 1,
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: workspace_root
+    }
+
+    assert :ok = RunLedger.append(path, Map.merge(base, %{transition: "run_claimed", stage: "claimed"}))
+    assert :ok = RunLedger.append(path, Map.merge(base, %{transition: "run_started", stage: "running"}))
+
+    assert :ok =
+             RunLedger.append(
+               path,
+               Map.merge(base, %{
+                 transition: "run_failed",
+                 stage: "released",
+                 terminal_reason: "worker_exit",
+                 next_action: "retry",
+                 next_attempt: 2
+               })
+             )
+
+    assert :ok =
+             RunLedger.append(
+               path,
+               Map.merge(base, %{
+                 transition: "retry_scheduled",
+                 stage: "retry_queued",
+                 next_action: "retry",
+                 next_attempt: 2
+               })
+             )
+  end
+
+  defp assert_pending_dispatch_visible(state, issue_id, attempt) do
+    assert MapSet.member?(state.claimed, issue_id)
+
+    assert %{attempt: ^attempt, status: :scheduled, timer_ref: timer_ref} =
+             state.retry_attempts[issue_id]
+
+    assert is_reference(timer_ref)
+
+    assert {:reply, snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, state)
+
+    assert Enum.any?(snapshot.retrying, fn row ->
+             row.issue_id == issue_id and row.attempt == attempt and row.stage == "retry_queued"
+           end)
+  end
+
+  defp due_dispatch_state(state, issue_id) do
+    retry_token = state.retry_attempts[issue_id].retry_token
+
+    assert {:ok, attempt, _metadata, due_state} =
+             Orchestrator.due_retry_attempt_state_for_test(state, issue_id, retry_token)
+
+    assert due_state.retry_attempts[issue_id].attempt == attempt
+    assert due_state.retry_attempts[issue_id].status == :dispatching
+    refute is_reference(due_state.retry_attempts[issue_id].timer_ref)
+    due_state
   end
 
   defp terminal_transition_state(issue_id, ref, run_ledger_path, opts) do
