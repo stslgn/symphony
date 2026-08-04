@@ -1379,20 +1379,35 @@ defmodule SymphonyElixir.ExtensionsTest do
   defp assert_eventually(_fun, 0), do: flunk("condition not met in time")
 
   defp await_orchestrator_poll_idle(orchestrator_name) do
-    assert_eventually(
-      fn ->
-        case Orchestrator.snapshot(orchestrator_name, 250) do
-          %{polling: %{checking?: false, next_poll_in_ms: next_poll_in_ms}}
-          when is_integer(next_poll_in_ms) and next_poll_in_ms > 0 ->
-            true
-
-          _other ->
-            false
-        end
-      end,
-      40
-    )
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    await_orchestrator_poll_idle(orchestrator_name, deadline)
   end
+
+  defp await_orchestrator_poll_idle(orchestrator_name, deadline) do
+    snapshot = Orchestrator.snapshot(orchestrator_name, 250)
+
+    case snapshot do
+      %{polling: %{checking?: false, next_poll_in_ms: next_poll_in_ms}}
+      when is_integer(next_poll_in_ms) and next_poll_in_ms > 0 ->
+        :ok
+
+      last_snapshot ->
+        now = System.monotonic_time(:millisecond)
+
+        if now >= deadline do
+          flunk(
+            "orchestrator poll did not become idle within 5000ms; " <>
+              "last polling state: #{inspect(polling_state(last_snapshot))}"
+          )
+        else
+          Process.sleep(min(25, deadline - now))
+          await_orchestrator_poll_idle(orchestrator_name, deadline)
+        end
+    end
+  end
+
+  defp polling_state(%{polling: polling}), do: polling
+  defp polling_state(other), do: other
 
   defp successful_poll_result(request) do
     %{
