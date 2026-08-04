@@ -412,14 +412,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_parked_issue(%Issue{} = issue, %State{} = state) do
-    if terminal_issue_state?(issue.state, terminal_state_set()) or
-         !issue_routable_to_worker?(issue) do
-      release_parked_issue(state, issue.id, "tracker_released")
-    else
-      update_in(state.parked[issue.id], fn
-        nil -> nil
-        wait -> %{wait | tracker_state: issue.state, identifier: issue.identifier}
-      end)
+    cond do
+      terminal_issue_state?(issue.state, terminal_state_set()) ->
+        release_terminal_parked_issue(state, issue.id)
+
+      !issue_routable_to_worker?(issue) ->
+        release_parked_issue(state, issue.id, "worker_route_removed")
+
+      true ->
+        update_in(state.parked[issue.id], fn
+          nil -> nil
+          wait -> %{wait | tracker_state: issue.state, identifier: issue.identifier}
+        end)
     end
   end
 
@@ -433,6 +437,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   def reconcile_issue_states_for_test(issues, state) when is_list(issues) do
     reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec reconcile_parked_issue_for_test(Issue.t(), term()) :: term()
+  def reconcile_parked_issue_for_test(%Issue{} = issue, %State{} = state) do
+    reconcile_parked_issue(issue, state)
   end
 
   @doc false
@@ -641,24 +651,50 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp release_parked_issue(%State{} = state, issue_id, terminal_reason) do
+  defp release_terminal_parked_issue(%State{} = state, issue_id) do
+    case persist_parked_release(state, issue_id, "tracker_terminal") do
+      {:ok, released_state, wait} ->
+        cleanup_metadata = %{
+          run_id: wait.run_id,
+          attempt: wait.attempt,
+          identifier: wait.identifier,
+          worker_host: Map.get(wait, :worker_host),
+          workspace_path: Map.get(wait, :workspace_path),
+          workspace_root: Map.get(wait, :workspace_root)
+        }
+
+        request_workspace_cleanup(released_state, issue_id, cleanup_metadata, "tracker_terminal")
+
+      {:error, state} ->
+        state
+    end
+  end
+
+  defp release_parked_issue(%State{} = state, issue_id, release_reason) do
+    case persist_parked_release(state, issue_id, release_reason) do
+      {:ok, released_state, _wait} -> released_state
+      {:error, state} -> state
+    end
+  end
+
+  defp persist_parked_release(%State{} = state, issue_id, release_reason) do
     case Map.get(state.parked, issue_id) do
       nil ->
-        state
+        {:error, state}
 
       wait ->
         event =
           wait
           |> operator_wait_event("wait_released")
-          |> Map.put(:terminal_reason, terminal_reason)
+          |> Map.put(:release_reason, release_reason)
 
         case append_run_event(state, event) do
           :ok ->
-            %{state | parked: Map.delete(state.parked, issue_id)}
+            {:ok, %{state | parked: Map.delete(state.parked, issue_id)}, wait}
 
           {:error, reason} ->
             Logger.error("Failed to release parked issue_id=#{issue_id}: #{inspect(reason)}")
-            state
+            {:error, state}
         end
     end
   end

@@ -955,6 +955,105 @@ defmodule SymphonyElixir.CoreTest do
       do: Process.cancel_timer(snapshotted_state.tick_timer_ref)
   end
 
+  test "terminal parked issue releases durably and removes its local recorded workspace" do
+    root = parked_workspace_root("local-terminal")
+    workspace = Path.join(root, "MT-PARKED-LOCAL-TERMINAL")
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "remove-me"), "old")
+
+    {state, wait} = parked_reconcile_state("local-terminal", workspace, root, nil)
+
+    reconciled =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{id: wait.issue_id, identifier: wait.identifier, state: "Closed"},
+        state
+      )
+
+    refute File.exists?(workspace)
+    refute Map.has_key?(reconciled.parked, wait.issue_id)
+    refute Map.has_key?(reconciled.cleanup_pending, wait.issue_id)
+
+    assert {:ok, events} = RunLedger.read_events(state.run_ledger_path)
+    assert Enum.any?(events, &(&1["transition"] == "wait_released" and &1["release_reason"] == "tracker_terminal"))
+    assert Enum.any?(events, &(&1["transition"] == "workspace_cleanup_completed"))
+  end
+
+  test "unrouted parked issue releases durably but preserves its local workspace" do
+    root = parked_workspace_root("local-unrouted")
+    workspace = Path.join(root, "MT-PARKED-LOCAL-UNROUTED")
+    sentinel = Path.join(workspace, "must-survive")
+    File.mkdir_p!(workspace)
+    File.write!(sentinel, "kept")
+
+    {state, wait} = parked_reconcile_state("local-unrouted", workspace, root, nil)
+
+    reconciled =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{
+          id: wait.issue_id,
+          identifier: wait.identifier,
+          state: "In Progress",
+          assigned_to_worker: false
+        },
+        state
+      )
+
+    assert File.read!(sentinel) == "kept"
+    refute Map.has_key?(reconciled.parked, wait.issue_id)
+    refute Map.has_key?(reconciled.cleanup_pending, wait.issue_id)
+
+    assert {:ok, events} = RunLedger.read_events(state.run_ledger_path)
+
+    assert Enum.any?(events, fn event ->
+             event["transition"] == "wait_released" and
+               event["release_reason"] == "worker_route_removed"
+           end)
+
+    refute Enum.any?(events, &String.starts_with?(&1["transition"], "workspace_cleanup_"))
+  end
+
+  test "terminal parked issue releases durably and removes its remote recorded workspace" do
+    {remote_root, workspace, trace_file} = install_fake_parked_cleanup_ssh!("remote-terminal")
+    {state, wait} = parked_reconcile_state("remote-terminal", workspace, remote_root, "worker-a")
+
+    reconciled =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{id: wait.issue_id, identifier: wait.identifier, state: "Closed"},
+        state
+      )
+
+    refute Map.has_key?(reconciled.parked, wait.issue_id)
+    refute Map.has_key?(reconciled.cleanup_pending, wait.issue_id)
+
+    trace = File.read!(trace_file)
+    assert trace =~ "worker-a bash -lc"
+    assert trace =~ "rm -rf"
+    assert trace =~ workspace
+  end
+
+  test "unrouted parked issue releases durably without touching its remote workspace" do
+    {remote_root, workspace, trace_file} = install_fake_parked_cleanup_ssh!("remote-unrouted")
+    {state, wait} = parked_reconcile_state("remote-unrouted", workspace, remote_root, "worker-a")
+
+    reconciled =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{
+          id: wait.issue_id,
+          identifier: wait.identifier,
+          state: "In Progress",
+          assigned_to_worker: false
+        },
+        state
+      )
+
+    refute Map.has_key?(reconciled.parked, wait.issue_id)
+    refute Map.has_key?(reconciled.cleanup_pending, wait.issue_id)
+    refute File.exists?(trace_file)
+
+    assert {:ok, events} = RunLedger.read_events(state.run_ledger_path)
+    refute Enum.any?(events, &String.starts_with?(&1["transition"], "workspace_cleanup_"))
+  end
+
   test "observed token budget exhaustion parks the run without scheduling retry" do
     issue_id = "issue-token-budget"
 
@@ -3445,6 +3544,79 @@ defmodule SymphonyElixir.CoreTest do
       claimed: MapSet.new([issue_id]),
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
+  end
+
+  defp parked_reconcile_state(tag, workspace_path, workspace_root, worker_host) do
+    issue_id = "issue-parked-#{tag}"
+
+    wait = %{
+      issue_id: issue_id,
+      run_id: "run-parked-#{tag}",
+      attempt: 2,
+      identifier: "MT-PARKED-#{String.upcase(tag)}",
+      wait_id: "wait-parked-#{tag}",
+      reason: "waiting_owner",
+      allowed_actions: ["approve", "reject"],
+      stage: "parked",
+      tracker_state: "Human Review",
+      terminal_reason: nil,
+      worker_host: worker_host,
+      workspace_path: workspace_path,
+      workspace_root: workspace_root,
+      parked_at: DateTime.utc_now()
+    }
+
+    ledger_path = ledger_path("parked-#{tag}")
+    :ok = seed_parked_ledger!(ledger_path, wait)
+
+    state = %Orchestrator.State{
+      run_ledger_path: ledger_path,
+      runner_generation: "runner-parked-reconcile",
+      parked: %{issue_id => wait},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    {state, wait}
+  end
+
+  defp parked_workspace_root(tag) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-parked-reconcile-#{tag}-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+    root
+  end
+
+  defp install_fake_parked_cleanup_ssh!(tag) do
+    test_root = parked_workspace_root("ssh-#{tag}")
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    remote_root = "/remote/symphony/workspaces"
+    workspace = Path.join(remote_root, "MT-PARKED-#{String.upcase(tag)}")
+
+    File.mkdir_p!(test_root)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    printf 'ARGV:%s\\n' "$*" >> "${SYMP_TEST_SSH_TRACE}"
+    exit 0
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+    end)
+
+    {remote_root, workspace, trace_file}
   end
 
   defp blocked_ledger_path do

@@ -51,9 +51,9 @@ defmodule SymphonyElixir.RunLedger do
         "tracker_terminal",
         "worker_route_removed"
       ]),
-    "wait_released" => MapSet.new(["tracker_released", "tracker_terminal", "worker_route_removed"]),
     "workspace_cleanup_requested" => MapSet.new(["tracker_terminal"])
   }
+  @release_reasons MapSet.new(["tracker_terminal", "worker_route_removed"])
   @park_terminal_reasons MapSet.new([
                            "operator_stop",
                            "time_budget_exhausted",
@@ -120,7 +120,7 @@ defmodule SymphonyElixir.RunLedger do
       typed_wait: true
     },
     "wait_released" => %{
-      required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason terminal_reason),
+      required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason release_reason),
       required_attempt: true,
       typed_wait: true
     },
@@ -164,6 +164,7 @@ defmodule SymphonyElixir.RunLedger do
                     :next_action,
                     :next_attempt,
                     :reasoning_effort,
+                    :release_reason,
                     :resolved_model,
                     :run_id,
                     :runner_generation,
@@ -692,7 +693,8 @@ defmodule SymphonyElixir.RunLedger do
          :ok <- validate_typed_wait(event, Map.get(schema, :typed_wait, false)),
          :ok <- validate_timestamp_field(event, Map.get(schema, :timestamp_field)),
          :ok <- validate_transition_stage(event),
-         :ok <- validate_terminal_reason(event) do
+         :ok <- validate_terminal_reason(event),
+         :ok <- validate_release_reason(event) do
       validate_next_action(event)
     end
   end
@@ -760,7 +762,7 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp validate_terminal_reason(%{"transition" => transition} = event)
-       when transition in ["run_parked", "wait_resumed", "resume_queued", "wait_rejected"] do
+       when transition in ["run_parked", "wait_resumed", "resume_queued", "wait_rejected", "wait_released"] do
     case event["terminal_reason"] do
       nil -> :ok
       reason -> if MapSet.member?(@park_terminal_reasons, reason), do: :ok, else: {:error, {:invalid_field, "terminal_reason"}}
@@ -775,6 +777,18 @@ defmodule SymphonyElixir.RunLedger do
       :error ->
         if is_nil(event["terminal_reason"]), do: :ok, else: {:error, {:invalid_field, "terminal_reason"}}
     end
+  end
+
+  defp validate_release_reason(%{"transition" => "wait_released", "release_reason" => reason}) do
+    if MapSet.member?(@release_reasons, reason),
+      do: :ok,
+      else: {:error, {:invalid_field, "release_reason"}}
+  end
+
+  defp validate_release_reason(event) do
+    if is_nil(event["release_reason"]),
+      do: :ok,
+      else: {:error, {:invalid_field, "release_reason"}}
   end
 
   defp validate_next_action(%{"transition" => transition} = event)
@@ -1124,7 +1138,8 @@ defmodule SymphonyElixir.RunLedger do
       :parked_reason,
       :terminal_reason,
       :worker_host,
-      :workspace_path
+      :workspace_path,
+      :workspace_root
     ]
 
     if Enum.all?(fields, fn field -> Map.fetch!(wait, field) == event[Atom.to_string(field)] end) do

@@ -155,7 +155,8 @@ defmodule SymphonyElixir.TestSupport do
       allowed_actions: wait.allowed_actions,
       terminal_reason: Map.get(wait, :terminal_reason),
       worker_host: Map.get(wait, :worker_host),
-      workspace_path: Map.get(wait, :workspace_path)
+      workspace_path: Map.get(wait, :workspace_path),
+      workspace_root: Map.get(wait, :workspace_root)
     })
   end
 
