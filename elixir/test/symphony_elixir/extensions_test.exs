@@ -5,7 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
-  alias SymphonyElixir.RunLedger
+  alias SymphonyElixir.{ParkedProjection, RunLedger}
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -1346,6 +1346,9 @@ defmodule SymphonyElixir.ExtensionsTest do
              "returned_bytes" => state_payload["parked_meta"]["returned_bytes"]
            }
 
+    assert state_payload["parked_meta"]["returned_bytes"] ==
+             byte_size(Jason.encode!(state_payload["parked"]))
+
     assert state_payload["parked_meta"]["returned_bytes"] <= 65_536
     assert length(state_payload["parked"]) == 100
     assert hd(state_payload["parked"])["issue_identifier"] == "AA-000"
@@ -1377,6 +1380,72 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ <<0xFF>>
     refute html =~ "destroy"
     refute html =~ "free_form_reason"
+  end
+
+  test "parked collection accounts for exact JSON array bytes at and above the limit" do
+    assert %{rows: [], metadata: %{returned_bytes: 2}} = ParkedProjection.collection([])
+
+    exact_prefix = tuned_parked_prefix(65_536, 60)
+    one_over_prefix = tuned_parked_prefix(65_537, 60)
+    old_under_count_prefix = tuned_parked_prefix(65_538, 60)
+    tail = for index <- 61..105, do: boundary_parked_wait(index, "ZZ")
+
+    assert length(exact_prefix ++ tail) > 100
+    assert encoded_projected_bytes(exact_prefix) == 65_536
+    assert encoded_projected_bytes(one_over_prefix) == 65_537
+    assert encoded_projected_bytes(old_under_count_prefix) == 65_538
+
+    exact = ParkedProjection.collection(exact_prefix ++ tail)
+    assert exact.metadata.returned_count == 60
+    assert exact.metadata.omitted_count == 45
+    assert exact.metadata.truncated
+    assert exact.metadata.returned_bytes == 65_536
+    assert exact.metadata.returned_bytes == byte_size(Jason.encode!(exact.rows))
+    assert exact.metadata.returned_bytes <= exact.metadata.byte_limit
+
+    for over_prefix <- [one_over_prefix, old_under_count_prefix] do
+      over = ParkedProjection.collection(over_prefix ++ tail)
+
+      assert over.metadata.returned_count == 59
+      assert over.metadata.omitted_count == 46
+      assert over.metadata.truncated
+      assert over.metadata.returned_bytes == byte_size(Jason.encode!(over.rows))
+      assert over.metadata.returned_bytes <= over.metadata.byte_limit
+    end
+
+    orchestrator_name = Module.concat(__MODULE__, :ExactParkedByteBoundaryOrchestrator)
+
+    snapshot =
+      static_snapshot()
+      |> Map.put(:running, [])
+      |> Map.put(:retrying, [])
+      |> Map.put(:parked, exact_prefix ++ tail)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    api_returned_bytes = byte_size(Jason.encode!(state_payload["parked"]))
+
+    assert state_payload["parked_meta"]["returned_bytes"] == api_returned_bytes
+    assert api_returned_bytes == 65_536
+    assert api_returned_bytes <= state_payload["parked_meta"]["byte_limit"]
+
+    {:ok, view, html} = live(build_conn(), "/")
+    live_payload = :sys.get_state(view.pid).socket.assigns.payload
+    live_returned_bytes = byte_size(Jason.encode!(live_payload.parked))
+
+    assert live_payload.parked_meta == exact.metadata
+    assert live_payload.parked_meta.returned_bytes == live_returned_bytes
+    assert live_returned_bytes == api_returned_bytes
+    assert Jason.decode!(Jason.encode!(live_payload.parked)) == state_payload["parked"]
+    assert html =~ "Showing 60 of 105 parked waits; 45 omitted by the bounded projection."
   end
 
   test "cleanup failure remains durably owned and truthful after restart across every surface" do
@@ -1697,6 +1766,69 @@ defmodule SymphonyElixir.ExtensionsTest do
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{limit_id: "codex", primary: %{remaining: 11}}
     }
+  end
+
+  defp tuned_parked_prefix(target_bytes, count) do
+    waits = for index <- 1..count, do: boundary_parked_wait(index, "AA")
+    padding_bytes = target_bytes - encoded_projected_bytes(waits)
+
+    {waits, remaining_bytes} =
+      Enum.map_reduce(waits, padding_bytes, fn wait, remaining_bytes ->
+        add_boundary_padding(wait, remaining_bytes)
+      end)
+
+    if remaining_bytes != 0 or encoded_projected_bytes(waits) != target_bytes do
+      raise "could not tune parked projection to #{target_bytes} encoded bytes"
+    end
+
+    waits
+  end
+
+  defp boundary_parked_wait(index, sort_prefix) do
+    suffix = String.pad_leading(Integer.to_string(index), 3, "0")
+
+    %{
+      issue_id: "issue-#{suffix}",
+      identifier: "#{sort_prefix}-#{suffix}",
+      wait_id: "wait-#{suffix}",
+      reason: "waiting_owner",
+      tracker_state: "Blocked",
+      run_id: "run-#{suffix}",
+      attempt: 0,
+      stage: "parked",
+      terminal_reason: nil,
+      worker_host: "worker",
+      workspace_path: "/srv/boundary/#{suffix}",
+      parked_at: ~U[2026-08-04 00:00:00Z]
+    }
+  end
+
+  defp add_boundary_padding(wait, remaining_bytes) do
+    [
+      {:workspace_path, 512},
+      {:worker_host, 128},
+      {:tracker_state, 128},
+      {:run_id, 128},
+      {:wait_id, 128},
+      {:issue_id, 128},
+      {:identifier, 96}
+    ]
+    |> Enum.reduce({wait, remaining_bytes}, fn {field, limit}, {wait, remaining_bytes} ->
+      value = Map.fetch!(wait, field)
+      added_bytes = min(remaining_bytes, limit - byte_size(value))
+
+      {
+        Map.put(wait, field, value <> String.duplicate("x", added_bytes)),
+        remaining_bytes - added_bytes
+      }
+    end)
+  end
+
+  defp encoded_projected_bytes(waits) do
+    waits
+    |> Enum.map(&ParkedProjection.row/1)
+    |> Jason.encode!()
+    |> byte_size()
   end
 
   defp wait_for_bound_port do

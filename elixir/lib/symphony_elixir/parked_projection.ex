@@ -4,8 +4,8 @@ defmodule SymphonyElixir.ParkedProjection do
 
   The projection is display-only. Exact workspace affinity stays unchanged in
   the durable/internal wait and is never read back from this module for cleanup.
-  Collections are stably sorted, capped at 100 rows and 65,536 encoded row
-  bytes, and accompanied by exact total/omission metadata.
+  Collections are stably sorted, capped at 100 rows and 65,536 encoded JSON
+  array bytes, and accompanied by exact total/omission metadata.
   """
 
   alias SymphonyElixir.OperatorWait
@@ -89,7 +89,7 @@ defmodule SymphonyElixir.ParkedProjection do
 
   defp take_bounded_rows(projected) do
     projected
-    |> Enum.reduce_while({[], 0}, fn {entry, _index}, {rows, bytes} ->
+    |> Enum.reduce_while({[], 2}, fn {entry, _index}, {rows, bytes} ->
       separator_bytes = if rows == [], do: 0, else: 1
       row_bytes = entry |> Jason.encode!() |> byte_size()
       next_bytes = bytes + separator_bytes + row_bytes
