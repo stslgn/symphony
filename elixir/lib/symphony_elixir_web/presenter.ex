@@ -135,6 +135,7 @@ defmodule SymphonyElixirWeb.Presenter do
   defp retry_attempt(retry), do: retry.attempt || 0
 
   defp issue_status(_running, _retry, parked) when not is_nil(parked), do: "parked"
+  defp issue_status(nil, %{stage: "resume_queued"}, nil), do: "resume_queued"
   defp issue_status(_running, nil, nil), do: "running"
   defp issue_status(nil, _retry, nil), do: "retrying"
   defp issue_status(_running, _retry, nil), do: "running"
@@ -163,7 +164,7 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp retry_entry_payload(entry) do
-    %{
+    payload = %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
       attempt: entry.attempt,
@@ -172,6 +173,8 @@ defmodule SymphonyElixirWeb.Presenter do
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path)
     }
+
+    maybe_add_resume_queue_metadata(payload, entry)
   end
 
   defp parked_entry_payload(entry) do
@@ -212,14 +215,26 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp retry_issue_payload(retry) do
-    %{
+    payload = %{
       attempt: retry.attempt,
       due_at: due_at_iso8601(retry.due_in_ms),
       error_code: ObservabilitySanitizer.retry_error_code(retry.error),
       worker_host: Map.get(retry, :worker_host),
       workspace_path: Map.get(retry, :workspace_path)
     }
+
+    maybe_add_resume_queue_metadata(payload, retry)
   end
+
+  defp maybe_add_resume_queue_metadata(payload, %{stage: "resume_queued"} = entry) do
+    Map.merge(payload, %{
+      stage: "resume_queued",
+      run_id: Map.get(entry, :run_id),
+      wait_id: Map.get(entry, :wait_id)
+    })
+  end
+
+  defp maybe_add_resume_queue_metadata(payload, _entry), do: payload
 
   defp model_payload(entry) do
     %{

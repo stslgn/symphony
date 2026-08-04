@@ -87,17 +87,20 @@ attempt, stage, workspace, terminal-reason, operator-command outcome/cursor,
 dispatch-control, and resolved model fields. It never stores prompts, agent
 output, credentials, catalog response details, or comment bodies. At startup,
 Symphony closes unfinished attempts from the
-previous runner generation before the first poll, restores unresolved waits and
-dispatch pause, and resumes each operator comment cursor. An eligible issue is
-then redispatched with an incremented attempt and a new run id.
+previous runner generation before the first poll, restores unresolved waits,
+durable queued resumes, and dispatch pause, and resumes each operator comment
+cursor. An eligible issue is then redispatched with an incremented attempt and
+a new run id.
 
 Human Review and Human Clarification transitions are recorded as durable
 `waiting_owner` operator waits; Deploy Ready is recorded as
 `waiting_live_approval`. The same typed wait model supports secret,
 infrastructure, review-cap, authentication, and explicit `operator_stopped`
 pauses. Parked issues have no retry timer, are excluded from automatic pickup,
-and are restored from the ledger after restart. Resuming a wait does not bypass
-the normal exact Linear state eligibility check.
+and are restored from the ledger after restart. Resuming a wait creates a
+durable `resume_queued` entry that remains visible with its next attempt while
+dispatch is paused or blocked; the next durable claim consumes it. Resume does
+not bypass the normal exact Linear state eligibility check.
 
 Run-budget stops use the same durable model with reason
 `run_budget_exhausted` and exact terminal reason `turn_budget_exhausted`,
@@ -285,8 +288,9 @@ The observability UI now runs on a minimal Phoenix stack:
 - LiveView for the dashboard at `/`
 - JSON API for operational debugging under `/api/v1/*`
 - `/api/v1/state` exposes separate `running`, `retrying`, and `parked` lists;
-  parked rows include the stable wait id, typed reason, allowed actions, and
-  issue/run identity.
+  `retrying` also includes durable `resume_queued` rows with their next attempt,
+  and parked rows include the stable wait id, typed reason, allowed actions,
+  and issue/run identity.
 - The state payload and terminal header expose `control.dispatch_paused`.
 - The same state payload exposes the effective capability allowlist names, but
   never credentials, tool arguments, prompts, or response bodies.

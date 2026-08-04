@@ -119,7 +119,7 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
       assert count_transition(resumed_events, "run_claimed") == 2
 
       assert Enum.any?(resumed_events, fn event ->
-               event["transition"] == "wait_resumed" and event["attempt"] == 1
+               event["transition"] == "resume_queued" and event["attempt"] == 1
              end)
 
       assert Enum.any?(resumed_events, fn event ->

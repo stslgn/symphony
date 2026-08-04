@@ -286,6 +286,7 @@ Fields:
 - `parked` (map `issue_id -> OperatorWait`)
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
+- `queued_resumes` (map `issue_id ->` durable queued-resume entry, consumed by the next claim)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
@@ -815,9 +816,11 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - Startup reconciliation marks every unfinished run from the previous runner generation as
   `interrupted_by_restart` before scheduling the first poll.
 - Startup reconciliation restores unresolved operator waits before dispatch.
+- Startup reconciliation restores durable queued resumes, including their next attempt.
 - Startup reconciliation restores global dispatch pause and per-issue operator comment cursors.
 - A parked issue is excluded from automatic retry and pickup even when its tracker state is active.
-- Resuming a wait removes only the runner-side park; normal exact-state eligibility still applies.
+- Resuming a wait atomically replaces the runner-side park with a durable `resume_queued` entry;
+  normal exact-state eligibility still applies, and the next durable claim consumes the queue entry.
 - A redispatched issue continues with an incremented attempt and a new run id.
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 

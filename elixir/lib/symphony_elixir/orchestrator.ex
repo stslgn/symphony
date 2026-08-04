@@ -54,6 +54,7 @@ defmodule SymphonyElixir.Orchestrator do
       completed: MapSet.new(),
       claimed: MapSet.new(),
       recovered_attempts: %{},
+      queued_resumes: %{},
       retry_attempts: %{},
       processed_operator_comment_ids: MapSet.new(),
       operator_comment_cursors: %{},
@@ -78,31 +79,32 @@ defmodule SymphonyElixir.Orchestrator do
 
     case RunLedger.reconcile_startup(run_ledger_path, runner_generation) do
       {:ok, recovery} ->
-        case restore_parked_waits_fn.(recovery.parked) do
-          {:ok, parked} ->
-            state = %State{
-              poll_interval_ms: config.polling.interval_ms,
-              max_concurrent_agents: config.agent.max_concurrent_agents,
-              next_poll_due_at_ms: now_ms,
-              poll_check_in_progress: false,
-              tick_timer_ref: nil,
-              tick_token: nil,
-              run_ledger_path: run_ledger_path,
-              runner_generation: runner_generation,
-              dispatch_paused: recovery.dispatch_paused,
-              recovered_attempts: recovery.recovered_attempts,
-              parked: parked,
-              processed_operator_comment_ids: recovery.processed_operator_comment_ids,
-              operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
-              codex_totals: @empty_codex_totals,
-              codex_rate_limits: nil
-            }
+        with {:ok, parked} <- restore_parked_waits_fn.(recovery.parked),
+             {:ok, queued_resumes} <- restore_queued_resumes(recovery.queued_resumes) do
+          state = %State{
+            poll_interval_ms: config.polling.interval_ms,
+            max_concurrent_agents: config.agent.max_concurrent_agents,
+            next_poll_due_at_ms: now_ms,
+            poll_check_in_progress: false,
+            tick_timer_ref: nil,
+            tick_token: nil,
+            run_ledger_path: run_ledger_path,
+            runner_generation: runner_generation,
+            dispatch_paused: recovery.dispatch_paused,
+            recovered_attempts: recovery.recovered_attempts,
+            queued_resumes: queued_resumes,
+            parked: parked,
+            processed_operator_comment_ids: recovery.processed_operator_comment_ids,
+            operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
+            codex_totals: @empty_codex_totals,
+            codex_rate_limits: nil
+          }
 
-            run_terminal_workspace_cleanup()
-            state = schedule_tick(state, 0)
+          run_terminal_workspace_cleanup()
+          state = schedule_tick(state, 0)
 
-            {:ok, state}
-
+          {:ok, state}
+        else
           {:error, reason} ->
             {:stop, {:operator_wait_restore_failed, reason}}
         end
@@ -805,7 +807,7 @@ defmodule SymphonyElixir.Orchestrator do
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
       if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue, Map.get(state_acc.recovered_attempts, issue.id))
+        dispatch_issue(state_acc, issue, dispatch_attempt(state_acc, issue.id))
       else
         state_acc
       end
@@ -1004,6 +1006,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     case append_run_event(state, claim_event) do
       :ok ->
+        state = consume_dispatch_queue(state, issue.id)
+
         start_issue_task(
           state,
           issue,
@@ -1091,6 +1095,7 @@ defmodule SymphonyElixir.Orchestrator do
               | running: running,
                 claimed: MapSet.put(state.claimed, issue.id),
                 recovered_attempts: Map.delete(state.recovered_attempts, issue.id),
+                queued_resumes: Map.delete(state.queued_resumes, issue.id),
                 retry_attempts: Map.delete(state.retry_attempts, issue.id)
             }
             |> initialize_operator_cursor(issue.id, running_entry.started_at)
@@ -1410,6 +1415,24 @@ defmodule SymphonyElixir.Orchestrator do
   defp normalize_retry_attempt(attempt) when is_integer(attempt) and attempt > 0, do: attempt
   defp normalize_retry_attempt(_attempt), do: 0
 
+  defp dispatch_attempt(%State{} = state, issue_id) do
+    recovered_attempt = Map.get(state.recovered_attempts, issue_id)
+    queued_attempt = get_in(state.queued_resumes, [issue_id, :attempt])
+
+    [recovered_attempt, queued_attempt]
+    |> Enum.filter(&is_integer/1)
+    |> Enum.max(fn -> nil end)
+  end
+
+  defp consume_dispatch_queue(%State{} = state, issue_id) do
+    %{
+      state
+      | claimed: MapSet.put(state.claimed, issue_id),
+        recovered_attempts: Map.delete(state.recovered_attempts, issue_id),
+        queued_resumes: Map.delete(state.queued_resumes, issue_id)
+    }
+  end
+
   defp next_retry_attempt_from_running(running_entry) do
     case Map.get(running_entry, :retry_attempt) do
       attempt when is_integer(attempt) and attempt > 0 -> attempt + 1
@@ -1718,6 +1741,7 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(retry, :workspace_path)
         }
       end)
+      |> Enum.concat(queued_resume_snapshot_rows(state.queued_resumes))
 
     parked =
       state.parked
@@ -2210,12 +2234,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_operator_wait_action(state, wait, action) do
     if OperatorWait.action_allowed?(wait, action) do
-      transition = if action == "reject", do: "wait_rejected", else: "wait_resumed"
+      transition = if action == "reject", do: "wait_rejected", else: "resume_queued"
       next_attempt = max(wait.attempt + 1, 1)
 
       event =
         wait
         |> operator_wait_event(transition)
+        |> maybe_mark_resume_queued(action)
         |> maybe_put_resumed_attempt(action, next_attempt)
 
       case append_run_event(state, event) do
@@ -2226,8 +2251,8 @@ defmodule SymphonyElixir.Orchestrator do
           state =
             state
             |> Map.update!(:parked, &Map.delete(&1, wait.issue_id))
-            |> Map.update!(:recovered_attempts, fn attempts ->
-              Map.update(attempts, wait.issue_id, next_attempt, &max(&1, next_attempt))
+            |> Map.update!(:queued_resumes, fn queued ->
+              Map.put(queued, wait.issue_id, queued_resume_entry(wait, next_attempt))
             end)
             |> schedule_tick(0)
 
@@ -2243,6 +2268,21 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_put_resumed_attempt(event, "reject", _next_attempt), do: event
   defp maybe_put_resumed_attempt(event, _action, next_attempt), do: Map.put(event, :attempt, next_attempt)
+
+  defp maybe_mark_resume_queued(event, "reject"), do: event
+  defp maybe_mark_resume_queued(event, _action), do: Map.put(event, :stage, "resume_queued")
+
+  defp queued_resume_entry(wait, next_attempt) do
+    %{
+      issue_id: wait.issue_id,
+      identifier: wait.identifier,
+      run_id: wait.run_id,
+      wait_id: wait.wait_id,
+      attempt: next_attempt,
+      stage: "resume_queued",
+      queued_at: DateTime.utc_now()
+    }
+  end
 
   defp process_operator_comments(%State{} = state) do
     process_operator_comments(state, operator_user_ids())
@@ -2582,6 +2622,55 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp restore_parked_waits(_events), do: {:error, :invalid_parked_wait_collection}
+
+  defp restore_queued_resumes(events) when is_map(events) do
+    Enum.reduce_while(events, {:ok, %{}}, fn {issue_id, event}, {:ok, restored} ->
+      case queued_resume_from_ledger_event(event) do
+        {:ok, queued_resume} ->
+          {:cont, {:ok, Map.put(restored, issue_id, queued_resume)}}
+
+        {:error, reason} ->
+          {:halt, {:error, {:invalid_queued_resume, issue_id, reason}}}
+      end
+    end)
+  end
+
+  defp restore_queued_resumes(_events), do: {:error, :invalid_queued_resume_collection}
+
+  defp queued_resume_from_ledger_event(event) do
+    with {:ok, queued_at, _offset} <- DateTime.from_iso8601(event["occurred_at"]) do
+      {:ok,
+       %{
+         issue_id: event["issue_id"],
+         identifier: event["issue_identifier"],
+         run_id: event["run_id"],
+         wait_id: event["wait_id"],
+         attempt: event["attempt"],
+         stage: "resume_queued",
+         queued_at: queued_at
+       }}
+    else
+      _other -> {:error, :invalid_occurred_at}
+    end
+  end
+
+  defp queued_resume_snapshot_rows(queued_resumes) do
+    Enum.map(queued_resumes, fn {issue_id, queued} ->
+      %{
+        issue_id: issue_id,
+        run_id: Map.get(queued, :run_id),
+        wait_id: Map.get(queued, :wait_id),
+        attempt: Map.get(queued, :attempt),
+        stage: "resume_queued",
+        due_in_ms: 0,
+        identifier: Map.get(queued, :identifier),
+        error: nil,
+        worker_host: Map.get(queued, :worker_host),
+        workspace_path: Map.get(queued, :workspace_path),
+        queued_at: Map.get(queued, :queued_at)
+      }
+    end)
+  end
 
   defp log_run_event_result(:ok, _issue_id), do: :ok
 

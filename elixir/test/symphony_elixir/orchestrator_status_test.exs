@@ -857,6 +857,90 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert due_in_ms > 0
   end
 
+  test "orchestrator restart exposes a durable queued resume in status" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-queued-resume-status-#{System.unique_integer([:positive])}"
+      )
+
+    ledger_path = Path.join(root, "run-ledger.jsonl")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "run_parked",
+               stage: "parked",
+               run_id: "run-status-resume-source",
+               issue_id: "issue-status-resume",
+               issue_identifier: "MT-RESUME-STATUS",
+               attempt: 3,
+               wait_id: "wait-status-resume",
+               parked_reason: "waiting_infrastructure",
+               allowed_actions: ["retry", "reject"]
+             })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "resume_queued",
+               stage: "resume_queued",
+               run_id: "run-status-resume-source",
+               issue_id: "issue-status-resume",
+               issue_identifier: "MT-RESUME-STATUS",
+               attempt: 4,
+               wait_id: "wait-status-resume",
+               parked_reason: "waiting_infrastructure",
+               allowed_actions: ["retry", "reject"]
+             })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "dispatch_paused",
+               stage: "operator",
+               runner_generation: "runner-before-restart"
+             })
+
+    orchestrator_name = Module.concat(__MODULE__, :QueuedResumeRestartOrchestrator)
+
+    assert {:ok, pid} =
+             Orchestrator.start_link(name: orchestrator_name, run_ledger_path: ledger_path)
+
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    snapshot = GenServer.call(pid, :snapshot)
+
+    assert snapshot.control.dispatch_paused
+    assert snapshot.parked == []
+
+    assert [
+             %{
+               issue_id: "issue-status-resume",
+               identifier: "MT-RESUME-STATUS",
+               run_id: "run-status-resume-source",
+               wait_id: "wait-status-resume",
+               attempt: 4,
+               stage: "resume_queued",
+               due_in_ms: 0
+             }
+           ] = snapshot.retrying
+
+    rendered =
+      StatusDashboard.format_snapshot_content_for_test(
+        {:ok,
+         %{
+           running: snapshot.running,
+           retrying: snapshot.retrying,
+           codex_totals: snapshot.codex_totals,
+           control: snapshot.control
+         }},
+        0.0
+      )
+
+    assert rendered =~ "MT-RESUME-STATUS"
+    assert rendered =~ "attempt=4"
+    assert rendered =~ "resume queued"
+  end
+
   test "orchestrator snapshot includes poll countdown and checking status" do
     orchestrator_name = Module.concat(__MODULE__, :PollingSnapshotOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -1032,6 +1116,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     running_entry = %{
       pid: worker_pid,
       ref: make_ref(),
+      run_id: "run-stall",
+      retry_attempt: 0,
       identifier: "MT-STALL",
       issue: %Issue{id: issue_id, identifier: "MT-STALL", state: "In Progress"},
       session_id: "thread-stall-turn-stall",
@@ -1191,7 +1277,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
-    assert plain =~ ~r/No active agents\r?\n│\s*\r?\n├─ Backoff queue/
+    assert plain =~ ~r/No active agents\r?\n│\s*\r?\n├─ Retry \/ resume queue/
   end
 
   test "status dashboard adds a spacer line before backoff queue when agents are active" do
@@ -1230,7 +1316,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
-    assert plain =~ ~r/MT-777.*\r?\n│\s*\r?\n├─ Backoff queue/s
+    assert plain =~ ~r/MT-777.*\r?\n│\s*\r?\n├─ Retry \/ resume queue/s
   end
 
   test "status dashboard renders an unstyled closing corner when the retry queue is empty" do

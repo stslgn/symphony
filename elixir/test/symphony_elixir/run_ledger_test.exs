@@ -253,6 +253,7 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-new")
     assert %{"issue-parked" => parked} = recovery.parked
     assert recovery.recovered_attempts == %{}
+    assert recovery.queued_resumes == %{}
 
     assert parked["wait_id"] == "wait-parked"
     assert parked["parked_reason"] == "waiting_owner"
@@ -271,8 +272,42 @@ defmodule SymphonyElixir.RunLedgerTest do
              })
 
     assert {:ok, next_recovery} = RunLedger.reconcile_startup(path, "runner-next")
-    assert next_recovery.recovered_attempts == %{"issue-parked" => 2}
+    assert next_recovery.recovered_attempts == %{}
+    assert next_recovery.queued_resumes["issue-parked"]["attempt"] == 2
     assert next_recovery.parked == %{}
+  end
+
+  test "durable claim atomically consumes a queued resume" do
+    path = ledger_path()
+
+    append_parked_run!(path, "run-resume-source", "issue-resume-claim")
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "resume_queued",
+               stage: "resume_queued",
+               run_id: "run-resume-source",
+               issue_id: "issue-resume-claim",
+               issue_identifier: "DUD-SEMANTIC-MIDDLE",
+               attempt: 2,
+               wait_id: "wait-semantic-middle",
+               parked_reason: "waiting_owner",
+               allowed_actions: ["approve", "reject"]
+             })
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_claimed",
+               stage: "claimed",
+               run_id: "run-resume-dispatched",
+               issue_id: "issue-resume-claim",
+               issue_identifier: "DUD-SEMANTIC-MIDDLE",
+               attempt: 2
+             })
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-after-claim")
+    assert recovery.queued_resumes == %{}
+    assert recovery.recovered_attempts == %{"issue-resume-claim" => 3}
   end
 
   test "startup reconciliation restores global pause and operator command cursors" do

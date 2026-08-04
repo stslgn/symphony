@@ -722,6 +722,105 @@ defmodule SymphonyElixir.CoreTest do
     Process.cancel_timer(resumed_state.tick_timer_ref)
   end
 
+  test "queued resumes stay visible while pause, capacity, or tracker preflight blocks dispatch" do
+    issue_id = "issue-blocked-resume"
+
+    queued_resumes = %{
+      issue_id => %{
+        issue_id: issue_id,
+        identifier: "MT-BLOCKED-RESUME",
+        run_id: "run-blocked-resume-source",
+        wait_id: "wait-blocked-resume",
+        attempt: 3,
+        stage: "resume_queued",
+        queued_at: DateTime.utc_now()
+      }
+    }
+
+    base_state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: nil,
+      queued_resumes: queued_resumes,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:noreply, paused_state} =
+             Orchestrator.handle_info(:run_poll_cycle, %{base_state | dispatch_paused: true})
+
+    assert paused_state.queued_resumes == queued_resumes
+
+    if is_reference(paused_state.tick_timer_ref), do: Process.cancel_timer(paused_state.tick_timer_ref)
+
+    dummy_issue = %Issue{
+      id: "issue-capacity-holder",
+      identifier: "MT-CAPACITY-HOLDER",
+      title: "Occupy the only slot",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    resumed_issue = %Issue{
+      id: issue_id,
+      identifier: "MT-BLOCKED-RESUME",
+      title: "Remain queued",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    dummy_pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(dummy_pid), do: Process.exit(dummy_pid, :kill) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_concurrent_agents: 1
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [dummy_issue, resumed_issue])
+
+    capacity_state = %{
+      base_state
+      | running: %{
+          dummy_issue.id => %{
+            pid: dummy_pid,
+            ref: nil,
+            run_id: "run-capacity-holder",
+            retry_attempt: 0,
+            identifier: dummy_issue.identifier,
+            issue: dummy_issue,
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([dummy_issue.id])
+    }
+
+    assert {:noreply, capacity_blocked_state} =
+             Orchestrator.handle_info(:run_poll_cycle, capacity_state)
+
+    assert capacity_blocked_state.queued_resumes == queued_resumes
+
+    if is_reference(capacity_blocked_state.tick_timer_ref),
+      do: Process.cancel_timer(capacity_blocked_state.tick_timer_ref)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_api_token: nil
+    )
+
+    assert {:noreply, tracker_blocked_state} =
+             Orchestrator.handle_info(:run_poll_cycle, base_state)
+
+    assert tracker_blocked_state.queued_resumes == queued_resumes
+
+    assert {:reply, snapshot, ^tracker_blocked_state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, tracker_blocked_state)
+
+    assert [%{issue_id: ^issue_id, attempt: 3, stage: "resume_queued"}] = snapshot.retrying
+
+    if is_reference(tracker_blocked_state.tick_timer_ref),
+      do: Process.cancel_timer(tracker_blocked_state.tick_timer_ref)
+  end
+
   test "typed waits require matching ids and allowed actions before resume" do
     issue_id = "issue-secret-wait"
 
@@ -792,19 +891,35 @@ defmodule SymphonyElixir.CoreTest do
              )
 
     refute Map.has_key?(resumed_state.parked, issue_id)
-    assert resumed_state.recovered_attempts[issue_id] == 2
+
+    assert %{
+             attempt: 2,
+             stage: "resume_queued",
+             run_id: "run-secret",
+             wait_id: wait_id
+           } = resumed_state.queued_resumes[issue_id]
+
+    assert wait_id == wait.wait_id
+
+    assert {:reply, snapshot, snapshotted_state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, resumed_state)
+
+    assert [%{issue_id: ^issue_id, attempt: 2, stage: "resume_queued"}] = snapshot.retrying
 
     assert {:ok, events} = RunLedger.read_events(ledger_path)
     assert Enum.count(events, &(&1["transition"] == "run_parked")) == 1
     assert Enum.count(events, &(&1["transition"] == "wait_rejected")) == 1
-    assert Enum.count(events, &(&1["transition"] == "wait_resumed")) == 1
+    assert Enum.count(events, &(&1["transition"] == "resume_queued")) == 1
 
     assert Enum.any?(events, fn event ->
-             event["transition"] == "wait_resumed" and event["attempt"] == 2
+             event["transition"] == "resume_queued" and event["attempt"] == 2
            end)
 
     assert {:ok, recovery} = RunLedger.reconcile_startup(ledger_path, "runner-after-resume")
-    assert recovery.recovered_attempts[issue_id] == 2
+    assert recovery.queued_resumes[issue_id]["attempt"] == 2
+
+    if is_reference(snapshotted_state.tick_timer_ref),
+      do: Process.cancel_timer(snapshotted_state.tick_timer_ref)
   end
 
   test "observed token budget exhaustion parks the run without scheduling retry" do
@@ -1616,7 +1731,7 @@ defmodule SymphonyElixir.CoreTest do
       do: Process.cancel_timer(repeated_state.tick_timer_ref)
 
     assert {:ok, events} = RunLedger.read_events(ledger_path)
-    assert Enum.count(events, &(&1["transition"] == "wait_resumed")) == 1
+    assert Enum.count(events, &(&1["transition"] == "resume_queued")) == 1
     assert Enum.count(events, &(&1["transition"] == "operator_command_applied")) == 1
   end
 
@@ -1678,7 +1793,7 @@ defmodule SymphonyElixir.CoreTest do
       do: Process.cancel_timer(reconciled_state.tick_timer_ref)
 
     assert {:ok, events} = RunLedger.read_events(ledger_path)
-    refute Enum.any?(events, &(&1["transition"] == "wait_resumed"))
+    refute Enum.any?(events, &(&1["transition"] == "resume_queued"))
     refute Enum.any?(events, &(&1["transition"] == "operator_command_applied"))
   end
 

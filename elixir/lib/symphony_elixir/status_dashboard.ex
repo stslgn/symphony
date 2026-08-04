@@ -375,7 +375,7 @@ defmodule SymphonyElixir.StatusDashboard do
          ] ++
            running_rows ++
            running_to_backoff_spacer ++
-           [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
+           [colorize("├─ Retry / resume queue", @ansi_bold), "│"] ++
            backoff_rows ++
            [closing_border()])
         |> List.flatten()
@@ -674,13 +674,21 @@ defmodule SymphonyElixir.StatusDashboard do
     due_in_ms = retry_entry.due_in_ms || 0
     error = format_retry_error(retry_entry.error)
 
-    "│  #{colorize("↻", @ansi_orange)} " <>
-      colorize("#{identifier}", @ansi_red) <>
-      " " <>
-      colorize("attempt=#{attempt}", @ansi_yellow) <>
-      colorize(" in ", @ansi_dim) <>
-      colorize(next_in_words(due_in_ms), @ansi_cyan) <>
-      error
+    if Map.get(retry_entry, :stage) == "resume_queued" do
+      "│  #{colorize("→", @ansi_orange)} " <>
+        colorize("#{identifier}", @ansi_red) <>
+        " " <>
+        colorize("attempt=#{attempt}", @ansi_yellow) <>
+        colorize(" resume queued", @ansi_dim)
+    else
+      "│  #{colorize("↻", @ansi_orange)} " <>
+        colorize("#{identifier}", @ansi_red) <>
+        " " <>
+        colorize("attempt=#{attempt}", @ansi_yellow) <>
+        colorize(" in ", @ansi_dim) <>
+        colorize(next_in_words(due_in_ms), @ansi_cyan) <>
+        error
+    end
   end
 
   defp next_in_words(due_in_ms) when is_integer(due_in_ms) do
