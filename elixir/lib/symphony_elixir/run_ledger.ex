@@ -6,8 +6,6 @@ defmodule SymphonyElixir.RunLedger do
   arbitrary prompts, agent output, credentials, or external comments.
   """
 
-  require Logger
-
   @schema_version 1
   @terminal_transitions MapSet.new([
                           "run_completed",
@@ -38,6 +36,14 @@ defmodule SymphonyElixir.RunLedger do
                     :worker_host,
                     :workspace_path
                   ])
+  @persisted_fields MapSet.union(
+                      MapSet.new(Enum.map(@allowed_fields, &Atom.to_string/1)),
+                      MapSet.new(["event_id", "occurred_at", "schema_version"])
+                    )
+  @optional_string_fields @allowed_fields
+                          |> MapSet.delete(:allowed_actions)
+                          |> MapSet.delete(:attempt)
+                          |> Enum.map(&Atom.to_string/1)
 
   @spec default_path() :: Path.t()
   def default_path do
@@ -109,12 +115,19 @@ defmodule SymphonyElixir.RunLedger do
   def read_events(path) when is_binary(path) do
     case File.read(path) do
       {:ok, contents} ->
-        events =
-          contents
-          |> String.split("\n", trim: true)
-          |> Enum.flat_map(&decode_line/1)
-
-        {:ok, events}
+        contents
+        |> ledger_lines()
+        |> Enum.with_index(1)
+        |> Enum.reduce_while({:ok, []}, fn {line, line_number}, {:ok, events} ->
+          case decode_line(line, line_number) do
+            {:ok, event} -> {:cont, {:ok, [event | events]}}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
+        |> case do
+          {:ok, events} -> {:ok, Enum.reverse(events)}
+          {:error, reason} -> {:error, reason}
+        end
 
       {:error, :enoent} ->
         {:ok, []}
@@ -299,18 +312,99 @@ defmodule SymphonyElixir.RunLedger do
     end)
   end
 
-  defp decode_line(line) do
+  defp ledger_lines(""), do: []
+
+  defp ledger_lines(contents) do
+    lines = String.split(contents, "\n", trim: false)
+
+    if List.last(lines) == "" do
+      List.delete_at(lines, -1)
+    else
+      lines
+    end
+  end
+
+  defp decode_line(line, line_number) do
     case Jason.decode(line) do
       {:ok, event} when is_map(event) ->
-        [event]
+        validate_event(event, line_number)
 
       {:ok, _other} ->
-        Logger.warning("Ignoring non-object Symphony run ledger event")
-        []
+        {:error, {:invalid_ledger_record, line_number, :not_an_object}}
 
-      {:error, reason} ->
-        Logger.warning("Ignoring malformed Symphony run ledger event: #{Exception.message(reason)}")
-        []
+      {:error, _reason} ->
+        {:error, {:invalid_ledger_record, line_number, :malformed_json}}
+    end
+  end
+
+  defp validate_event(event, line_number) do
+    with :ok <- validate_event_fields(event),
+         :ok <- validate_schema_version(event),
+         :ok <- validate_required_string(event, "event_id"),
+         :ok <- validate_occurred_at(event),
+         :ok <- validate_required_string(event, "transition"),
+         :ok <- validate_optional_attempt(event),
+         :ok <- validate_optional_actions(event),
+         :ok <- validate_optional_strings(event) do
+      {:ok, event}
+    else
+      {:error, reason} -> {:error, {:invalid_ledger_record, line_number, reason}}
+    end
+  end
+
+  defp validate_event_fields(event) do
+    if event |> Map.keys() |> MapSet.new() |> MapSet.subset?(@persisted_fields) do
+      :ok
+    else
+      {:error, :unknown_fields}
+    end
+  end
+
+  defp validate_schema_version(%{"schema_version" => @schema_version}), do: :ok
+  defp validate_schema_version(_event), do: {:error, :unsupported_schema_version}
+
+  defp validate_required_string(event, field) do
+    case Map.fetch(event, field) do
+      {:ok, value} when is_binary(value) and value != "" -> :ok
+      _other -> {:error, {:invalid_field, field}}
+    end
+  end
+
+  defp validate_occurred_at(event) do
+    with :ok <- validate_required_string(event, "occurred_at"),
+         {:ok, _datetime, _offset} <- DateTime.from_iso8601(event["occurred_at"]) do
+      :ok
+    else
+      _other -> {:error, {:invalid_field, "occurred_at"}}
+    end
+  end
+
+  defp validate_optional_attempt(event) do
+    validate_optional_field(event, "attempt", fn value ->
+      is_integer(value) and value >= 0
+    end)
+  end
+
+  defp validate_optional_actions(event) do
+    validate_optional_field(event, "allowed_actions", fn value ->
+      is_list(value) and Enum.all?(value, &is_binary/1)
+    end)
+  end
+
+  defp validate_optional_strings(event) do
+    Enum.reduce_while(@optional_string_fields, :ok, fn field, :ok ->
+      case validate_optional_field(event, field, &is_binary/1) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp validate_optional_field(event, field, predicate) do
+    case Map.fetch(event, field) do
+      :error -> :ok
+      {:ok, nil} -> :ok
+      {:ok, value} -> if predicate.(value), do: :ok, else: {:error, {:invalid_field, field}}
     end
   end
 

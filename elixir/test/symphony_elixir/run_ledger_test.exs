@@ -73,38 +73,92 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert next_recovery.parked == %{}
   end
 
-  test "ignores malformed trailing records during recovery" do
+  test "fails startup closed when a parked tail record is corrupted" do
     path = ledger_path()
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, "{\"transition\":\"run_started\"\n")
 
-    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-new")
-    assert recovery.recovered_attempts == %{}
-    assert recovery.parked == %{}
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_started",
+               run_id: "run-parked-tail",
+               issue_id: "issue-parked-tail",
+               attempt: 2
+             })
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_parked",
+               run_id: "run-parked-tail",
+               issue_id: "issue-parked-tail",
+               attempt: 2,
+               wait_id: "wait-parked-tail",
+               parked_reason: "operator_wait"
+             })
+
+    corrupt_last_record!(path)
+
+    assert {:error, {:invalid_ledger_record, 2, :malformed_json}} =
+             RunLedger.reconcile_startup(path, "runner-new")
   end
 
-  test "ignores non-object records and defaults malformed attempts" do
+  test "fails startup closed when a terminal tail record is corrupted" do
     path = ledger_path()
-    File.mkdir_p!(Path.dirname(path))
 
-    File.write!(
-      path,
-      [
-        Jason.encode!([]),
-        "\n",
-        Jason.encode!(%{
-          "transition" => "run_started",
-          "run_id" => "run-malformed-attempt",
-          "issue_id" => "issue-malformed-attempt",
-          "attempt" => "not-an-integer"
-        }),
-        "\n"
-      ]
-    )
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_started",
+               run_id: "run-terminal-tail",
+               issue_id: "issue-terminal-tail",
+               attempt: 1
+             })
 
-    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-new")
-    assert recovery.recovered_attempts == %{"issue-malformed-attempt" => 1}
-    assert recovery.parked == %{}
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_completed",
+               run_id: "run-terminal-tail",
+               issue_id: "issue-terminal-tail",
+               attempt: 1
+             })
+
+    corrupt_last_record!(path)
+
+    assert {:error, {:invalid_ledger_record, 2, :malformed_json}} =
+             RunLedger.reconcile_startup(path, "runner-new")
+  end
+
+  test "fails startup closed on corruption in the middle of the ledger" do
+    path = ledger_path()
+
+    assert :ok = RunLedger.append(path, %{transition: "dispatch_paused"})
+    File.write!(path, "not-json\n", [:append])
+    assert :ok = RunLedger.append(path, %{transition: "dispatch_resumed"})
+
+    assert {:error, {:invalid_ledger_record, 2, :malformed_json}} =
+             RunLedger.reconcile_startup(path, "runner-new")
+  end
+
+  test "rejects non-object and semantically invalid records" do
+    non_object_path = ledger_path()
+    File.mkdir_p!(Path.dirname(non_object_path))
+    File.write!(non_object_path, Jason.encode!([]) <> "\n")
+
+    assert {:error, {:invalid_ledger_record, 1, :not_an_object}} =
+             RunLedger.read_events(non_object_path)
+
+    invalid_attempt_path = ledger_path()
+
+    assert :ok =
+             RunLedger.append(invalid_attempt_path, %{
+               transition: "run_started",
+               run_id: "run-invalid-attempt",
+               issue_id: "issue-invalid-attempt",
+               attempt: 1
+             })
+
+    [event] = valid_records(invalid_attempt_path)
+    File.write!(invalid_attempt_path, Jason.encode!(%{event | "attempt" => "not-an-integer"}) <> "\n")
+
+    assert {:error, {:invalid_ledger_record, 1, {:invalid_field, "attempt"}}} =
+             RunLedger.reconcile_startup(invalid_attempt_path, "runner-new")
   end
 
   test "startup reconciliation restores parked waits until they are resumed" do
@@ -253,5 +307,26 @@ defmodule SymphonyElixir.RunLedgerTest do
       System.tmp_dir!(),
       "symphony-run-ledger-#{RunLedger.new_id("test")}/events.jsonl"
     )
+  end
+
+  defp corrupt_last_record!(path) do
+    records = valid_records(path)
+    last = records |> List.last() |> Jason.encode!()
+    truncated = binary_part(last, 0, byte_size(last) - 1)
+
+    contents =
+      records
+      |> Enum.drop(-1)
+      |> Enum.map_join("\n", &Jason.encode!/1)
+
+    prefix = if contents == "", do: "", else: contents <> "\n"
+    File.write!(path, prefix <> truncated <> "\n")
+  end
+
+  defp valid_records(path) do
+    path
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.map(&Jason.decode!/1)
   end
 end
