@@ -2836,7 +2836,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp codex_payload_method(_payload), do: nil
 
   defp codex_update_error_code(%{event: event} = update)
-       when event in [:app_server_error, :terminal_protocol_error, :turn_failed, :turn_ended_with_error, :startup_failed] do
+       when event in [
+              :app_server_error,
+              :terminal_protocol_error,
+              :turn_failed,
+              :turn_ended_with_error,
+              :startup_failed
+            ] do
     ObservabilitySanitizer.error_code(update, "runtime_error")
   end
 
@@ -3197,35 +3203,39 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_operator_wait_action(state, wait, action) do
     if OperatorWait.action_allowed?(wait, action) do
-      transition = if action == "reject", do: "wait_rejected", else: "resume_queued"
-      next_attempt = max(wait.attempt + 1, 1)
-
-      event =
-        wait
-        |> operator_wait_event(transition)
-        |> maybe_mark_resume_queued(action)
-        |> maybe_put_resumed_attempt(action, next_attempt)
-
-      case append_run_event(state, event) do
-        :ok when action == "reject" ->
-          {:ok, %{wait: wait, action: action, resumed: false}, state}
-
-        :ok ->
-          state =
-            state
-            |> Map.update!(:parked, &Map.delete(&1, wait.issue_id))
-            |> Map.update!(:queued_resumes, fn queued ->
-              Map.put(queued, wait.issue_id, queued_resume_entry(wait, next_attempt))
-            end)
-            |> schedule_tick(0)
-
-          {:ok, %{wait: wait, action: action, resumed: true}, state}
-
-        {:error, reason} ->
-          {:error, {:ledger_write_failed, reason}, state}
-      end
+      apply_allowed_operator_wait_action(state, wait, action)
     else
       {:error, :action_not_allowed, state}
+    end
+  end
+
+  defp apply_allowed_operator_wait_action(state, wait, action) do
+    transition = if action == "reject", do: "wait_rejected", else: "resume_queued"
+    next_attempt = max(wait.attempt + 1, 1)
+
+    event =
+      wait
+      |> operator_wait_event(transition)
+      |> maybe_mark_resume_queued(action)
+      |> maybe_put_resumed_attempt(action, next_attempt)
+
+    case append_run_event(state, event) do
+      :ok when action == "reject" ->
+        {:ok, %{wait: wait, action: action, resumed: false}, state}
+
+      :ok ->
+        state =
+          state
+          |> Map.update!(:parked, &Map.delete(&1, wait.issue_id))
+          |> Map.update!(:queued_resumes, fn queued ->
+            Map.put(queued, wait.issue_id, queued_resume_entry(wait, next_attempt))
+          end)
+          |> schedule_tick(0)
+
+        {:ok, %{wait: wait, action: action, resumed: true}, state}
+
+      {:error, reason} ->
+        {:error, {:ledger_write_failed, reason}, state}
     end
   end
 
