@@ -372,6 +372,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     conn = get(build_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
+    refute inspect(state_payload) =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
@@ -390,7 +391,6 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "worker_host" => nil,
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
-                 "session_title" => nil,
                  "model" => %{
                    "resolved" => nil,
                    "reasoning_effort" => nil,
@@ -399,7 +399,6 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "model_catalog" => nil,
                  "turn_count" => 7,
                  "last_event" => "notification",
-                 "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
@@ -421,7 +420,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "issue_identifier" => "MT-RETRY",
                  "attempt" => 2,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
-                 "error" => "boom",
+                 "error_code" => "worker_failure",
                  "worker_host" => nil,
                  "workspace_path" => nil
                }
@@ -452,6 +451,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
     issue_payload = json_response(conn, 200)
+    refute inspect(issue_payload) =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
 
     assert issue_payload == %{
              "issue_identifier" => "MT-HTTP",
@@ -466,7 +466,6 @@ defmodule SymphonyElixir.ExtensionsTest do
                "worker_host" => nil,
                "workspace_path" => nil,
                "session_id" => "thread-http",
-               "session_title" => nil,
                "model" => %{
                  "resolved" => nil,
                  "reasoning_effort" => nil,
@@ -477,7 +476,6 @@ defmodule SymphonyElixir.ExtensionsTest do
                "state" => "In Progress",
                "started_at" => issue_payload["running"]["started_at"],
                "last_event" => "notification",
-               "last_message" => "rendered",
                "last_event_at" => nil,
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
                "budget" => %{
@@ -495,13 +493,16 @@ defmodule SymphonyElixir.ExtensionsTest do
              "parked" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
-             "last_error" => nil,
+             "last_error_code" => nil,
              "tracked" => %{}
            }
 
     conn = get(build_conn(), "/api/v1/MT-RETRY")
 
-    assert %{"status" => "retrying", "retry" => %{"attempt" => 2, "error" => "boom"}} =
+    assert %{
+             "status" => "retrying",
+             "retry" => %{"attempt" => 2, "error_code" => "worker_failure"}
+           } =
              json_response(conn, 200)
 
     conn = get(build_conn(), "/api/v1/MT-PARKED")
@@ -804,7 +805,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Operations Dashboard"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
-    assert html =~ "rendered"
+    refute html =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
     assert html =~ "Runtime"
     assert html =~ "Live"
     assert html =~ "Offline"
@@ -825,7 +826,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           state: "In Progress",
           session_id: "thread-http",
           turn_count: 8,
-          last_codex_event: :notification,
+          last_codex_event: :turn_completed,
           last_codex_message: %{
             event: :notification,
             message: %{
@@ -833,7 +834,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                 "method" => "codex/event/agent_message_content_delta",
                 "params" => %{
                   "msg" => %{
-                    "content" => "structured update"
+                    "content" => "SENSITIVE-BL10-DO-NOT-EXPOSE"
                   }
                 }
               }
@@ -854,7 +855,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     StatusDashboard.notify_update()
 
     assert_eventually(fn ->
-      render(view) =~ "agent message content streaming: structured update"
+      rendered = render(view)
+
+      rendered =~ "turn_completed" and
+        not String.contains?(rendered, "SENSITIVE-BL10-DO-NOT-EXPOSE")
     end)
   end
 
@@ -953,9 +957,10 @@ defmodule SymphonyElixir.ExtensionsTest do
           identifier: "MT-HTTP",
           state: "In Progress",
           session_id: "thread-http",
+          session_title: "SENSITIVE-BL10-DO-NOT-EXPOSE",
           turn_count: 7,
           codex_app_server_pid: nil,
-          last_codex_message: "rendered",
+          last_codex_message: "SENSITIVE-BL10-DO-NOT-EXPOSE",
           last_codex_timestamp: nil,
           last_codex_event: :notification,
           codex_input_tokens: 4,

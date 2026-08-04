@@ -6,7 +6,7 @@ defmodule SymphonyElixir.StatusDashboard do
   use GenServer
   require Logger
 
-  alias SymphonyElixir.{Config, HttpServer}
+  alias SymphonyElixir.{Config, HttpServer, ObservabilitySanitizer}
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixirWeb.ObservabilityPubSub
 
@@ -692,22 +692,8 @@ defmodule SymphonyElixir.StatusDashboard do
   defp next_in_words(_), do: "n/a"
 
   defp format_retry_error(error) when is_binary(error) do
-    sanitized =
-      error
-      |> String.replace("\\r\\n", " ")
-      |> String.replace("\\r", " ")
-      |> String.replace("\\n", " ")
-      |> String.replace("\r\n", " ")
-      |> String.replace("\r", " ")
-      |> String.replace("\n", " ")
-      |> String.replace(~r/\s+/, " ")
-      |> String.trim()
-
-    if sanitized == "" do
-      ""
-    else
-      " " <> colorize("error=#{truncate(sanitized, 96)}", @ansi_dim)
-    end
+    error_code = ObservabilitySanitizer.retry_error_code(error)
+    " " <> colorize("error_code=#{error_code}", @ansi_dim)
   end
 
   defp format_retry_error(_), do: ""
@@ -1107,17 +1093,10 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp humanize_codex_event(:session_started, _message, payload) do
     session_id = map_value(payload, ["session_id", :session_id])
-    session_title = map_value(payload, ["session_title", :session_title])
 
-    cond do
-      is_binary(session_title) and is_binary(session_id) ->
-        "session started (#{session_title}; #{session_id})"
-
-      is_binary(session_id) ->
-        "session started (#{session_id})"
-
-      true ->
-        "session started"
+    case ObservabilitySanitizer.identifier(session_id) do
+      nil -> "session started"
+      safe_session_id -> "session started (#{safe_session_id})"
     end
   end
 
@@ -1129,8 +1108,6 @@ defmodule SymphonyElixir.StatusDashboard do
         map_path(message, ["payload", "method"]) ||
         map_path(message, [:payload, :method])
 
-    decision = map_value(message, ["decision", :decision])
-
     base =
       if is_binary(method) do
         "#{humanize_codex_method(method, payload)} (auto-approved)"
@@ -1138,25 +1115,23 @@ defmodule SymphonyElixir.StatusDashboard do
         "approval request auto-approved"
       end
 
-    if is_binary(decision), do: "#{base}: #{decision}", else: base
+    base
   end
 
-  defp humanize_codex_event(:tool_input_auto_answered, message, payload) do
-    answer = map_value(message, ["answer", :answer])
-
+  defp humanize_codex_event(:tool_input_auto_answered, _message, payload) do
     base =
       case humanize_codex_method("item/tool/requestUserInput", payload) do
         nil -> "tool input auto-answered"
         text -> "#{text} (auto-answered)"
       end
 
-    if is_binary(answer), do: "#{base}: #{inline_text(answer)}", else: base
+    base
   end
 
   defp humanize_codex_event(:mcp_elicitation_auto_answered, message, _payload) do
     action = map_value(message, ["action", :action])
 
-    if is_binary(action) do
+    if action in ["accept", "cancel", "decline"] do
       "MCP server elicitation auto-answered: #{action}"
     else
       "MCP server elicitation auto-answered"
@@ -1175,10 +1150,18 @@ defmodule SymphonyElixir.StatusDashboard do
   defp humanize_codex_event(:capability_denied, _message, payload),
     do: humanize_dynamic_tool_event("capability denied by Symphony policy", payload)
 
-  defp humanize_codex_event(:turn_ended_with_error, message, _payload), do: "turn ended with error: #{format_reason(message)}"
-  defp humanize_codex_event(:startup_failed, message, _payload), do: "startup failed: #{format_reason(message)}"
-  defp humanize_codex_event(:app_server_error, message, _payload), do: "codex app-server error: #{format_reason(message)}"
-  defp humanize_codex_event(:terminal_protocol_error, message, _payload), do: "terminal codex protocol error: #{format_reason(message)}"
+  defp humanize_codex_event(:turn_ended_with_error, message, _payload),
+    do: "turn ended with error (#{ObservabilitySanitizer.error_code(message, "turn_error")})"
+
+  defp humanize_codex_event(:startup_failed, message, _payload),
+    do: "startup failed (#{ObservabilitySanitizer.error_code(message, "startup_error")})"
+
+  defp humanize_codex_event(:app_server_error, message, _payload),
+    do: "codex app-server error (#{ObservabilitySanitizer.error_code(message, "protocol_error")})"
+
+  defp humanize_codex_event(:terminal_protocol_error, message, _payload),
+    do: "terminal codex protocol error (#{ObservabilitySanitizer.error_code(message, "protocol_error")})"
+
   defp humanize_codex_event(:turn_failed, _message, payload), do: humanize_codex_method("turn/failed", payload)
   defp humanize_codex_event(:turn_cancelled, _message, _payload), do: "turn cancelled"
   defp humanize_codex_event(:malformed, _message, _payload), do: "malformed JSON event from codex"
@@ -1202,47 +1185,19 @@ defmodule SymphonyElixir.StatusDashboard do
 
       _ ->
         cond do
-          is_binary(map_value(payload, ["session_title", :session_title])) and
-              is_binary(map_value(payload, ["session_id", :session_id])) ->
-            "session started (#{map_value(payload, ["session_title", :session_title])}; #{map_value(payload, ["session_id", :session_id])})"
-
-          is_binary(map_value(payload, ["session_id", :session_id])) ->
-            "session started (#{map_value(payload, ["session_id", :session_id])})"
+          is_binary(ObservabilitySanitizer.identifier(map_value(payload, ["session_id", :session_id]))) ->
+            "session started (#{ObservabilitySanitizer.identifier(map_value(payload, ["session_id", :session_id]))})"
 
           match?(%{"error" => _}, payload) ->
-            "error: #{format_error_value(Map.get(payload, "error"))}"
+            "codex error (#{ObservabilitySanitizer.error_code(Map.get(payload, "error"), "runtime_error")})"
 
           true ->
-            payload
-            |> inspect(pretty: true, limit: 30)
-            |> String.replace("\n", " ")
-            |> sanitize_ansi_and_control_bytes()
-            |> String.trim()
+            "codex event"
         end
     end
   end
 
-  defp humanize_codex_payload(payload) when is_binary(payload) do
-    payload
-    |> String.replace("\n", " ")
-    |> sanitize_ansi_and_control_bytes()
-    |> String.trim()
-  end
-
-  defp humanize_codex_payload(payload) do
-    payload
-    |> inspect(pretty: true, limit: 20)
-    |> String.replace("\n", " ")
-    |> sanitize_ansi_and_control_bytes()
-    |> String.trim()
-  end
-
-  defp sanitize_ansi_and_control_bytes(value) when is_binary(value) do
-    value
-    |> String.replace(~r/\x1B\[[0-9;]*[A-Za-z]/, "")
-    |> String.replace(~r/\x1B./, "")
-    |> String.replace(~r/[\x00-\x1F\x7F]/, "")
-  end
+  defp humanize_codex_payload(_payload), do: "codex event"
 
   defp humanize_codex_method("thread/started", payload) do
     thread_id = map_path(payload, ["params", "thread", "id"]) || map_path(payload, [:params, :thread, :id])
@@ -1270,6 +1225,8 @@ defmodule SymphonyElixir.StatusDashboard do
         map_path(payload, [:params, :turn, :status]) ||
         "completed"
 
+    status = if status in ["completed", "failed", "cancelled"], do: status, else: "completed"
+
     usage =
       map_path(payload, ["params", "usage"]) ||
         map_path(payload, [:params, :usage]) ||
@@ -1286,13 +1243,7 @@ defmodule SymphonyElixir.StatusDashboard do
     "turn completed (#{status})#{usage_suffix}"
   end
 
-  defp humanize_codex_method("turn/failed", payload) do
-    error_message =
-      map_path(payload, ["params", "error", "message"]) ||
-        map_path(payload, [:params, :error, :message])
-
-    if is_binary(error_message), do: "turn failed: #{error_message}", else: "turn failed"
-  end
+  defp humanize_codex_method("turn/failed", _payload), do: "turn failed"
 
   defp humanize_codex_method("turn/cancelled", _payload), do: "turn cancelled"
 
@@ -1342,36 +1293,29 @@ defmodule SymphonyElixir.StatusDashboard do
   defp humanize_codex_method("item/started", payload), do: humanize_item_lifecycle("started", payload)
   defp humanize_codex_method("item/completed", payload), do: humanize_item_lifecycle("completed", payload)
 
-  defp humanize_codex_method("item/agentMessage/delta", payload),
-    do: humanize_streaming_event("agent message streaming", payload)
+  defp humanize_codex_method("item/agentMessage/delta", _payload),
+    do: "agent message streaming"
 
-  defp humanize_codex_method("item/plan/delta", payload),
-    do: humanize_streaming_event("plan streaming", payload)
+  defp humanize_codex_method("item/plan/delta", _payload),
+    do: "plan streaming"
 
-  defp humanize_codex_method("item/reasoning/summaryTextDelta", payload),
-    do: humanize_streaming_event("reasoning summary streaming", payload)
+  defp humanize_codex_method("item/reasoning/summaryTextDelta", _payload),
+    do: "reasoning summary streaming"
 
-  defp humanize_codex_method("item/reasoning/summaryPartAdded", payload),
-    do: humanize_streaming_event("reasoning summary section added", payload)
+  defp humanize_codex_method("item/reasoning/summaryPartAdded", _payload),
+    do: "reasoning summary section added"
 
-  defp humanize_codex_method("item/reasoning/textDelta", payload),
-    do: humanize_streaming_event("reasoning text streaming", payload)
+  defp humanize_codex_method("item/reasoning/textDelta", _payload),
+    do: "reasoning text streaming"
 
-  defp humanize_codex_method("item/commandExecution/outputDelta", payload),
-    do: humanize_streaming_event("command output streaming", payload)
+  defp humanize_codex_method("item/commandExecution/outputDelta", _payload),
+    do: "command output streaming"
 
-  defp humanize_codex_method("item/fileChange/outputDelta", payload),
-    do: humanize_streaming_event("file change output streaming", payload)
+  defp humanize_codex_method("item/fileChange/outputDelta", _payload),
+    do: "file change output streaming"
 
-  defp humanize_codex_method("item/commandExecution/requestApproval", payload) do
-    command = extract_command(payload)
-
-    if is_binary(command) do
-      "command approval requested (#{command})"
-    else
-      "command approval requested"
-    end
-  end
+  defp humanize_codex_method("item/commandExecution/requestApproval", _payload),
+    do: "command approval requested"
 
   defp humanize_codex_method("item/fileChange/requestApproval", payload) do
     change_count = map_path(payload, ["params", "fileChangeCount"]) || map_path(payload, ["params", "changeCount"])
@@ -1383,19 +1327,8 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
-  defp humanize_codex_method("item/tool/requestUserInput", payload) do
-    question =
-      map_path(payload, ["params", "question"]) ||
-        map_path(payload, ["params", "prompt"]) ||
-        map_path(payload, [:params, :question]) ||
-        map_path(payload, [:params, :prompt])
-
-    if is_binary(question) and String.trim(question) != "" do
-      "tool requires user input: #{inline_text(question)}"
-    else
-      "tool requires user input"
-    end
-  end
+  defp humanize_codex_method("item/tool/requestUserInput", _payload),
+    do: "tool requires user input"
 
   defp humanize_codex_method("tool/requestUserInput", payload),
     do: humanize_codex_method("item/tool/requestUserInput", payload)
@@ -1406,7 +1339,11 @@ defmodule SymphonyElixir.StatusDashboard do
         map_path(payload, [:params, :authMode]) ||
         "unknown"
 
-    "account updated (auth #{auth_mode})"
+    if auth_mode in ["chatgpt", "apiKey", "unknown"] do
+      "account updated (auth #{auth_mode})"
+    else
+      "account updated"
+    end
   end
 
   defp humanize_codex_method("account/rateLimits/updated", payload) do
@@ -1420,7 +1357,7 @@ defmodule SymphonyElixir.StatusDashboard do
   defp humanize_codex_method("account/chatgptAuthTokens/refresh", _payload), do: "account auth token refresh requested"
 
   defp humanize_codex_method("item/tool/call", payload) do
-    tool = dynamic_tool_name(payload)
+    tool = payload |> dynamic_tool_name() |> ObservabilitySanitizer.identifier()
 
     if is_binary(tool) and String.trim(tool) != "" do
       "dynamic tool call requested (#{tool})"
@@ -1433,20 +1370,12 @@ defmodule SymphonyElixir.StatusDashboard do
     humanize_codex_wrapper_event(suffix, payload)
   end
 
-  defp humanize_codex_method(method, payload) do
-    msg_type =
-      map_path(payload, ["params", "msg", "type"]) ||
-        map_path(payload, [:params, :msg, :type])
-
-    if is_binary(msg_type) do
-      "#{method} (#{msg_type})"
-    else
-      method
-    end
+  defp humanize_codex_method(method, _payload) do
+    if ObservabilitySanitizer.protocol_method(method), do: method, else: "codex notification"
   end
 
   defp humanize_dynamic_tool_event(base, payload) do
-    case dynamic_tool_name(payload) do
+    case payload |> dynamic_tool_name() |> ObservabilitySanitizer.identifier() do
       tool when is_binary(tool) ->
         trimmed = String.trim(tool)
 
@@ -1475,8 +1404,8 @@ defmodule SymphonyElixir.StatusDashboard do
         %{}
 
     item_type = item |> map_value(["type", :type]) |> humanize_item_type()
-    item_status = map_value(item, ["status", :status])
-    item_id = map_value(item, ["id", :id])
+    item_status = item |> map_value(["status", :status]) |> safe_item_status()
+    item_id = item |> map_value(["id", :id]) |> ObservabilitySanitizer.identifier()
 
     details =
       []
@@ -1490,13 +1419,15 @@ defmodule SymphonyElixir.StatusDashboard do
   defp humanize_codex_wrapper_event("mcp_startup_update", payload) do
     server =
       map_path(payload, ["params", "msg", "server"]) ||
-        map_path(payload, [:params, :msg, :server]) ||
-        "mcp"
+        map_path(payload, [:params, :msg, :server])
+
+    server = ObservabilitySanitizer.identifier(server) || "mcp"
 
     state =
       map_path(payload, ["params", "msg", "status", "state"]) ||
-        map_path(payload, [:params, :msg, :status, :state]) ||
-        "updated"
+        map_path(payload, [:params, :msg, :status, :state])
+
+    state = if state in ["starting", "ready", "failed", "updated"], do: state, else: "updated"
 
     "mcp startup: #{server} #{state}"
   end
@@ -1521,22 +1452,22 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
-  defp humanize_codex_wrapper_event("agent_message_delta", payload),
-    do: humanize_streaming_event("agent message streaming", payload)
+  defp humanize_codex_wrapper_event("agent_message_delta", _payload),
+    do: "agent message streaming"
 
-  defp humanize_codex_wrapper_event("agent_message_content_delta", payload),
-    do: humanize_streaming_event("agent message content streaming", payload)
+  defp humanize_codex_wrapper_event("agent_message_content_delta", _payload),
+    do: "agent message content streaming"
 
-  defp humanize_codex_wrapper_event("agent_reasoning_delta", payload),
-    do: humanize_streaming_event("reasoning streaming", payload)
+  defp humanize_codex_wrapper_event("agent_reasoning_delta", _payload),
+    do: "reasoning streaming"
 
-  defp humanize_codex_wrapper_event("reasoning_content_delta", payload),
-    do: humanize_streaming_event("reasoning content streaming", payload)
+  defp humanize_codex_wrapper_event("reasoning_content_delta", _payload),
+    do: "reasoning content streaming"
 
   defp humanize_codex_wrapper_event("agent_reasoning_section_break", _payload), do: "reasoning section break"
-  defp humanize_codex_wrapper_event("agent_reasoning", payload), do: humanize_reasoning_update(payload)
+  defp humanize_codex_wrapper_event("agent_reasoning", _payload), do: "reasoning update"
   defp humanize_codex_wrapper_event("turn_diff", _payload), do: "turn diff updated"
-  defp humanize_codex_wrapper_event("exec_command_begin", payload), do: humanize_exec_command_begin(payload)
+  defp humanize_codex_wrapper_event("exec_command_begin", _payload), do: "command started"
   defp humanize_codex_wrapper_event("exec_command_end", payload), do: humanize_exec_command_end(payload)
   defp humanize_codex_wrapper_event("exec_command_output_delta", _payload), do: "command output streaming"
   defp humanize_codex_wrapper_event("mcp_tool_call_begin", _payload), do: "mcp tool call started"
@@ -1551,33 +1482,7 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
-  defp humanize_codex_wrapper_event(other, payload) do
-    msg_type =
-      map_path(payload, ["params", "msg", "type"]) ||
-        map_path(payload, [:params, :msg, :type])
-
-    if is_binary(msg_type) do
-      "#{other} (#{msg_type})"
-    else
-      other
-    end
-  end
-
-  defp humanize_exec_command_begin(payload) do
-    command =
-      map_path(payload, ["params", "msg", "command"]) ||
-        map_path(payload, [:params, :msg, :command]) ||
-        map_path(payload, ["params", "msg", "parsed_cmd"]) ||
-        map_path(payload, [:params, :msg, :parsed_cmd])
-
-    command = normalize_command(command)
-
-    if is_binary(command) do
-      command
-    else
-      "command started"
-    end
-  end
+  defp humanize_codex_wrapper_event(_other, _payload), do: "codex wrapper event"
 
   defp humanize_exec_command_end(payload) do
     exit_code =
@@ -1688,106 +1593,18 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_rate_limit_bucket_summary(_bucket), do: nil
 
-  defp format_error_value(%{"message" => message}) when is_binary(message), do: message
-  defp format_error_value(%{message: message}) when is_binary(message), do: message
-  defp format_error_value(error), do: inspect(error, limit: 10)
-
-  defp format_reason(message) when is_map(message) do
-    case map_value(message, ["reason", :reason]) do
-      nil ->
-        message
-        |> inspect(limit: 10)
-        |> inline_text()
-
-      reason ->
-        format_error_value(reason)
-    end
-  end
-
-  defp format_reason(other), do: format_error_value(other)
-
-  defp humanize_streaming_event(label, payload) do
-    case extract_delta_preview(payload) do
-      nil -> label
-      preview -> "#{label}: #{preview}"
-    end
-  end
-
-  defp humanize_reasoning_update(payload) do
-    case extract_reasoning_focus(payload) do
-      nil -> "reasoning update"
-      focus -> "reasoning update: #{focus}"
-    end
-  end
-
-  defp extract_reasoning_focus(payload) do
-    value = extract_first_path(payload, reasoning_focus_paths())
-
-    if is_binary(value) do
-      trimmed = String.trim(value)
-      if trimmed == "", do: nil, else: inline_text(trimmed)
-    else
-      nil
-    end
-  end
-
-  defp extract_delta_preview(payload) do
-    delta = extract_first_path(payload, delta_paths())
-
-    case delta do
-      value when is_binary(value) ->
-        trimmed = String.trim(value)
-        if trimmed == "", do: nil, else: inline_text(trimmed)
-
-      _ ->
-        nil
-    end
-  end
-
-  defp extract_command(payload) do
-    payload
-    |> map_path(["params", "parsedCmd"])
-    |> fallback_command(payload)
-    |> normalize_command()
-  end
-
-  defp fallback_command(nil, payload) do
-    map_path(payload, ["params", "command"]) ||
-      map_path(payload, ["params", "cmd"]) ||
-      map_path(payload, ["params", "argv"]) ||
-      map_path(payload, ["params", "args"])
-  end
-
-  defp fallback_command(command, _payload), do: command
-
-  defp normalize_command(%{} = command) do
-    binary_command = map_value(command, ["parsedCmd", :parsedCmd, "command", :command, "cmd", :cmd])
-    args = map_value(command, ["args", :args, "argv", :argv])
-
-    if is_binary(binary_command) and is_list(args) do
-      normalize_command([binary_command | args])
-    else
-      normalize_command(binary_command || args)
-    end
-  end
-
-  defp normalize_command(command) when is_binary(command), do: inline_text(command)
-
-  defp normalize_command(command) when is_list(command) do
-    if Enum.all?(command, &is_binary/1) do
-      command
-      |> Enum.join(" ")
-      |> inline_text()
-    else
-      nil
-    end
-  end
-
-  defp normalize_command(_command), do: nil
-
   defp humanize_item_type(nil), do: "item"
 
-  defp humanize_item_type(type) when is_binary(type) do
+  defp humanize_item_type(type)
+       when type in [
+              "agentMessage",
+              "commandExecution",
+              "fileChange",
+              "mcpToolCall",
+              "plan",
+              "reasoning",
+              "token_count"
+            ] do
     type
     |> String.replace(~r/([a-z0-9])([A-Z])/, "\\1 \\2")
     |> String.replace("_", " ")
@@ -1796,7 +1613,12 @@ defmodule SymphonyElixir.StatusDashboard do
     |> String.trim()
   end
 
-  defp humanize_item_type(type), do: to_string(type)
+  defp humanize_item_type(_type), do: "item"
+
+  defp safe_item_status(status) when status in ["cancelled", "completed", "failed", "pending", "running"],
+    do: status
+
+  defp safe_item_status(_status), do: nil
 
   defp humanize_status(status) when is_binary(status) do
     status
@@ -1820,16 +1642,6 @@ defmodule SymphonyElixir.StatusDashboard do
       map_path(payload, [:params, :msg, :payload, :type])
   end
 
-  defp inline_text(text) when is_binary(text) do
-    text
-    |> String.replace("\n", " ")
-    |> String.replace(~r/\s+/, " ")
-    |> String.trim()
-    |> truncate(80)
-  end
-
-  defp inline_text(other), do: other |> to_string() |> inline_text()
-
   defp parse_integer(value) when is_integer(value), do: value
 
   defp parse_integer(value) when is_binary(value) do
@@ -1849,74 +1661,6 @@ defmodule SymphonyElixir.StatusDashboard do
       [:params, :msg, :info, :total_token_usage],
       ["params", "tokenUsage", "total"],
       [:params, :tokenUsage, :total]
-    ]
-  end
-
-  defp delta_paths do
-    [
-      ["params", "delta"],
-      [:params, :delta],
-      ["params", "msg", "delta"],
-      [:params, :msg, :delta],
-      ["params", "textDelta"],
-      [:params, :textDelta],
-      ["params", "msg", "textDelta"],
-      [:params, :msg, :textDelta],
-      ["params", "outputDelta"],
-      [:params, :outputDelta],
-      ["params", "msg", "outputDelta"],
-      [:params, :msg, :outputDelta],
-      ["params", "text"],
-      [:params, :text],
-      ["params", "msg", "text"],
-      [:params, :msg, :text],
-      ["params", "summaryText"],
-      [:params, :summaryText],
-      ["params", "msg", "summaryText"],
-      [:params, :msg, :summaryText],
-      ["params", "msg", "content"],
-      [:params, :msg, :content],
-      ["params", "msg", "payload", "delta"],
-      [:params, :msg, :payload, :delta],
-      ["params", "msg", "payload", "textDelta"],
-      [:params, :msg, :payload, :textDelta],
-      ["params", "msg", "payload", "outputDelta"],
-      [:params, :msg, :payload, :outputDelta],
-      ["params", "msg", "payload", "text"],
-      [:params, :msg, :payload, :text],
-      ["params", "msg", "payload", "summaryText"],
-      [:params, :msg, :payload, :summaryText],
-      ["params", "msg", "payload", "content"],
-      [:params, :msg, :payload, :content]
-    ]
-  end
-
-  defp reasoning_focus_paths do
-    [
-      ["params", "reason"],
-      [:params, :reason],
-      ["params", "summaryText"],
-      [:params, :summaryText],
-      ["params", "summary"],
-      [:params, :summary],
-      ["params", "text"],
-      [:params, :text],
-      ["params", "msg", "reason"],
-      [:params, :msg, :reason],
-      ["params", "msg", "summaryText"],
-      [:params, :msg, :summaryText],
-      ["params", "msg", "summary"],
-      [:params, :msg, :summary],
-      ["params", "msg", "text"],
-      [:params, :msg, :text],
-      ["params", "msg", "payload", "reason"],
-      [:params, :msg, :payload, :reason],
-      ["params", "msg", "payload", "summaryText"],
-      [:params, :msg, :payload, :summaryText],
-      ["params", "msg", "payload", "summary"],
-      [:params, :msg, :payload, :summary],
-      ["params", "msg", "payload", "text"],
-      [:params, :msg, :payload, :text]
     ]
   end
 

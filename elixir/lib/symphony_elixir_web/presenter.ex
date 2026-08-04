@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{Config, ObservabilitySanitizer, Orchestrator}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -122,7 +122,7 @@ defmodule SymphonyElixirWeb.Presenter do
         codex_session_logs: []
       },
       recent_events: (running && recent_events_payload(running)) || [],
-      last_error: retry && retry.error,
+      last_error_code: retry && ObservabilitySanitizer.retry_error_code(retry.error),
       tracked: %{}
     }
   end
@@ -147,12 +147,10 @@ defmodule SymphonyElixirWeb.Presenter do
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
-      session_title: Map.get(entry, :session_title),
       model: model_payload(entry),
       model_catalog: Map.get(entry, :model_catalog),
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_codex_event,
-      last_message: summarize_message(entry.last_codex_message),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
       tokens: %{
@@ -170,7 +168,7 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_identifier: entry.identifier,
       attempt: entry.attempt,
       due_at: due_at_iso8601(entry.due_in_ms),
-      error: entry.error,
+      error_code: ObservabilitySanitizer.retry_error_code(entry.error),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path)
     }
@@ -197,14 +195,12 @@ defmodule SymphonyElixirWeb.Presenter do
       worker_host: Map.get(running, :worker_host),
       workspace_path: Map.get(running, :workspace_path),
       session_id: running.session_id,
-      session_title: Map.get(running, :session_title),
       model: model_payload(running),
       model_catalog: Map.get(running, :model_catalog),
       turn_count: Map.get(running, :turn_count, 0),
       state: running.state,
       started_at: iso8601(running.started_at),
       last_event: running.last_codex_event,
-      last_message: summarize_message(running.last_codex_message),
       last_event_at: iso8601(running.last_codex_timestamp),
       tokens: %{
         input_tokens: running.codex_input_tokens,
@@ -219,7 +215,7 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       attempt: retry.attempt,
       due_at: due_at_iso8601(retry.due_in_ms),
-      error: retry.error,
+      error_code: ObservabilitySanitizer.retry_error_code(retry.error),
       worker_host: Map.get(retry, :worker_host),
       workspace_path: Map.get(retry, :workspace_path)
     }
@@ -262,15 +258,11 @@ defmodule SymphonyElixirWeb.Presenter do
     [
       %{
         at: iso8601(running.last_codex_timestamp),
-        event: running.last_codex_event,
-        message: summarize_message(running.last_codex_message)
+        event: running.last_codex_event
       }
     ]
     |> Enum.reject(&is_nil(&1.at))
   end
-
-  defp summarize_message(nil), do: nil
-  defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)
 
   defp due_at_iso8601(due_in_ms) when is_integer(due_in_ms) do
     DateTime.utc_now()

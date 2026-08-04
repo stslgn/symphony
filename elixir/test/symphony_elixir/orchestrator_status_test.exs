@@ -95,7 +95,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {:codex_worker_update, issue_id,
        %{
          event: :notification,
-         payload: %{method: "some-event"},
+         payload: %{
+           method: "item/commandExecution/requestApproval",
+           params: %{parsedCmd: "SENSITIVE-BL10-DO-NOT-EXPOSE"}
+         },
          timestamp: now
        }}
     )
@@ -113,9 +116,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert snapshot_entry.last_codex_message == %{
              event: :notification,
-             message: %{method: "some-event"},
+             message: %{method: "item/commandExecution/requestApproval"},
              timestamp: now
            }
+
+    refute inspect(snapshot_entry) =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
 
     assert {:ok, events} = RunLedger.read_events(initial_state.run_ledger_path)
 
@@ -824,7 +829,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       timer_ref: nil,
       due_at_ms: System.monotonic_time(:millisecond) + 5_000,
       identifier: "MT-500",
-      error: "agent exited: :boom"
+      error: "agent_exit"
     }
 
     initial_state = :sys.get_state(pid)
@@ -840,7 +845,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                attempt: 2,
                due_in_ms: due_in_ms,
                identifier: "MT-500",
-               error: "agent exited: :boom"
+               error: "agent_exit"
              }
            ] = snapshot.retrying
 
@@ -1048,7 +1053,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              attempt: 1,
              due_at_ms: due_at_ms,
              identifier: "MT-STALL",
-             error: "stalled for " <> _
+             error: "worker_stalled"
            } = state.retry_attempts[issue_id]
 
     assert is_integer(due_at_ms)
@@ -1412,7 +1417,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute plain =~ " notification "
   end
 
-  test "status dashboard strips ANSI and control bytes from last codex message" do
+  test "status dashboard fails closed for raw last codex message content" do
     payload =
       "cmd: " <>
         <<27>> <>
@@ -1436,7 +1441,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     plain = Regex.replace(~r/\e\[[0-9;]*m/, row, "")
 
-    assert plain =~ "cmd: RED after line"
+    assert plain =~ "codex event"
+    refute plain =~ "RED"
     refute plain =~ <<27>>
     refute plain =~ <<0>>
   end
@@ -1501,10 +1507,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {"item/reasoning/textDelta", %{"params" => %{"textDelta" => "reason"}}, "reasoning text streaming"},
       {"item/commandExecution/outputDelta", %{"params" => %{"outputDelta" => "ok"}}, "command output streaming"},
       {"item/fileChange/outputDelta", %{"params" => %{"outputDelta" => "changed"}}, "file change output streaming"},
-      {"item/commandExecution/requestApproval", %{"params" => %{"parsedCmd" => "git status"}}, "command approval requested (git status)"},
+      {"item/commandExecution/requestApproval", %{"params" => %{"parsedCmd" => "git status"}}, "command approval requested"},
       {"item/fileChange/requestApproval", %{"params" => %{"fileChangeCount" => 2}}, "file change approval requested (2 files)"},
       {"item/tool/call", %{"params" => %{"tool" => "linear_graphql"}}, "dynamic tool call requested (linear_graphql)"},
-      {"item/tool/requestUserInput", %{"params" => %{"question" => "Continue?"}}, "tool requires user input: Continue?"}
+      {"item/tool/requestUserInput", %{"params" => %{"question" => "Continue?"}}, "tool requires user input"}
     ]
 
     Enum.each(event_cases, fn {method, payload, expected_fragment} ->
@@ -1582,7 +1588,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     message = %{
       event: :terminal_protocol_error,
       message: %{
-        reason: {:terminal_protocol_error, :invalid_markup, "invalid markup in final assistant message"}
+        reason: {:terminal_protocol_error, :invalid_markup}
       }
     }
 
@@ -1595,16 +1601,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     message = %{
       event: :app_server_error,
       message: %{
-        reason: {:app_server_error, "conversation unavailable"}
+        reason: {:app_server_error, "turn_error"}
       }
     }
 
     humanized = StatusDashboard.humanize_codex_message(message)
     assert humanized =~ "codex app-server error"
-    assert humanized =~ "conversation unavailable"
+    assert humanized =~ "turn_error"
   end
 
-  test "status dashboard uses shell command line as exec command status text" do
+  test "status dashboard omits shell command text from exec status" do
     message = %{
       event: :notification,
       message: %{
@@ -1613,7 +1619,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       }
     }
 
-    assert StatusDashboard.humanize_codex_message(message) == "git status --short"
+    assert StatusDashboard.humanize_codex_message(message) == "command started"
+    refute StatusDashboard.humanize_codex_message(message) =~ "git status --short"
   end
 
   test "status dashboard formats auto-approval updates from codex" do
@@ -1650,14 +1657,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert humanized =~ "auto-answered"
   end
 
-  test "status dashboard enriches wrapper reasoning and message streaming events with payload context" do
+  test "status dashboard keeps reasoning, message, command, and error content categorical" do
     reasoning_message = %{
       event: :notification,
       message: %{
         "method" => "codex/event/agent_reasoning",
         "params" => %{
           "msg" => %{
-            "payload" => %{"summaryText" => "compare retry paths for Linear polling"}
+            "payload" => %{"summaryText" => "SENSITIVE-BL10-DO-NOT-EXPOSE"}
           }
         }
       }
@@ -1669,7 +1676,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         "method" => "codex/event/agent_message_delta",
         "params" => %{
           "msg" => %{
-            "payload" => %{"delta" => "writing workpad reconciliation update"}
+            "payload" => %{"delta" => "SENSITIVE-BL10-DO-NOT-EXPOSE"}
           }
         }
       }
@@ -1683,11 +1690,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       }
     }
 
-    assert StatusDashboard.humanize_codex_message(reasoning_message) =~
-             "reasoning update: compare retry paths for Linear polling"
+    assert StatusDashboard.humanize_codex_message(reasoning_message) == "reasoning update"
+    assert StatusDashboard.humanize_codex_message(message_delta) == "agent message streaming"
 
-    assert StatusDashboard.humanize_codex_message(message_delta) =~
-             "agent message streaming: writing workpad reconciliation update"
+    refute StatusDashboard.humanize_codex_message(reasoning_message) =~
+             "SENSITIVE-BL10-DO-NOT-EXPOSE"
+
+    refute StatusDashboard.humanize_codex_message(message_delta) =~
+             "SENSITIVE-BL10-DO-NOT-EXPOSE"
 
     assert StatusDashboard.humanize_codex_message(fallback_reasoning) == "reasoning update"
   end

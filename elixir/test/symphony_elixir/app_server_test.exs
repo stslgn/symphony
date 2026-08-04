@@ -1398,7 +1398,8 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert_received {:app_server_message, %{event: :turn_completed}}
       refute_received {:app_server_message, %{event: :malformed}}
-      assert log =~ "Codex turn stream output: warning: this is stderr noise"
+      assert log =~ "Codex turn stream emitted non-JSON output"
+      refute log =~ "warning: this is stderr noise"
     after
       File.rm_rf(test_root)
     end
@@ -1468,7 +1469,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert {:ok, _result} =
                AppServer.run(workspace, "Capture malformed protocol line", issue, on_message: on_message)
 
-      assert_received {:app_server_message, %{event: :malformed, payload: "{\"method\":\"turn/completed\""}}
+      assert_received {:app_server_message, %{event: :malformed, error_code: "invalid_json"}}
       assert_received {:app_server_message, %{event: :turn_completed}}
     after
       File.rm_rf(test_root)
@@ -1505,7 +1506,7 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-94"}}}'
             ;;
           4)
-            printf '%s\\n' '{"fields":{"error":"invalid markup in final assistant message","message":"ignoring assistant output"}}'
+            printf '%s\\n' '{"fields":{"error":"invalid markup SENSITIVE-BL10-DO-NOT-EXPOSE","message":"ignoring assistant output"}}'
             exit 0
             ;;
           *)
@@ -1535,21 +1536,26 @@ defmodule SymphonyElixir.AppServerTest do
       test_pid = self()
       on_message = fn message -> send(test_pid, {:app_server_message, message}) end
 
-      assert {:error, {:terminal_protocol_error, :invalid_markup, "invalid markup in final assistant message"}} =
-               AppServer.run(workspace, "Capture invalid markup runtime failure", issue, on_message: on_message)
+      log =
+        capture_log(fn ->
+          assert {:error, {:terminal_protocol_error, :invalid_markup}} =
+                   AppServer.run(workspace, "Capture invalid markup runtime failure", issue, on_message: on_message)
+        end)
 
       assert_received {:app_server_message,
                        %{
                          event: :terminal_protocol_error,
-                         reason: {:terminal_protocol_error, :invalid_markup, "invalid markup in final assistant message"}
+                         error_code: "invalid_markup",
+                         reason: {:terminal_protocol_error, :invalid_markup}
                        }}
 
       assert_received {:app_server_message,
                        %{
                          event: :turn_ended_with_error,
-                         reason: {:terminal_protocol_error, :invalid_markup, "invalid markup in final assistant message"}
+                         error_code: "invalid_markup"
                        }}
 
+      refute log =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
       refute_received {:app_server_message, %{event: :turn_completed}}
     after
       File.rm_rf(test_root)
@@ -1586,7 +1592,7 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-95"}}}'
             ;;
           4)
-            printf '%s\\n' '{"method":"error","params":{"code":"turn_error","message":"conversation unavailable"}}'
+            printf '%s\\n' '{"method":"error","params":{"code":"turn_error","message":"SENSITIVE-BL10-DO-NOT-EXPOSE"}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -1617,21 +1623,26 @@ defmodule SymphonyElixir.AppServerTest do
       test_pid = self()
       on_message = fn message -> send(test_pid, {:app_server_message, message}) end
 
-      assert {:error, {:app_server_error, "conversation unavailable"}} =
-               AppServer.run(workspace, "Capture runtime error notification", issue, on_message: on_message)
+      log =
+        capture_log(fn ->
+          assert {:error, {:app_server_error, "turn_error"}} =
+                   AppServer.run(workspace, "Capture runtime error notification", issue, on_message: on_message)
+        end)
 
       assert_received {:app_server_message,
                        %{
                          event: :app_server_error,
-                         reason: {:app_server_error, "conversation unavailable"}
+                         error_code: "turn_error",
+                         reason: {:app_server_error, "turn_error"}
                        }}
 
       assert_received {:app_server_message,
                        %{
                          event: :turn_ended_with_error,
-                         reason: {:app_server_error, "conversation unavailable"}
+                         error_code: "turn_error"
                        }}
 
+      refute log =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
       refute_received {:app_server_message, %{event: :turn_completed}}
     after
       File.rm_rf(test_root)

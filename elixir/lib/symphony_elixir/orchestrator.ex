@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{
     AgentRunner,
     Config,
+    ObservabilitySanitizer,
     OperatorCommand,
     OperatorWait,
     RunBudget,
@@ -179,7 +180,8 @@ defmodule SymphonyElixir.Orchestrator do
               })
 
             _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+              error_code = ObservabilitySanitizer.error_code(reason, "agent_exit")
+              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} error_code=#{error_code}; scheduling retry")
 
               next_attempt = next_retry_attempt_from_running(running_entry)
 
@@ -194,7 +196,7 @@ defmodule SymphonyElixir.Orchestrator do
               })
           end
 
-        Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
+        Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id}")
 
         notify_dashboard()
         {:noreply, state}
@@ -1140,7 +1142,13 @@ defmodule SymphonyElixir.Orchestrator do
     retry_token = make_ref()
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
-    error = pick_retry_error(previous_retry, metadata)
+
+    error =
+      case pick_retry_error(previous_retry, metadata) do
+        nil -> nil
+        value -> ObservabilitySanitizer.retry_error_code(value)
+      end
+
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
 
@@ -1850,12 +1858,40 @@ defmodule SymphonyElixir.Orchestrator do
   defp turn_count_for_update(_existing_count, _existing_session_id, _update), do: 0
 
   defp summarize_codex_update(update) do
+    payload = update[:payload] || update[:raw]
+
+    message =
+      %{}
+      |> maybe_put_codex_summary_value(
+        :method,
+        payload
+        |> codex_payload_method()
+        |> ObservabilitySanitizer.protocol_method()
+      )
+      |> maybe_put_codex_summary_value(
+        :error_code,
+        codex_update_error_code(update)
+      )
+
     %{
       event: update[:event],
-      message: update[:payload] || update[:raw],
+      message: message,
       timestamp: update[:timestamp]
     }
   end
+
+  defp codex_payload_method(%{} = payload), do: Map.get(payload, :method) || Map.get(payload, "method")
+  defp codex_payload_method(_payload), do: nil
+
+  defp codex_update_error_code(%{event: event} = update)
+       when event in [:app_server_error, :terminal_protocol_error, :turn_failed, :turn_ended_with_error, :startup_failed] do
+    ObservabilitySanitizer.error_code(update, "runtime_error")
+  end
+
+  defp codex_update_error_code(_update), do: nil
+
+  defp maybe_put_codex_summary_value(summary, _key, nil), do: summary
+  defp maybe_put_codex_summary_value(summary, key, value), do: Map.put(summary, key, value)
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
     if is_reference(state.tick_timer_ref) do

@@ -138,7 +138,7 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     Snapshot.assert_dashboard_snapshot!("backoff_queue", render_snapshot(snapshot_data, 15.4))
   end
 
-  test "backoff queue row escapes escaped newline sequences" do
+  test "backoff queue row exposes only a categorical error code" do
     snapshot_data =
       {:ok,
        %{
@@ -148,7 +148,7 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
              identifier: "MT-980",
              attempt: 1,
              due_in_ms: 1_500,
-             error: "error with \\nnewline"
+             error: "SENSITIVE-BL10-DO-NOT-EXPOSE"
            })
          ],
          codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
@@ -162,8 +162,8 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
 
     [backoff_line] = backoff_lines
 
-    assert backoff_line =~ "error=error with newline"
-    refute backoff_line =~ "\\n"
+    assert backoff_line =~ "error_code=worker_failure"
+    refute backoff_line =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
   end
 
   test "snapshot fixture: unlimited credits variant" do

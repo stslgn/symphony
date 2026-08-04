@@ -5,13 +5,12 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   require Logger
   alias SymphonyElixir.Codex.{CapabilityPolicy, DynamicTool, ModelCatalog}
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, ObservabilitySanitizer, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
   @port_line_bytes 1_048_576
-  @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
 
   @type session :: %{
@@ -150,7 +149,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, session_title) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
-        Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id} session_title=#{inspect(session_title)}")
+        Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
 
         emit_message(
           on_message,
@@ -185,14 +184,15 @@ defmodule SymphonyElixir.Codex.AppServer do
              }}
 
           {:error, reason} ->
-            Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
+            error_code = ObservabilitySanitizer.error_code(reason, "turn_error")
+            Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id} error_code=#{error_code}")
 
             emit_message(
               on_message,
               :turn_ended_with_error,
               %{
                 session_id: session_id,
-                reason: reason
+                error_code: error_code
               },
               metadata
             )
@@ -201,8 +201,9 @@ defmodule SymphonyElixir.Codex.AppServer do
         end
 
       {:error, reason} ->
-        Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
-        emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
+        error_code = ObservabilitySanitizer.error_code(reason, "startup_error")
+        Logger.error("Codex session failed for #{issue_context(issue)} error_code=#{error_code}")
+        emit_message(on_message, :startup_failed, %{error_code: error_code}, metadata)
         {:error, reason}
     end
   end
@@ -497,11 +498,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           emit_message(
             on_message,
             :malformed,
-            %{
-              payload: payload_string,
-              raw: payload_string
-            },
-            metadata_from_message(port, %{raw: payload_string})
+            %{error_code: "invalid_json"},
+            metadata_from_message(port, %{})
           )
         end
 
@@ -512,16 +510,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp handle_decoded_incoming(port, on_message, payload, payload_string, timeout_ms, tool_executor, auto_approve_requests) do
     case terminal_protocol_error_reason(payload) do
       {:ok, reason} ->
-        Logger.warning("Codex terminal protocol error: reason=#{inspect(reason)} payload=#{inspect(payload)}")
+        error_code = ObservabilitySanitizer.error_code(reason, "protocol_error")
+        Logger.warning("Codex terminal protocol error: error_code=#{error_code}")
 
         emit_message(
           on_message,
           :terminal_protocol_error,
-          %{
-            payload: payload,
-            raw: payload_string,
-            reason: reason
-          },
+          %{error_code: error_code, reason: reason},
           metadata_from_message(port, payload)
         )
 
@@ -546,43 +541,27 @@ defmodule SymphonyElixir.Codex.AppServer do
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
         {:ok, :turn_completed}
 
-      %{"method" => "turn/failed", "params" => _} = payload ->
-        emit_turn_event(
-          on_message,
-          :turn_failed,
-          payload,
-          payload_string,
-          port,
-          Map.get(payload, "params")
-        )
+      %{"method" => "turn/failed", "params" => params} = payload ->
+        error_code = ObservabilitySanitizer.error_code(params, "turn_failed")
+        reason = {:turn_failed, error_code}
+        emit_message(on_message, :turn_failed, %{error_code: error_code, reason: reason}, metadata_from_message(port, payload))
+        {:error, reason}
 
-        {:error, {:turn_failed, Map.get(payload, "params")}}
-
-      %{"method" => "turn/cancelled", "params" => _} = payload ->
-        emit_turn_event(
-          on_message,
-          :turn_cancelled,
-          payload,
-          payload_string,
-          port,
-          Map.get(payload, "params")
-        )
-
-        {:error, {:turn_cancelled, Map.get(payload, "params")}}
+      %{"method" => "turn/cancelled"} = payload ->
+        reason = {:turn_cancelled, "cancelled"}
+        emit_message(on_message, :turn_cancelled, %{error_code: "cancelled", reason: reason}, metadata_from_message(port, payload))
+        {:error, reason}
 
       %{"method" => "error"} = payload ->
         reason = app_server_error_reason(payload)
+        error_code = ObservabilitySanitizer.error_code(reason, "protocol_error")
 
-        Logger.warning("Codex app-server error: reason=#{inspect(reason)} payload=#{truncate_protocol_payload(payload_string)}")
+        Logger.warning("Codex app-server error: error_code=#{error_code}")
 
         emit_message(
           on_message,
           :app_server_error,
-          %{
-            payload: payload,
-            raw: payload_string,
-            reason: reason
-          },
+          %{error_code: error_code, reason: reason},
           metadata_from_message(port, payload)
         )
 
@@ -696,7 +675,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             metadata
           )
 
-          Logger.debug("Codex notification: #{inspect(method)}")
+          Logger.debug("Codex notification received")
           receive_loop(port, on_message, timeout_ms, "", tool_executor, approval_context)
         end
     end
@@ -747,7 +726,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     |> Enum.find(&invalid_markup_error?/1)
     |> case do
       nil -> :error
-      message -> {:ok, {:terminal_protocol_error, :invalid_markup, message}}
+      _message -> {:ok, {:terminal_protocol_error, :invalid_markup}}
     end
   end
 
@@ -759,18 +738,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         Map.get(payload, "error") ||
         payload
 
-    case first_error_message(error_payload) do
-      nil -> {:app_server_error, compact_protocol_payload(error_payload)}
-      message -> {:app_server_error, message}
-    end
-  end
-
-  defp first_error_message(payload) do
-    payload
-    |> collect_error_strings()
-    |> Enum.map(&String.trim/1)
-    |> Enum.find(&(&1 != ""))
-    |> truncate_protocol_reason()
+    {:app_server_error, ObservabilitySanitizer.error_code(error_payload, "protocol_error")}
   end
 
   defp collect_error_strings(payload) when is_map(payload) do
@@ -791,31 +759,6 @@ defmodule SymphonyElixir.Codex.AppServer do
     message
     |> String.downcase()
     |> String.contains?("invalid markup")
-  end
-
-  defp truncate_protocol_reason(nil), do: nil
-
-  defp truncate_protocol_reason(message) when is_binary(message) do
-    trimmed = String.trim(message)
-
-    if String.length(trimmed) > @max_stream_log_bytes do
-      String.slice(trimmed, 0, @max_stream_log_bytes) <> "...<truncated>"
-    else
-      trimmed
-    end
-  end
-
-  defp compact_protocol_payload(payload) do
-    payload
-    |> inspect(limit: 20, printable_limit: @max_stream_log_bytes)
-    |> truncate_protocol_reason()
-  end
-
-  defp truncate_protocol_payload(payload_string) do
-    payload_string
-    |> to_string()
-    |> String.trim()
-    |> truncate_protocol_reason()
   end
 
   defp maybe_handle_approval_request(
@@ -1385,16 +1328,16 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload) do
       {:ok, %{"id" => ^request_id, "error" => error}} ->
-        {:error, {:response_error, error}}
+        {:error, {:response_error, ObservabilitySanitizer.error_code(error, "response_error")}}
 
       {:ok, %{"id" => ^request_id, "result" => result}} ->
         {:ok, result}
 
       {:ok, %{"id" => ^request_id} = response_payload} ->
-        {:error, {:response_error, response_payload}}
+        {:error, {:response_error, ObservabilitySanitizer.error_code(response_payload, "response_error")}}
 
-      {:ok, %{} = other} ->
-        Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
+      {:ok, %{}} ->
+        Logger.debug("Ignoring unrelated message while waiting for Codex response")
         with_timeout_response(port, request_id, timeout_ms, "")
 
       {:error, _} ->
@@ -1404,18 +1347,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp log_non_json_stream_line(data, stream_label) do
-    text =
-      data
-      |> to_string()
-      |> String.trim()
-      |> String.slice(0, @max_stream_log_bytes)
-
-    if text != "" do
-      if String.match?(text, ~r/\b(error|warn|warning|failed|fatal|panic|exception)\b/i) do
-        Logger.warning("Codex #{stream_label} output: #{text}")
-      else
-        Logger.debug("Codex #{stream_label} output: #{text}")
-      end
+    if data |> to_string() |> String.trim() != "" do
+      Logger.warning("Codex #{stream_label} emitted non-JSON output")
     end
   end
 

@@ -290,6 +290,10 @@ The observability UI now runs on a minimal Phoenix stack:
 - The state payload and terminal header expose `control.dispatch_paused`.
 - The same state payload exposes the effective capability allowlist names, but
   never credentials, tool arguments, prompts, or response bodies.
+- Coding-agent status is categorical: event/method names, bounded identifiers,
+  counts, and sanitized error codes. Runtime state, logs, JSON, and LiveView do
+  not retain or render provider payloads, agent/reasoning deltas, command
+  arguments, session titles, or free-form provider errors.
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 

@@ -245,7 +245,7 @@ Fields:
 - `codex_app_server_pid` (string or null)
 - `last_codex_event` (string/enum or null)
 - `last_codex_timestamp` (timestamp or null)
-- `last_codex_message` (summarized payload)
+- `last_codex_message` (categorical event metadata only; never a raw provider payload)
 - `codex_input_tokens` (integer)
 - `codex_output_tokens` (integer)
 - `codex_total_tokens` (integer)
@@ -1474,8 +1474,9 @@ Message formatting requirements:
 
 - Use stable `key=value` phrasing.
 - Include action outcome (`completed`, `failed`, `retrying`, etc.).
-- Include concise failure reason when present.
-- Avoid logging large raw payloads unless necessary.
+- Include a stable, sanitized failure code when present.
+- Never log provider payloads, agent/reasoning text, prompts, command arguments, response bodies, or
+  free-form error messages.
 
 ### 13.2 Logging Outputs and Sinks
 
@@ -1502,6 +1503,8 @@ SHOULD return:
 - `control`
   - `dispatch_paused` (boolean)
 - `capabilities` (effective allowlist names only; no credentials, arguments, prompts, or results)
+- latest coding-agent event metadata MAY include categorical event/method names, bounded identifiers,
+  counts, and sanitized error codes only; raw payloads MUST NOT be retained in snapshot state
 - `codex_totals`
   - `input_tokens`
   - `output_tokens`
@@ -1521,6 +1524,10 @@ implementation-defined.
 
 If present, it SHOULD draw from orchestrator state/metrics only and MUST NOT be REQUIRED for
 correctness.
+
+Human-readable status MUST NOT render agent/reasoning deltas, command arguments, prompts, response
+bodies, session titles derived from issue text, or free-form provider errors. It MAY render categorical
+event names, bounded identifiers, counts, and sanitized error codes.
 
 ### 13.5 Session Metrics and Token Accounting
 
@@ -1572,6 +1579,9 @@ If implemented:
 - The implementation MAY serve server-rendered HTML or a client-side application for the dashboard.
 - The dashboard/API MUST be observability/control surfaces only and MUST NOT become REQUIRED for
   orchestrator correctness.
+- Dashboard and API projections MUST expose categorical event names, bounded identifiers, counts,
+  and sanitized error codes only. They MUST NOT expose raw coding-agent payloads, prompts,
+  reasoning/message deltas, command arguments, response bodies, or free-form provider errors.
 
 Extension config:
 

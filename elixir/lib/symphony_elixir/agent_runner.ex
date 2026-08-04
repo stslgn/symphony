@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, ObservabilitySanitizer, PromptBuilder, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -21,8 +21,9 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, reason} ->
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        error_code = ObservabilitySanitizer.error_code(reason, "agent_run_failed")
+        Logger.error("Agent run failed for #{issue_context(issue)} error_code=#{error_code}")
+        raise RuntimeError, "Agent run failed for #{issue_context(issue)} error_code=#{error_code}"
     end
   end
 

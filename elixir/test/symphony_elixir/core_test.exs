@@ -682,7 +682,7 @@ defmodule SymphonyElixir.CoreTest do
           retry_token: retry_token,
           due_at_ms: System.monotonic_time(:millisecond),
           identifier: "MT-PAUSED-RETRY",
-          error: "agent exited: :boom"
+          error: "agent_exit"
         }
       }
     }
@@ -1223,7 +1223,7 @@ defmodule SymphonyElixir.CoreTest do
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
+    assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent_exit"} =
              state.retry_attempts[issue_id]
 
     assert_scheduled_delay(due_at_ms, scheduled_from_ms, 40_000)
@@ -1263,7 +1263,7 @@ defmodule SymphonyElixir.CoreTest do
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
+    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent_exit"} =
              state.retry_attempts[issue_id]
 
     assert_scheduled_delay(due_at_ms, scheduled_from_ms, 10_000)
@@ -1293,7 +1293,7 @@ defmodule SymphonyElixir.CoreTest do
           retry_token: current_retry_token,
           due_at_ms: System.monotonic_time(:millisecond) + 30_000,
           identifier: "MT-561",
-          error: "agent exited: :boom"
+          error: "agent_exit"
         }
       })
     end)
@@ -1305,7 +1305,7 @@ defmodule SymphonyElixir.CoreTest do
              attempt: 2,
              retry_token: ^current_retry_token,
              identifier: "MT-561",
-             error: "agent exited: :boom"
+             error: "agent_exit"
            } = :sys.get_state(pid).retry_attempts[issue_id]
   end
 

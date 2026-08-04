@@ -163,10 +163,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     </td>
                     <td>
                       <div class="session-stack">
-                        <%= if entry.session_title do %>
-                          <span class="muted"><%= entry.session_title %></span>
-                        <% end %>
-
                         <%= if entry.session_id do %>
                           <button
                             type="button"
@@ -187,8 +183,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <div class="detail-stack">
                         <span
                           class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "n/a")}
-                        ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
+                          title={to_string(entry.last_event || "n/a")}
+                        ><%= entry.last_event || "n/a" %></span>
                         <span class="muted event-meta">
                           <%= entry.last_event || "n/a" %>
                           <%= if entry.last_event_at do %>
@@ -228,7 +224,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <th>Issue</th>
                     <th>Attempt</th>
                     <th>Due at</th>
-                    <th>Error</th>
+                    <th>Error code</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -241,7 +237,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     </td>
                     <td><%= entry.attempt %></td>
                     <td class="mono"><%= entry.due_at || "n/a" %></td>
-                    <td><%= entry.error || "n/a" %></td>
+                    <td><%= entry.error_code || "n/a" %></td>
                   </tr>
                 </tbody>
               </table>
