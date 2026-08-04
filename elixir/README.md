@@ -263,8 +263,11 @@ normal poll/reconcile cycle. Tracker reads run in one supervised, monitored task
 orchestrator remains responsive to status, budgets, worker messages, and operator controls. Wake-ups
 during that task coalesce behind one dirty latch and cause exactly one follow-up poll. Task
 references/generations reject stale results; crash and timeout recovery use bounded backoff. The
-webhook wake-up call also has a bounded timeout and returns an unavailable response without crashing
-the request process. Symphony re-fetches Linear and uses existing running, claimed, parked,
+poll worker is owned by a supervised registry-backed guard. If the orchestrator dies abnormally,
+the guard terminates that worker and retains exclusive poll admission until termination is confirmed,
+so a restarted owner cannot overlap an orphaned tracker request. The webhook wake-up call also has a
+bounded timeout and returns an unavailable response without crashing the request process. Symphony
+re-fetches Linear and uses existing running, claimed, parked,
 concurrency, command-cursor, and dispatch-revalidation guards. Duplicate or out-of-order deliveries
 therefore do not directly create transitions, and fixed polling remains the fallback for lost
 webhook delivery.

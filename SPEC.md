@@ -854,7 +854,9 @@ budget timers, worker lifecycle messages, and operator controls while tracker I/
 Wake-ups received during an in-flight poll set one dirty latch; completion schedules exactly one
 follow-up poll. Poll results are accepted only for the current task reference and generation. Task
 crash or timeout schedules a bounded retry backoff, and stale/late results cannot overwrite live
-state.
+state. Poll admission MUST also be exclusive across orchestrator incarnations. A supervised owner
+guard holds that lease until its tracker worker is confirmed dead; abnormal orchestrator death
+therefore terminates the old worker before a restarted orchestrator can admit another poll.
 
 Tick sequence:
 

@@ -1491,6 +1491,149 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert state.poll_task == nil
   end
 
+  test "owner kill releases its poll worker before restarted admission" do
+    parent = self()
+
+    {:ok, probe} =
+      Agent.start_link(fn ->
+        %{attempt: 0, worker_pids: [], max_live_workers: 0}
+      end)
+
+    poll_work_fn = fn request ->
+      worker_pid = self()
+
+      await_supervisor_admission = fn await_supervisor_admission, attempts_left ->
+        task_children = Task.Supervisor.children(SymphonyElixir.TaskSupervisor)
+
+        if worker_pid in task_children or attempts_left == 0 do
+          task_children
+        else
+          Process.sleep(1)
+          await_supervisor_admission.(await_supervisor_admission, attempts_left - 1)
+        end
+      end
+
+      task_children = await_supervisor_admission.(await_supervisor_admission, 50)
+
+      {attempt, supervised_count, prior_supervised_workers} =
+        Agent.get_and_update(probe, fn probe_state ->
+          attempt = probe_state.attempt + 1
+          worker_pids = [worker_pid | probe_state.worker_pids]
+
+          supervised_workers =
+            Enum.filter(task_children, &(&1 in worker_pids))
+
+          prior_supervised_workers = Enum.reject(supervised_workers, &(&1 == worker_pid))
+          supervised_count = length(supervised_workers)
+
+          result = {attempt, supervised_count, prior_supervised_workers}
+
+          {result,
+           %{
+             attempt: attempt,
+             worker_pids: worker_pids,
+             max_live_workers: max(probe_state.max_live_workers, supervised_count)
+           }}
+        end)
+
+      send(
+        parent,
+        {:owner_bound_poll_started, attempt, worker_pid, request, supervised_count, prior_supervised_workers}
+      )
+
+      receive do
+        {:release_owner_bound_poll, result} -> result
+      end
+    end
+
+    orchestrator_name = Module.concat(__MODULE__, :OwnerBoundPollOrchestrator)
+
+    {:ok, supervisor_pid} =
+      Supervisor.start_link(
+        [
+          {Orchestrator, name: orchestrator_name, poll_work_fn: poll_work_fn, poll_task_timeout_ms: 5_000}
+        ],
+        strategy: :one_for_one
+      )
+
+    Process.unlink(supervisor_pid)
+
+    on_exit(fn ->
+      if Process.alive?(supervisor_pid), do: Supervisor.stop(supervisor_pid)
+    end)
+
+    first_owner_pid = Process.whereis(orchestrator_name)
+    first_owner_ref = Process.monitor(first_owner_pid)
+
+    assert_receive {:owner_bound_poll_started, 1, first_worker_pid, _first_request, 1, []}, 500
+    first_poll_task = :sys.get_state(first_owner_pid).poll_task
+    first_guard_ref = Process.monitor(first_poll_task.guard_pid)
+    first_worker_ref = Process.monitor(first_worker_pid)
+
+    Process.exit(first_owner_pid, :kill)
+    assert_receive {:DOWN, ^first_owner_ref, :process, ^first_owner_pid, :killed}, 500
+
+    assert_receive {
+                     :owner_bound_poll_started,
+                     2,
+                     second_worker_pid,
+                     second_request,
+                     second_supervised_count,
+                     prior_supervised_workers
+                   },
+                   2_000
+
+    assert second_supervised_count == 1,
+           inspect(%{
+             first_guard_alive: Process.alive?(first_poll_task.guard_pid),
+             first_worker_alive: Process.alive?(first_worker_pid),
+             prior_supervised_workers: prior_supervised_workers,
+             registry:
+               Registry.lookup(
+                 SymphonyElixir.PollTaskRegistry,
+                 {:orchestrator_poll, orchestrator_name}
+               )
+           })
+
+    assert prior_supervised_workers == []
+
+    assert_receive {:DOWN, ^first_guard_ref, :process, _guard_pid, _reason}, 500
+    assert_receive {:DOWN, ^first_worker_ref, :process, ^first_worker_pid, _reason}, 500
+
+    refute Process.alive?(first_worker_pid)
+    assert Process.alive?(second_worker_pid)
+
+    second_owner_pid = Process.whereis(orchestrator_name)
+    refute second_owner_pid == first_owner_pid
+    assert Process.alive?(second_owner_pid)
+
+    second_poll_task = :sys.get_state(second_owner_pid).poll_task
+    assert second_poll_task.pid == second_worker_pid
+
+    assert Registry.lookup(
+             SymphonyElixir.PollTaskRegistry,
+             {:orchestrator_poll, orchestrator_name}
+           ) == [{second_poll_task.guard_pid, nil}]
+
+    task_children = Task.Supervisor.children(SymphonyElixir.TaskSupervisor)
+    assert second_worker_pid in task_children
+    refute first_worker_pid in task_children
+
+    assert %{attempt: 2, max_live_workers: 1} = Agent.get(probe, & &1)
+
+    send(
+      second_worker_pid,
+      {:release_owner_bound_poll, successful_poll_result(second_request)}
+    )
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(
+               second_owner_pid,
+               &match?(%{polling: %{checking?: false}}, &1),
+               500
+             )
+  end
+
   test "timed-out poll ignores stale results and starts one bounded recovery task" do
     parent = self()
     {:ok, counter} = Agent.start_link(fn -> 0 end)
@@ -1526,7 +1669,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     send(
       pid,
-      {first_task.ref, {first_task.generation, Map.put(successful_poll_result(first_request), :dispatch, {:ok, [:stale]})}}
+      {:poll_guard_result, first_task.guard_pid, first_task.generation, Map.put(successful_poll_result(first_request), :dispatch, {:ok, [:stale]})}
     )
 
     Process.sleep(25)

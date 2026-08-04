@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Orchestrator do
     ObservabilitySanitizer,
     OperatorCommand,
     OperatorWait,
+    PollTaskGuard,
     RateLimitTelemetry,
     RunBudget,
     RunLedger,
@@ -52,6 +53,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_task,
       :poll_task_timeout_ms,
       :poll_work_fn,
+      :poll_owner_key,
       :tick_timer_ref,
       :tick_token,
       :run_ledger_path,
@@ -105,6 +107,7 @@ defmodule SymphonyElixir.Orchestrator do
             poll_task: nil,
             poll_task_timeout_ms: Keyword.get(opts, :poll_task_timeout_ms, @poll_task_timeout_ms),
             poll_work_fn: Keyword.get(opts, :poll_work_fn),
+            poll_owner_key: Keyword.get(opts, :name, __MODULE__),
             tick_timer_ref: nil,
             tick_token: nil,
             run_ledger_path: run_ledger_path,
@@ -173,11 +176,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
-        {ref, {generation, result}},
-        %{poll_task: %{ref: ref, generation: generation}} = state
+        {:poll_guard_started, guard_pid, generation, worker_pid},
+        %{poll_task: %{guard_pid: guard_pid, generation: generation}} = state
       )
-      when is_reference(ref) and is_integer(generation) do
-    Process.demonitor(ref, [:flush])
+      when is_pid(guard_pid) and is_pid(worker_pid) and is_integer(generation) do
+    {:noreply, put_in(state.poll_task.pid, worker_pid)}
+  end
+
+  def handle_info({:poll_guard_started, _guard_pid, _generation, _worker_pid}, state),
+    do: {:noreply, state}
+
+  def handle_info(
+        {:poll_guard_result, guard_pid, generation, result},
+        %{poll_task: %{guard_pid: guard_pid, generation: generation}} = state
+      )
+      when is_pid(guard_pid) and is_integer(generation) do
     state = clear_poll_task(state)
 
     state =
@@ -196,37 +209,62 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
-  def handle_info({ref, {_generation, _result}}, state) when is_reference(ref),
+  def handle_info({:poll_guard_result, _guard_pid, _generation, _result}, state),
     do: {:noreply, state}
 
   def handle_info(
-        {:poll_task_timeout, generation, ref, timeout_token},
+        {:poll_guard_failed, guard_pid, generation, reason},
+        %{poll_task: %{guard_pid: guard_pid, generation: generation}} = state
+      ) do
+    Logger.warning("Tracker poll task crashed generation=#{generation} reason=#{inspect(reason)}")
+    state = state |> clear_poll_task() |> finish_poll_cycle({:error, {:task_exit, reason}})
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:poll_guard_failed, _guard_pid, _generation, _reason}, state),
+    do: {:noreply, state}
+
+  def handle_info(
+        {:poll_guard_busy, guard_pid, generation, existing_guard},
+        %{poll_task: %{guard_pid: guard_pid, generation: generation}} = state
+      ) do
+    Logger.warning("Tracker poll admission remains owned generation=#{generation} existing_guard=#{inspect(existing_guard)}")
+
+    state = state |> clear_poll_task() |> finish_poll_cycle({:error, :poll_admission_busy})
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:poll_guard_busy, _guard_pid, _generation, _existing_guard}, state),
+    do: {:noreply, state}
+
+  def handle_info(
+        {:poll_task_timeout, generation, guard_pid, timeout_token},
         %{
           poll_task: %{
             generation: generation,
-            ref: ref,
-            timeout_token: timeout_token,
-            pid: pid
+            guard_pid: guard_pid,
+            timeout_token: timeout_token
           }
         } = state
       ) do
-    _ = Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, pid)
-    Process.demonitor(ref, [:flush])
+    :ok = PollTaskGuard.cancel(guard_pid, generation)
     Logger.warning("Tracker poll task timed out generation=#{generation}")
     state = state |> clear_poll_task() |> finish_poll_cycle({:error, :timeout})
     notify_dashboard()
     {:noreply, state}
   end
 
-  def handle_info({:poll_task_timeout, _generation, _ref, _timeout_token}, state),
+  def handle_info({:poll_task_timeout, _generation, _guard_pid, _timeout_token}, state),
     do: {:noreply, state}
 
   def handle_info(
         {:DOWN, ref, :process, _pid, reason},
-        %{poll_task: %{ref: ref, generation: generation}} = state
+        %{poll_task: %{guard_ref: ref, generation: generation}} = state
       ) do
-    Logger.warning("Tracker poll task crashed generation=#{generation} reason=#{inspect(reason)}")
-    state = state |> clear_poll_task() |> finish_poll_cycle({:error, {:task_exit, reason}})
+    Logger.warning("Tracker poll guard exited generation=#{generation} reason=#{inspect(reason)}")
+    state = state |> clear_poll_task() |> finish_poll_cycle({:error, {:guard_exit, reason}})
     notify_dashboard()
     {:noreply, state}
   end
@@ -390,37 +428,47 @@ defmodule SymphonyElixir.Orchestrator do
     request = poll_request(state)
     work_fn = state.poll_work_fn || (&collect_tracker_poll/1)
 
-    try do
-      task =
-        Task.Supervisor.async_nolink(SymphonyElixir.TaskSupervisor, fn ->
-          {generation, work_fn.(request)}
-        end)
+    case start_poll_guard(state, generation, request, work_fn) do
+      {:ok, guard_pid} ->
+        guard_ref = Process.monitor(guard_pid)
+        timeout_token = make_ref()
 
-      timeout_token = make_ref()
+        timeout_ref =
+          Process.send_after(
+            self(),
+            {:poll_task_timeout, generation, guard_pid, timeout_token},
+            poll_task_timeout_ms(state)
+          )
 
-      timeout_ref =
-        Process.send_after(
-          self(),
-          {:poll_task_timeout, generation, task.ref, timeout_token},
-          poll_task_timeout_ms(state)
-        )
+        %{
+          state
+          | poll_generation: generation,
+            poll_task: %{
+              pid: nil,
+              guard_pid: guard_pid,
+              guard_ref: guard_ref,
+              generation: generation,
+              timeout_ref: timeout_ref,
+              timeout_token: timeout_token
+            }
+        }
 
-      %{
-        state
-        | poll_generation: generation,
-          poll_task: %{
-            pid: task.pid,
-            ref: task.ref,
-            generation: generation,
-            timeout_ref: timeout_ref,
-            timeout_token: timeout_token
-          }
-      }
-    catch
-      :exit, reason ->
-        Logger.warning("Unable to start supervised tracker poll task: #{inspect(reason)}")
-        finish_poll_cycle(state, {:error, {:task_start_failed, reason}})
+      {:error, reason} ->
+        Logger.warning("Unable to start supervised tracker poll guard: #{inspect(reason)}")
+        finish_poll_cycle(state, {:error, {:guard_start_failed, reason}})
     end
+  end
+
+  defp start_poll_guard(state, generation, request, work_fn) do
+    PollTaskGuard.start(
+      self(),
+      state.poll_owner_key || __MODULE__,
+      generation,
+      request,
+      work_fn
+    )
+  catch
+    :exit, reason -> {:error, {:supervisor_exit, reason}}
   end
 
   defp prepare_poll_state(%State{} = state) do
@@ -2813,8 +2861,9 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp clear_poll_task(%State{poll_task: %{timeout_ref: timeout_ref}} = state) do
+  defp clear_poll_task(%State{poll_task: %{timeout_ref: timeout_ref, guard_ref: guard_ref}} = state) do
     if is_reference(timeout_ref), do: Process.cancel_timer(timeout_ref)
+    if is_reference(guard_ref), do: Process.demonitor(guard_ref, [:flush])
     %{state | poll_task: nil}
   end
 
