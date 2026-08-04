@@ -341,7 +341,10 @@ defmodule SymphonyElixir.RunLedger do
 
       queued_resumes = Enum.reduce(events, %{}, &update_queued_resume_state/2)
 
-      recovered_dispatches = Enum.reduce(events, %{}, &update_recovered_dispatch_state/2)
+      recovered_dispatches =
+        events
+        |> Enum.reduce(%{}, &update_recovered_dispatch_state/2)
+        |> restore_recovered_dispatch_affinity(events)
 
       dispatch_paused = Enum.reduce(events, false, &update_dispatch_pause_state/2)
 
@@ -542,6 +545,30 @@ defmodule SymphonyElixir.RunLedger do
       stage: "retry_queued"
     }
   end
+
+  defp restore_recovered_dispatch_affinity(dispatches, events) do
+    affinities = Enum.reduce(events, %{}, &update_recovered_run_affinity/2)
+
+    Map.new(dispatches, fn {issue_id, dispatch} ->
+      affinity = Map.get(affinities, dispatch.previous_run_id, %{})
+
+      {issue_id,
+       dispatch
+       |> Map.put(:worker_host, Map.get(affinity, :worker_host, dispatch.worker_host))
+       |> Map.put(:workspace_path, Map.get(affinity, :workspace_path, dispatch.workspace_path))
+       |> Map.put(:workspace_root, Map.get(affinity, :workspace_root, dispatch.workspace_root))}
+    end)
+  end
+
+  defp update_recovered_run_affinity(%{"run_id" => run_id} = event, affinities)
+       when is_binary(run_id) do
+    Map.update(affinities, run_id, run_identity(event), fn affinity ->
+      {:ok, merged} = merge_run_affinity(affinity, event)
+      merged
+    end)
+  end
+
+  defp update_recovered_run_affinity(_event, affinities), do: affinities
 
   defp update_dispatch_pause_state(%{"transition" => "dispatch_paused"}, _paused),
     do: true
@@ -816,6 +843,12 @@ defmodule SymphonyElixir.RunLedger do
     end
   end
 
+  defp validate_next_action(%{"transition" => "retry_scheduled"} = event) do
+    if is_nil(event["next_action"]) or event["next_action"] in ["continuation", "retry"],
+      do: :ok,
+      else: {:error, {:invalid_field, "next_action"}}
+  end
+
   defp validate_next_action(event) do
     if is_nil(event["next_action"]), do: :ok, else: {:error, {:invalid_field, "next_action"}}
   end
@@ -920,7 +953,19 @@ defmodule SymphonyElixir.RunLedger do
 
       true ->
         with :ok <- validate_claimed_dispatch(event, state.dispatches) do
-          run = run_identity(event) |> Map.put(:phase, :claimed) |> Map.put(:terminal, nil)
+          run =
+            event
+            |> run_identity()
+            |> Map.merge(%{
+              phase: :claimed,
+              terminal: nil,
+              terminal_reason: nil,
+              dispatch_intent: nil,
+              retry_event: nil,
+              cleanup_intent: false,
+              cleanup_requested: nil,
+              cleanup_completed: nil
+            })
 
           {:ok,
            %{
@@ -968,14 +1013,15 @@ defmodule SymphonyElixir.RunLedger do
     with {:ok, run} <- fetch_run(state, event),
          :ok <- require_phase(run, terminal_predecessors(transition)),
          {:ok, run} <- merge_run_affinity(run, event) do
-      next_state = put_run(state, event["run_id"], %{run | phase: :terminal, terminal: transition})
+      run = terminalize_run(run, transition, event)
+      next_state = put_run(state, event["run_id"], run)
 
       cond do
         event["next_action"] in ["continuation", "retry"] ->
-          {:ok, put_dispatch(next_state, event, event["next_attempt"])}
+          {:ok, put_dispatch(next_state, run, event["next_attempt"], "retry_queued")}
 
         transition == "run_interrupted" and event["terminal_reason"] == "runner_restarted" ->
-          {:ok, put_dispatch(next_state, event, event["attempt"] + 1)}
+          {:ok, put_dispatch(next_state, run, event["attempt"] + 1, "recovery_queued")}
 
         true ->
           {:ok, next_state}
@@ -987,8 +1033,11 @@ defmodule SymphonyElixir.RunLedger do
     with {:ok, run} <- fetch_run(state, event),
          :ok <- require_terminal(run),
          :ok <- reject_parked_retry(run),
-         :ok <- require_increasing_attempt(event["attempt"], event["next_attempt"]) do
-      {:ok, put_dispatch(state, event, event["next_attempt"])}
+         :ok <- require_increasing_attempt(event["attempt"], event["next_attempt"]),
+         :ok <- validate_retry_intent(run, event),
+         :ok <- validate_retry_affinity(run, event),
+         {:ok, run} <- record_retry_event(run, event) do
+      {:ok, put_run(state, event["run_id"], run)}
     end
   end
 
@@ -998,7 +1047,9 @@ defmodule SymphonyElixir.RunLedger do
        ) do
     with {:ok, run} <- fetch_run(state, event),
          :ok <- require_terminal(run),
-         {:ok, run} <- merge_run_affinity(run, event) do
+         :ok <- require_cleanup_intent(run),
+         {:ok, run} <- merge_run_affinity(run, event),
+         {:ok, run} <- record_cleanup_request(run, event) do
       {:ok, put_run(state, event["run_id"], run)}
     end
   end
@@ -1009,7 +1060,9 @@ defmodule SymphonyElixir.RunLedger do
        ) do
     with {:ok, run} <- fetch_run(state, event),
          :ok <- require_terminal(run),
-         {:ok, run} <- merge_run_affinity(run, event) do
+         :ok <- require_cleanup_request(run),
+         {:ok, run} <- merge_run_affinity(run, event),
+         {:ok, run} <- record_cleanup_completed(run, event) do
       {:ok, put_run(state, event["run_id"], run)}
     end
   end
@@ -1027,7 +1080,10 @@ defmodule SymphonyElixir.RunLedger do
            |> put_dispatch(event, event["attempt"])}
 
         "wait_released" ->
-          {:ok, Map.update!(state, :waits, &Map.delete(&1, event["issue_id"]))}
+          {:ok,
+           state
+           |> Map.update!(:waits, &Map.delete(&1, event["issue_id"]))
+           |> maybe_record_wait_cleanup_intent(wait, event)}
 
         "wait_rejected" ->
           {:ok, state}
@@ -1055,6 +1111,7 @@ defmodule SymphonyElixir.RunLedger do
 
   defp run_identity(event) do
     %{
+      run_id: event["run_id"],
       issue_id: event["issue_id"],
       issue_identifier: event["issue_identifier"],
       attempt: event["attempt"],
@@ -1116,6 +1173,129 @@ defmodule SymphonyElixir.RunLedger do
 
   defp require_increasing_attempt(attempt, next_attempt) when next_attempt > attempt, do: :ok
   defp require_increasing_attempt(_attempt, _next_attempt), do: {:error, :retry_attempt_not_increasing}
+
+  defp terminalize_run(run, transition, event) do
+    dispatch_intent =
+      cond do
+        event["next_action"] in ["continuation", "retry"] ->
+          %{action: event["next_action"], attempt: event["next_attempt"]}
+
+        transition == "run_interrupted" and event["terminal_reason"] == "runner_restarted" ->
+          %{action: "retry", attempt: event["attempt"] + 1}
+
+        true ->
+          nil
+      end
+
+    %{
+      run
+      | phase: :terminal,
+        terminal: transition,
+        terminal_reason: event["terminal_reason"],
+        dispatch_intent: dispatch_intent,
+        cleanup_intent: transition == "run_stopped" and event["terminal_reason"] == "tracker_terminal"
+    }
+  end
+
+  defp validate_retry_intent(%{dispatch_intent: %{action: action, attempt: attempt}}, event) do
+    action_matches? = is_nil(event["next_action"]) or event["next_action"] == action
+
+    if action_matches? and event["next_attempt"] == attempt,
+      do: :ok,
+      else: {:error, :retry_terminal_intent_mismatch}
+  end
+
+  defp validate_retry_intent(_run, _event), do: {:error, :missing_terminal_retry_intent}
+
+  defp validate_retry_affinity(run, event) do
+    fields = [:worker_host, :workspace_path, :workspace_root]
+
+    if Enum.all?(fields, fn field ->
+         incoming = event[Atom.to_string(field)]
+         current = Map.fetch!(run, field)
+         is_nil(incoming) or incoming == current
+       end) do
+      :ok
+    else
+      {:error, :retry_affinity_mismatch}
+    end
+  end
+
+  defp record_retry_event(%{retry_event: nil} = run, event) do
+    {:ok, %{run | retry_event: retry_event_identity(event)}}
+  end
+
+  defp record_retry_event(%{retry_event: retry_event} = run, event) do
+    if retry_event == retry_event_identity(event),
+      do: {:ok, run},
+      else: {:error, :non_idempotent_retry_duplicate}
+  end
+
+  defp retry_event_identity(event) do
+    Map.take(event, [
+      "run_id",
+      "issue_id",
+      "issue_identifier",
+      "attempt",
+      "next_action",
+      "next_attempt",
+      "worker_host",
+      "workspace_path",
+      "workspace_root"
+    ])
+  end
+
+  defp require_cleanup_intent(%{cleanup_intent: true}), do: :ok
+  defp require_cleanup_intent(_run), do: {:error, :missing_cleanup_intent}
+
+  defp require_cleanup_request(%{cleanup_requested: cleanup_requested})
+       when is_map(cleanup_requested),
+       do: :ok
+
+  defp require_cleanup_request(%{cleanup_intent: true}), do: :ok
+
+  defp require_cleanup_request(_run), do: {:error, :missing_cleanup_request}
+
+  defp record_cleanup_request(%{cleanup_requested: nil} = run, event) do
+    {:ok, %{run | cleanup_requested: cleanup_event_identity(event)}}
+  end
+
+  defp record_cleanup_request(%{cleanup_requested: request} = run, event) do
+    if request == cleanup_event_identity(event),
+      do: {:ok, run},
+      else: {:error, :non_idempotent_cleanup_request}
+  end
+
+  defp record_cleanup_completed(%{cleanup_completed: nil} = run, event) do
+    {:ok, %{run | cleanup_completed: cleanup_event_identity(event)}}
+  end
+
+  defp record_cleanup_completed(%{cleanup_completed: completed} = run, event) do
+    if completed == cleanup_event_identity(event),
+      do: {:ok, run},
+      else: {:error, :non_idempotent_cleanup_completion}
+  end
+
+  defp cleanup_event_identity(event) do
+    Map.take(event, [
+      "run_id",
+      "issue_id",
+      "issue_identifier",
+      "attempt",
+      "terminal_reason",
+      "worker_host",
+      "workspace_path",
+      "workspace_root"
+    ])
+  end
+
+  defp maybe_record_wait_cleanup_intent(state, wait, %{"release_reason" => "tracker_terminal"}) do
+    Map.update!(state, :runs, fn runs ->
+      Map.update!(runs, wait.run_id, &%{&1 | cleanup_intent: true})
+    end)
+  end
+
+  defp maybe_record_wait_cleanup_intent(state, _wait, _event), do: state
 
   defp ensure_wait_available(waits, event) do
     if Map.has_key?(waits, event["issue_id"]), do: {:error, :issue_already_parked}, else: :ok
@@ -1188,6 +1368,20 @@ defmodule SymphonyElixir.RunLedger do
     }
 
     %{state | dispatches: Map.put(state.dispatches, event["issue_id"], dispatch)}
+  end
+
+  defp put_dispatch(state, run, attempt, stage) do
+    dispatch = %{
+      attempt: attempt,
+      issue_identifier: run.issue_identifier,
+      worker_host: run.worker_host,
+      workspace_path: run.workspace_path,
+      workspace_root: run.workspace_root,
+      previous_run_id: run.run_id,
+      stage: stage
+    }
+
+    %{state | dispatches: Map.put(state.dispatches, run.issue_id, dispatch)}
   end
 
   defp put_run(state, run_id, run), do: %{state | runs: Map.put(state.runs, run_id, run)}

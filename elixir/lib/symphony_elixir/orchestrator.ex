@@ -1372,6 +1372,7 @@ defmodule SymphonyElixir.Orchestrator do
       issue_id: issue_id,
       issue_identifier: identifier,
       attempt: previous_attempt,
+      next_action: metadata[:next_action] || Map.get(previous_retry, :next_action),
       next_attempt: next_attempt,
       worker_host: worker_host,
       workspace_path: workspace_path,
@@ -1387,6 +1388,7 @@ defmodule SymphonyElixir.Orchestrator do
       error: error,
       previous_run_id: previous_run_id,
       previous_attempt: previous_attempt,
+      next_action: event.next_action,
       worker_host: worker_host,
       workspace_path: workspace_path,
       workspace_root: workspace_root,
@@ -1461,6 +1463,7 @@ defmodule SymphonyElixir.Orchestrator do
           error: retry.error,
           previous_run_id: retry.previous_run_id,
           previous_attempt: retry.previous_attempt,
+          next_action: retry.next_action,
           worker_host: retry.worker_host,
           workspace_path: retry.workspace_path,
           workspace_root: retry.workspace_root
@@ -1483,6 +1486,7 @@ defmodule SymphonyElixir.Orchestrator do
           error: Map.get(retry_entry, :error),
           previous_run_id: Map.get(retry_entry, :previous_run_id),
           previous_attempt: Map.get(retry_entry, :previous_attempt),
+          next_action: Map.get(retry_entry, :next_action),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path),
           workspace_root: Map.get(retry_entry, :workspace_root)
@@ -1563,7 +1567,7 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> schedule_issue_retry(
             issue_id,
-            attempt + 1,
+            attempt,
             Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
           )
           |> retry_schedule_state()
@@ -1627,7 +1631,7 @@ defmodule SymphonyElixir.Orchestrator do
         state
         |> schedule_issue_retry(
           issue.id,
-          attempt + 1,
+          attempt,
           Map.merge(metadata, %{
             identifier: issue.identifier,
             error: "no available orchestrator slots"
@@ -2596,12 +2600,12 @@ defmodule SymphonyElixir.Orchestrator do
       {:continuation, attempt, metadata} ->
         state
         |> complete_issue(issue_id)
-        |> schedule_issue_retry(issue_id, attempt, metadata)
+        |> schedule_issue_retry(issue_id, attempt, Map.put(metadata, :next_action, "continuation"))
         |> retry_schedule_state()
 
       {:retry, attempt, metadata} ->
         state
-        |> schedule_issue_retry(issue_id, attempt, metadata)
+        |> schedule_issue_retry(issue_id, attempt, Map.put(metadata, :next_action, "retry"))
         |> retry_schedule_state()
 
       {:stop, cleanup_workspace, retry} ->
@@ -2614,7 +2618,7 @@ defmodule SymphonyElixir.Orchestrator do
          metadata: metadata
        }) do
     state
-    |> schedule_issue_retry(issue_id, attempt, metadata)
+    |> schedule_issue_retry(issue_id, attempt, Map.put(metadata, :next_action, "retry"))
     |> retry_schedule_state()
   end
 

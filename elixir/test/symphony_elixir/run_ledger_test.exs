@@ -525,6 +525,135 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert next_recovery.recovered_attempts[issue_id] == 4
   end
 
+  test "retry scheduling is bound to exact terminal intent and immutable affinity" do
+    path = ledger_path()
+    run_id = "run-bound-retry"
+    issue_id = "issue-bound-retry"
+    identifier = "DUD-BOUND-RETRY"
+
+    assert :ok =
+             append_claim!(path, run_id, issue_id, identifier, 3,
+               worker_host: "worker-a",
+               workspace_path: "/srv/a/DUD-BOUND-RETRY",
+               workspace_root: "/srv/a"
+             )
+
+    assert :ok = append_started!(path, run_id, issue_id, identifier, 3)
+    assert :ok = append_retry_terminal!(path, run_id, issue_id, identifier, 3, 4)
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "retry_scheduled",
+               stage: "retry_queued",
+               run_id: run_id,
+               issue_id: issue_id,
+               issue_identifier: identifier,
+               attempt: 3,
+               next_action: "retry",
+               next_attempt: 9,
+               worker_host: "worker-b",
+               workspace_path: "/srv/b/DUD-BOUND-RETRY",
+               workspace_root: "/srv/b"
+             })
+
+    assert {:error, {:invalid_ledger_record, 4, {:invalid_transition_sequence, "retry_scheduled", :retry_terminal_intent_mismatch}}} = RunLedger.read_events(path)
+
+    [claim, started, terminal, forged] = valid_records(path)
+    rewrite_records!(path, [claim, started, terminal, %{forged | "next_attempt" => 4}])
+
+    assert {:error, {:invalid_ledger_record, 4, {:invalid_transition_sequence, "retry_scheduled", :retry_affinity_mismatch}}} =
+             RunLedger.read_events(path)
+  end
+
+  test "legacy retry affinity omission preserves established run affinity" do
+    path = ledger_path()
+    run_id = "run-legacy-affinity"
+    issue_id = "issue-legacy-affinity"
+    identifier = "DUD-LEGACY-AFFINITY"
+
+    assert :ok =
+             append_claim!(path, run_id, issue_id, identifier, 2,
+               worker_host: "worker-a",
+               workspace_path: "/srv/a/DUD-LEGACY-AFFINITY",
+               workspace_root: "/srv/a"
+             )
+
+    assert :ok = append_started!(path, run_id, issue_id, identifier, 2)
+    assert :ok = append_retry_terminal!(path, run_id, issue_id, identifier, 2, 3)
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "retry_scheduled",
+               stage: "retry_queued",
+               run_id: run_id,
+               issue_id: issue_id,
+               issue_identifier: identifier,
+               attempt: 2,
+               next_attempt: 3
+             })
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-legacy-affinity")
+
+    assert recovery.recovered_dispatches[issue_id] == %{
+             attempt: 3,
+             previous_run_id: run_id,
+             identifier: identifier,
+             worker_host: "worker-a",
+             workspace_path: "/srv/a/DUD-LEGACY-AFFINITY",
+             workspace_root: "/srv/a",
+             stage: "retry_queued"
+           }
+  end
+
+  test "retry scheduling permits only an exact semantic duplicate" do
+    path = ledger_path()
+    run_id = "run-idempotent-retry"
+    issue_id = "issue-idempotent-retry"
+    identifier = "DUD-IDEMPOTENT-RETRY"
+
+    assert :ok = append_claim!(path, run_id, issue_id, identifier, 1)
+    assert :ok = append_started!(path, run_id, issue_id, identifier, 1)
+    assert :ok = append_retry_terminal!(path, run_id, issue_id, identifier, 1, 2)
+
+    event = %{
+      transition: "retry_scheduled",
+      stage: "retry_queued",
+      run_id: run_id,
+      issue_id: issue_id,
+      issue_identifier: identifier,
+      attempt: 1,
+      next_action: "retry",
+      next_attempt: 2
+    }
+
+    assert :ok = RunLedger.append(path, event)
+    assert :ok = RunLedger.append(path, event)
+    assert {:ok, _events} = RunLedger.read_events(path)
+
+    assert :ok = RunLedger.append(path, %{event | next_action: "continuation"})
+
+    assert {:error, {:invalid_ledger_record, 6, {:invalid_transition_sequence, "retry_scheduled", :retry_terminal_intent_mismatch}}} = RunLedger.read_events(path)
+  end
+
+  test "workspace cleanup records require durable terminal cleanup intent" do
+    path = ledger_path()
+    append_complete_run!(path, "run-no-cleanup", "issue-no-cleanup")
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "workspace_cleanup_completed",
+               stage: "cleanup",
+               run_id: "run-no-cleanup",
+               issue_id: "issue-no-cleanup",
+               issue_identifier: "DUD-SEMANTIC-TAIL",
+               attempt: 1,
+               workspace_path: "/srv/a/DUD-SEMANTIC-TAIL",
+               workspace_root: "/srv/a"
+             })
+
+    assert {:error, {:invalid_ledger_record, 4, {:invalid_transition_sequence, "workspace_cleanup_completed", :missing_cleanup_request}}} = RunLedger.read_events(path)
+  end
+
   test "startup reconciliation restores global pause and operator command cursors" do
     path = ledger_path()
 
@@ -709,6 +838,20 @@ defmodule SymphonyElixir.RunLedgerTest do
              })
   end
 
+  defp append_retry_terminal!(path, run_id, issue_id, issue_identifier, attempt, next_attempt) do
+    RunLedger.append(path, %{
+      transition: "run_failed",
+      stage: "released",
+      run_id: run_id,
+      issue_id: issue_id,
+      issue_identifier: issue_identifier,
+      attempt: attempt,
+      terminal_reason: "worker_exit",
+      next_action: "retry",
+      next_attempt: next_attempt
+    })
+  end
+
   defp append_parked_run!(path, run_id, issue_id) do
     assert :ok =
              append_claim!(path, run_id, issue_id, "DUD-SEMANTIC-MIDDLE", 1)
@@ -739,7 +882,8 @@ defmodule SymphonyElixir.RunLedgerTest do
       issue_identifier: issue_identifier,
       attempt: attempt,
       worker_host: Keyword.get(opts, :worker_host),
-      workspace_path: Keyword.get(opts, :workspace_path)
+      workspace_path: Keyword.get(opts, :workspace_path),
+      workspace_root: Keyword.get(opts, :workspace_root)
     })
   end
 
