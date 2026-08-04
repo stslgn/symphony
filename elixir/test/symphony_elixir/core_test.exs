@@ -747,8 +747,8 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    assert {:noreply, paused_state} =
-             Orchestrator.handle_info(:run_poll_cycle, %{base_state | dispatch_paused: true})
+    paused_state =
+      Orchestrator.run_poll_cycle_for_test(%{base_state | dispatch_paused: true})
 
     assert paused_state.queued_resumes == queued_resumes
 
@@ -796,8 +796,7 @@ defmodule SymphonyElixir.CoreTest do
         claimed: MapSet.new([dummy_issue.id])
     }
 
-    assert {:noreply, capacity_blocked_state} =
-             Orchestrator.handle_info(:run_poll_cycle, capacity_state)
+    capacity_blocked_state = Orchestrator.run_poll_cycle_for_test(capacity_state)
 
     assert capacity_blocked_state.queued_resumes == queued_resumes
 
@@ -809,8 +808,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_api_token: nil
     )
 
-    assert {:noreply, tracker_blocked_state} =
-             Orchestrator.handle_info(:run_poll_cycle, base_state)
+    tracker_blocked_state = Orchestrator.run_poll_cycle_for_test(base_state)
 
     assert tracker_blocked_state.queued_resumes == queued_resumes
 
@@ -825,8 +823,7 @@ defmodule SymphonyElixir.CoreTest do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [resumed_issue])
 
-    assert {:noreply, affinity_blocked_state} =
-             Orchestrator.handle_info(:run_poll_cycle, base_state)
+    affinity_blocked_state = Orchestrator.run_poll_cycle_for_test(base_state)
 
     assert affinity_blocked_state.queued_resumes == queued_resumes
     assert affinity_blocked_state.running == %{}
@@ -2161,7 +2158,7 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    assert {:noreply, reconciled_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    reconciled_state = Orchestrator.run_poll_cycle_for_test(state)
     assert reconciled_state.parked[issue_id].wait_id == wait.wait_id
     assert reconciled_state.operator_comment_cursors == %{}
 
@@ -2219,12 +2216,11 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    assert {:noreply, resumed_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    resumed_state = Orchestrator.run_poll_cycle_for_test(state)
     refute Map.has_key?(resumed_state.parked, issue_id)
     assert MapSet.member?(resumed_state.processed_operator_comment_ids, comment.id)
 
-    assert {:noreply, repeated_state} =
-             Orchestrator.handle_info(:run_poll_cycle, resumed_state)
+    repeated_state = Orchestrator.run_poll_cycle_for_test(resumed_state)
 
     if is_reference(repeated_state.tick_timer_ref),
       do: Process.cancel_timer(repeated_state.tick_timer_ref)
@@ -2279,7 +2275,7 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    assert {:noreply, reconciled_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    reconciled_state = Orchestrator.run_poll_cycle_for_test(state)
     assert reconciled_state.parked[issue_id].wait_id == wait.wait_id
 
     assert %{created_at: cursor_at, comment_ids: comment_ids} =
@@ -2368,7 +2364,7 @@ defmodule SymphonyElixir.CoreTest do
 
     seed_running_ledger!(ledger_path, running_entry)
 
-    assert {:noreply, stopped_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    stopped_state = Orchestrator.run_poll_cycle_for_test(state)
     refute Map.has_key?(stopped_state.running, issue_id)
 
     assert Map.has_key?(stopped_state.parked, issue_id),

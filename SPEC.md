@@ -840,6 +840,15 @@ then repeats every `polling.interval_ms`.
 
 The effective poll interval SHOULD be updated when workflow config changes are re-applied.
 
+Tracker reads for a poll (running/parked state, operator comments, candidate fetch, and dispatch
+revalidation) MUST execute in a supervised, monitored task rather than in the orchestrator
+GenServer. At most one poll task may be in flight. The GenServer MUST remain responsive to status,
+budget timers, worker lifecycle messages, and operator controls while tracker I/O is blocked.
+Wake-ups received during an in-flight poll set one dirty latch; completion schedules exactly one
+follow-up poll. Poll results are accepted only for the current task reference and generation. Task
+crash or timeout schedules a bounded retry backoff, and stale/late results cannot overwrite live
+state.
+
 Tick sequence:
 
 1. Reconcile running and parked issues.
@@ -1784,6 +1793,8 @@ Minimum endpoints:
 - `POST /api/v1/refresh`
   - Queues an immediate tracker poll + reconciliation cycle (best-effort trigger; implementations
     MAY coalesce repeated requests).
+  - Uses an explicit bounded orchestrator-call timeout. Timeout, exit, or unavailable orchestrator
+    returns a bounded `503` response and MUST NOT crash the HTTP caller.
   - Suggested request body: empty body or `{}`.
   - Suggested response (`202 Accepted`) shape:
 
@@ -1804,6 +1815,8 @@ Minimum endpoints:
     `webhookTimestamp` within 60 seconds of local time.
   - A verified `Issue` or `Comment`-create delivery queues or coalesces the same poll/reconcile
     cycle as `/refresh` and responds `200 OK` without echoing the request body.
+  - If the bounded wake-up call times out or exits, responds `503` without crashing the webhook
+    process. Authentication and payload handling remain fail-closed.
   - Other verified delivery types/actions are acknowledged with `200 OK` and ignored.
   - Missing configuration returns `503`; missing, malformed, stale, or invalid authentication fails
     closed and MUST NOT wake the orchestrator.

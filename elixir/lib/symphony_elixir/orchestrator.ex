@@ -26,6 +26,10 @@ defmodule SymphonyElixir.Orchestrator do
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @max_cumulative_token_count 9_223_372_036_854_775_807
+  @poll_task_timeout_ms 30_000
+  @poll_failure_backoff_base_ms 250
+  @poll_failure_backoff_max_ms 5_000
+  @refresh_call_timeout_ms 500
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -45,12 +49,18 @@ defmodule SymphonyElixir.Orchestrator do
       :max_concurrent_agents,
       :next_poll_due_at_ms,
       :poll_check_in_progress,
+      :poll_task,
+      :poll_task_timeout_ms,
+      :poll_work_fn,
       :tick_timer_ref,
       :tick_token,
       :run_ledger_path,
       :run_ledger_append_fn,
       :task_start_fn,
       :runner_generation,
+      poll_generation: 0,
+      poll_dirty: false,
+      poll_failure_count: 0,
       dispatch_paused: false,
       running: %{},
       parked: %{},
@@ -92,6 +102,9 @@ defmodule SymphonyElixir.Orchestrator do
             max_concurrent_agents: config.agent.max_concurrent_agents,
             next_poll_due_at_ms: now_ms,
             poll_check_in_progress: false,
+            poll_task: nil,
+            poll_task_timeout_ms: Keyword.get(opts, :poll_task_timeout_ms, @poll_task_timeout_ms),
+            poll_work_fn: Keyword.get(opts, :poll_work_fn),
             tick_timer_ref: nil,
             tick_token: nil,
             run_ledger_path: run_ledger_path,
@@ -126,45 +139,94 @@ defmodule SymphonyElixir.Orchestrator do
   @impl true
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
       when is_reference(tick_token) do
-    state = refresh_runtime_config(state)
-
     state = %{
       state
-      | poll_check_in_progress: true,
-        next_poll_due_at_ms: nil,
+      | next_poll_due_at_ms: nil,
         tick_timer_ref: nil,
         tick_token: nil
     }
 
-    notify_dashboard()
-    :ok = schedule_poll_cycle_start()
-    {:noreply, state}
+    {:noreply, queue_poll_cycle(state)}
   end
 
   def handle_info({:tick, _tick_token}, state), do: {:noreply, state}
 
   def handle_info(:tick, state) do
-    state = refresh_runtime_config(state)
-
     state = %{
       state
-      | poll_check_in_progress: true,
-        next_poll_due_at_ms: nil,
+      | next_poll_due_at_ms: nil,
         tick_timer_ref: nil,
         tick_token: nil
     }
 
-    notify_dashboard()
-    :ok = schedule_poll_cycle_start()
-    {:noreply, state}
+    {:noreply, queue_poll_cycle(state)}
+  end
+
+  def handle_info(:run_poll_cycle, %{poll_task: %{} = _poll_task} = state) do
+    {:noreply, %{state | poll_dirty: true}}
   end
 
   def handle_info(:run_poll_cycle, state) do
-    state = refresh_runtime_config(state)
-    state = maybe_dispatch(state)
-    state = schedule_tick(state, state.poll_interval_ms)
-    state = %{state | poll_check_in_progress: false}
+    state = start_poll_task(state)
+    notify_dashboard()
+    {:noreply, state}
+  end
 
+  def handle_info(
+        {ref, {generation, result}},
+        %{poll_task: %{ref: ref, generation: generation}} = state
+      )
+      when is_reference(ref) and is_integer(generation) do
+    Process.demonitor(ref, [:flush])
+    state = clear_poll_task(state)
+
+    state =
+      case result do
+        %{} = poll_result ->
+          state
+          |> apply_poll_result(poll_result)
+          |> finish_poll_cycle(:ok)
+
+        invalid_result ->
+          Logger.warning("Tracker poll task returned an invalid result: #{inspect(invalid_result)}")
+          finish_poll_cycle(state, {:error, :invalid_poll_result})
+      end
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({ref, {_generation, _result}}, state) when is_reference(ref),
+    do: {:noreply, state}
+
+  def handle_info(
+        {:poll_task_timeout, generation, ref, timeout_token},
+        %{
+          poll_task: %{
+            generation: generation,
+            ref: ref,
+            timeout_token: timeout_token,
+            pid: pid
+          }
+        } = state
+      ) do
+    _ = Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, pid)
+    Process.demonitor(ref, [:flush])
+    Logger.warning("Tracker poll task timed out generation=#{generation}")
+    state = state |> clear_poll_task() |> finish_poll_cycle({:error, :timeout})
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:poll_task_timeout, _generation, _ref, _timeout_token}, state),
+    do: {:noreply, state}
+
+  def handle_info(
+        {:DOWN, ref, :process, _pid, reason},
+        %{poll_task: %{ref: ref, generation: generation}} = state
+      ) do
+    Logger.warning("Tracker poll task crashed generation=#{generation} reason=#{inspect(reason)}")
+    state = state |> clear_poll_task() |> finish_poll_cycle({:error, {:task_exit, reason}})
     notify_dashboard()
     {:noreply, state}
   end
@@ -281,7 +343,7 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, defer_retry_while_paused(state, issue_id, retry_token)}
       else
         case due_retry_attempt_state(state, issue_id, retry_token) do
-          {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
+          {:ok, _attempt, _metadata, state} -> {:noreply, queue_poll_cycle(state)}
           :missing -> {:noreply, state}
         end
       end
@@ -297,77 +359,95 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
-  defp maybe_dispatch(%State{} = state) do
+  defp queue_poll_cycle(%State{poll_task: %{} = _poll_task} = state) do
+    %{refresh_runtime_config(state) | poll_dirty: true, poll_check_in_progress: true}
+  end
+
+  defp queue_poll_cycle(%State{poll_check_in_progress: true} = state),
+    do: refresh_runtime_config(state)
+
+  defp queue_poll_cycle(%State{} = state) do
     state =
       state
-      |> reconcile_running_issues()
-      |> reconcile_parked_issues()
-      |> process_operator_comments()
+      |> refresh_runtime_config()
+      |> Map.put(:poll_check_in_progress, true)
+      |> Map.put(:next_poll_due_at_ms, nil)
 
-    with false <- state.dispatch_paused,
-         :ok <- Config.validate!(),
-         :ok <- Config.validate_runtime_capabilities(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
-    else
-      {:error, :missing_linear_api_token} ->
-        Logger.error("Linear API token missing in WORKFLOW.md")
+    notify_dashboard()
+    :ok = schedule_poll_cycle_start()
+    state
+  end
+
+  defp start_poll_task(%State{} = state) do
+    state =
+      state
+      |> refresh_runtime_config()
+      |> prepare_poll_state()
+      |> Map.put(:poll_check_in_progress, true)
+      |> Map.put(:next_poll_due_at_ms, nil)
+
+    generation = state.poll_generation + 1
+    request = poll_request(state)
+    work_fn = state.poll_work_fn || (&collect_tracker_poll/1)
+
+    try do
+      task =
+        Task.Supervisor.async_nolink(SymphonyElixir.TaskSupervisor, fn ->
+          {generation, work_fn.(request)}
+        end)
+
+      timeout_token = make_ref()
+
+      timeout_ref =
+        Process.send_after(
+          self(),
+          {:poll_task_timeout, generation, task.ref, timeout_token},
+          poll_task_timeout_ms(state)
+        )
+
+      %{
         state
-
-      {:error, :missing_linear_project_slug} ->
-        Logger.error("Linear project slug missing in WORKFLOW.md")
-        state
-
-      {:error, :missing_tracker_kind} ->
-        Logger.error("Tracker kind missing in WORKFLOW.md")
-
-        state
-
-      {:error, {:unsupported_tracker_kind, kind}} ->
-        Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
-
-        state
-
-      {:error, {:invalid_workflow_config, message}} ->
-        Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
-
-      {:error, {:missing_required_dynamic_tools, tools}} ->
-        Logger.error("Runtime capability preflight blocked dispatch: missing_required_dynamic_tools=#{Enum.join(tools, ",")}")
-        state
-
-      {:error, {:missing_workflow_file, path, reason}} ->
-        Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
-
-      {:error, :workflow_front_matter_not_a_map} ->
-        Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
-
-      {:error, {:workflow_parse_error, reason}} ->
-        Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
-
-      {:error, reason} ->
-        Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
-
-      false ->
-        state
-
-      true ->
-        state
+        | poll_generation: generation,
+          poll_task: %{
+            pid: task.pid,
+            ref: task.ref,
+            generation: generation,
+            timeout_ref: timeout_ref,
+            timeout_token: timeout_token
+          }
+      }
+    catch
+      :exit, reason ->
+        Logger.warning("Unable to start supervised tracker poll task: #{inspect(reason)}")
+        finish_poll_cycle(state, {:error, {:task_start_failed, reason}})
     end
   end
 
-  defp reconcile_running_issues(%State{} = state) do
-    state =
-      state
-      |> retry_pending_terminal_transitions()
-      |> retry_pending_durable_retries()
-      |> retry_pending_workspace_cleanups()
-      |> reconcile_stalled_running_issues()
+  defp prepare_poll_state(%State{} = state) do
+    state
+    |> retry_pending_terminal_transitions()
+    |> retry_pending_durable_retries()
+    |> retry_pending_workspace_cleanups()
+    |> reconcile_stalled_running_issues()
+    |> ensure_operator_cursors_for_poll()
+  end
+
+  defp ensure_operator_cursors_for_poll(%State{} = state) do
+    case operator_user_ids() do
+      [] ->
+        state
+
+      _operator_user_ids ->
+        state
+        |> operator_command_issue_ids()
+        |> Enum.reduce(state, fn issue_id, state_acc ->
+          ensure_operator_cursor(state_acc, issue_id)
+        end)
+    end
+  end
+
+  defp poll_request(%State{} = state) do
+    operator_user_ids = operator_user_ids()
 
     running_ids =
       state.running
@@ -376,42 +456,226 @@ defmodule SymphonyElixir.Orchestrator do
       end)
       |> Enum.map(&elem(&1, 0))
 
-    if running_ids == [] do
-      state
+    retry_issue_ids =
+      state.retry_attempts
+      |> Enum.flat_map(fn
+        {issue_id, %{status: :dispatching}} -> [issue_id]
+        _retry -> []
+      end)
+
+    %{
+      running_ids: running_ids,
+      parked_ids: Map.keys(state.parked),
+      retry_issue_ids: retry_issue_ids,
+      comment_requests: operator_comment_requests(state, operator_user_ids),
+      operator_user_ids: operator_user_ids,
+      dispatch_paused: state.dispatch_paused
+    }
+  end
+
+  defp operator_comment_requests(_state, []), do: []
+
+  defp operator_comment_requests(%State{} = state, _operator_user_ids) do
+    state
+    |> operator_command_issue_ids()
+    |> Enum.flat_map(&operator_comment_request(state, &1))
+  end
+
+  defp operator_comment_request(state, issue_id) do
+    case Map.get(state.operator_comment_cursors, issue_id) do
+      %{created_at: %DateTime{} = cursor} -> [{issue_id, cursor}]
+      _cursor -> []
+    end
+  end
+
+  defp collect_tracker_poll(request) do
+    %{
+      request: request,
+      running: fetch_issue_states(request.running_ids),
+      parked: fetch_issue_states(request.parked_ids),
+      comments: fetch_operator_comments(request.comment_requests),
+      dispatch: fetch_dispatch_candidates(request.dispatch_paused)
+    }
+  end
+
+  defp fetch_issue_states([]), do: {:ok, []}
+  defp fetch_issue_states(issue_ids), do: Tracker.fetch_issue_states_by_ids(issue_ids)
+
+  defp fetch_operator_comments(comment_requests) do
+    Map.new(comment_requests, fn {issue_id, cursor} ->
+      {issue_id, Tracker.fetch_comments_since(issue_id, cursor)}
+    end)
+  end
+
+  defp fetch_dispatch_candidates(true), do: {:skip, :paused}
+
+  defp fetch_dispatch_candidates(false) do
+    with :ok <- Config.validate!(),
+         :ok <- Config.validate_runtime_capabilities(),
+         {:ok, issues} <- Tracker.fetch_candidate_issues() do
+      revalidate_poll_candidates(issues)
+    end
+  end
+
+  defp revalidate_poll_candidates(issues) when is_list(issues) do
+    issue_ids =
+      Enum.flat_map(issues, fn
+        %Issue{id: issue_id} when is_binary(issue_id) -> [issue_id]
+        _issue -> []
+      end)
+
+    fetch_issue_states(issue_ids)
+  end
+
+  defp revalidate_poll_candidates(_issues), do: {:error, :invalid_candidate_collection}
+
+  defp apply_poll_result(%State{} = state, %{request: request} = result) when is_map(request) do
+    state
+    |> apply_running_poll_result(request.running_ids, Map.get(result, :running))
+    |> apply_parked_poll_result(Map.get(result, :parked))
+    |> apply_operator_comment_results(
+      request.operator_user_ids,
+      Map.get(result, :comments, %{})
+    )
+    |> apply_dispatch_poll_result(request, Map.get(result, :dispatch))
+  end
+
+  defp apply_poll_result(%State{} = state, _invalid_result), do: state
+
+  defp apply_running_poll_result(state, running_ids, {:ok, issues}) when is_list(issues) do
+    issues
+    |> reconcile_running_issue_states(state, active_state_set(), terminal_state_set())
+    |> reconcile_missing_running_issue_ids(running_ids, issues)
+  end
+
+  defp apply_running_poll_result(state, _running_ids, {:error, reason}) do
+    Logger.debug("Failed to refresh running issue states: #{inspect(reason)}; keeping active workers")
+    state
+  end
+
+  defp apply_running_poll_result(state, _running_ids, _invalid_result), do: state
+
+  defp apply_parked_poll_result(state, {:ok, issues}) when is_list(issues),
+    do: Enum.reduce(issues, state, &reconcile_parked_issue/2)
+
+  defp apply_parked_poll_result(state, {:error, reason}) do
+    Logger.debug("Failed to refresh parked issue states: #{inspect(reason)}; keeping operator waits")
+    state
+  end
+
+  defp apply_parked_poll_result(state, _invalid_result), do: state
+
+  defp apply_operator_comment_results(state, [], _comment_results), do: state
+
+  defp apply_operator_comment_results(state, operator_user_ids, comment_results)
+       when is_list(operator_user_ids) and is_map(comment_results) do
+    Enum.reduce(comment_results, state, fn
+      {issue_id, {:ok, comments}}, state_acc when is_list(comments) ->
+        comments
+        |> Enum.sort_by(&operator_comment_sort_key/1)
+        |> Enum.reduce(state_acc, fn comment, comment_state ->
+          process_operator_comment(comment_state, issue_id, comment, operator_user_ids)
+        end)
+
+      {issue_id, {:error, reason}}, state_acc ->
+        Logger.debug("Failed to fetch operator comments issue_id=#{issue_id}: #{inspect(reason)}")
+        state_acc
+
+      {_issue_id, _invalid_result}, state_acc ->
+        state_acc
+    end)
+  end
+
+  defp apply_operator_comment_results(state, _operator_user_ids, _comment_results), do: state
+
+  defp apply_dispatch_poll_result(state, _request, {:skip, :paused}), do: state
+
+  defp apply_dispatch_poll_result(%State{dispatch_paused: true} = state, request, _result) do
+    Enum.reduce(request.retry_issue_ids, state, fn issue_id, state_acc ->
+      defer_pending_dispatch(state_acc, issue_id, :dispatch_paused)
+    end)
+  end
+
+  defp apply_dispatch_poll_result(state, request, {:ok, issues}) when is_list(issues) do
+    state = apply_due_retry_candidates(state, request.retry_issue_ids, issues)
+
+    if available_slots(state) > 0 do
+      choose_issues(issues, state)
     else
-      case Tracker.fetch_issue_states_by_ids(running_ids) do
-        {:ok, issues} ->
-          issues
-          |> reconcile_running_issue_states(
-            state,
-            active_state_set(),
-            terminal_state_set()
-          )
-          |> reconcile_missing_running_issue_ids(running_ids, issues)
+      state
+    end
+  end
 
-        {:error, reason} ->
-          Logger.debug("Failed to refresh running issue states: #{inspect(reason)}; keeping active workers")
+  defp apply_dispatch_poll_result(state, request, {:error, reason}) do
+    log_dispatch_poll_error(reason)
 
-          state
+    Enum.reduce(request.retry_issue_ids, state, fn issue_id, state_acc ->
+      defer_pending_dispatch(state_acc, issue_id, {:retry_poll_failed, reason})
+    end)
+  end
+
+  defp apply_dispatch_poll_result(state, _request, _invalid_result), do: state
+
+  defp apply_due_retry_candidates(state, retry_issue_ids, issues) do
+    Enum.reduce(retry_issue_ids, state, fn issue_id, state_acc ->
+      case Map.get(state_acc.retry_attempts, issue_id) do
+        %{status: :dispatching, attempt: attempt} = retry_entry ->
+          metadata = retry_metadata(retry_entry)
+          issue = find_issue_by_id(issues, issue_id)
+
+          {:noreply, next_state} =
+            handle_retry_issue_lookup(issue, state_acc, issue_id, attempt, metadata)
+
+          next_state
+
+        _retry ->
+          state_acc
       end
-    end
+    end)
   end
 
-  defp reconcile_parked_issues(%State{parked: parked} = state) when map_size(parked) == 0,
-    do: state
-
-  defp reconcile_parked_issues(%State{} = state) do
-    parked_ids = Map.keys(state.parked)
-
-    case Tracker.fetch_issue_states_by_ids(parked_ids) do
-      {:ok, issues} ->
-        Enum.reduce(issues, state, &reconcile_parked_issue/2)
-
-      {:error, reason} ->
-        Logger.debug("Failed to refresh parked issue states: #{inspect(reason)}; keeping operator waits")
-        state
-    end
+  defp retry_metadata(retry_entry) do
+    %{
+      identifier: Map.get(retry_entry, :identifier),
+      error: Map.get(retry_entry, :error),
+      previous_run_id: Map.get(retry_entry, :previous_run_id),
+      previous_attempt: Map.get(retry_entry, :previous_attempt),
+      next_action: Map.get(retry_entry, :next_action),
+      worker_host: Map.get(retry_entry, :worker_host),
+      workspace_path: Map.get(retry_entry, :workspace_path),
+      workspace_root: Map.get(retry_entry, :workspace_root)
+    }
   end
+
+  defp log_dispatch_poll_error(:missing_linear_api_token),
+    do: Logger.error("Linear API token missing in WORKFLOW.md")
+
+  defp log_dispatch_poll_error(:missing_linear_project_slug),
+    do: Logger.error("Linear project slug missing in WORKFLOW.md")
+
+  defp log_dispatch_poll_error(:missing_tracker_kind),
+    do: Logger.error("Tracker kind missing in WORKFLOW.md")
+
+  defp log_dispatch_poll_error({:unsupported_tracker_kind, kind}),
+    do: Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
+
+  defp log_dispatch_poll_error({:invalid_workflow_config, message}),
+    do: Logger.error("Invalid WORKFLOW.md config: #{message}")
+
+  defp log_dispatch_poll_error({:missing_required_dynamic_tools, tools}),
+    do: Logger.error("Runtime capability preflight blocked dispatch: missing_required_dynamic_tools=#{Enum.join(tools, ",")}")
+
+  defp log_dispatch_poll_error({:missing_workflow_file, path, reason}),
+    do: Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
+
+  defp log_dispatch_poll_error(:workflow_front_matter_not_a_map),
+    do: Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
+
+  defp log_dispatch_poll_error({:workflow_parse_error, reason}),
+    do: Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
+
+  defp log_dispatch_poll_error(reason),
+    do: Logger.error("Failed to fetch from tracker: #{inspect(reason)}")
 
   defp reconcile_parked_issue(%Issue{} = issue, %State{} = state) do
     cond do
@@ -529,6 +793,22 @@ defmodule SymphonyElixir.Orchestrator do
   def due_retry_attempt_state_for_test(%State{} = state, issue_id, retry_token)
       when is_binary(issue_id) and is_reference(retry_token) do
     due_retry_attempt_state(state, issue_id, retry_token)
+  end
+
+  @doc false
+  @spec run_poll_cycle_for_test(term()) :: term()
+  def run_poll_cycle_for_test(%State{} = state) do
+    state =
+      state
+      |> refresh_runtime_config()
+      |> prepare_poll_state()
+      |> Map.put(:poll_check_in_progress, true)
+
+    request = poll_request(state)
+
+    state
+    |> apply_poll_result(collect_tracker_poll(request))
+    |> finish_poll_cycle(:ok)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -909,7 +1189,7 @@ defmodule SymphonyElixir.Orchestrator do
       if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
         dispatch = dispatch_context(state_acc, issue.id)
 
-        dispatch_issue(
+        do_dispatch_issue(
           state_acc,
           issue,
           dispatch.attempt,
@@ -1059,42 +1339,6 @@ defmodule SymphonyElixir.Orchestrator do
     |> Enum.map(&normalize_issue_state/1)
     |> Enum.filter(&(&1 != ""))
     |> MapSet.new()
-  end
-
-  defp dispatch_issue(
-         %State{} = state,
-         issue,
-         attempt,
-         preferred_worker_host,
-         expected_workspace_path,
-         expected_workspace_root,
-         affinity_required
-       ) do
-    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
-      {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(
-          state,
-          refreshed_issue,
-          attempt,
-          preferred_worker_host,
-          expected_workspace_path,
-          expected_workspace_root,
-          affinity_required
-        )
-
-      {:skip, :missing} ->
-        Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
-        state
-
-      {:skip, %Issue{} = refreshed_issue} ->
-        Logger.info("Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}")
-
-        state
-
-      {:error, reason} ->
-        Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
-        state
-    end
   end
 
   defp do_dispatch_issue(
@@ -1672,29 +1916,6 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | retry_attempts: retry_attempts}
   end
 
-  defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_candidate_issues() do
-      {:ok, issues} ->
-        issues
-        |> find_issue_by_id(issue_id)
-        |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
-
-      {:error, reason} ->
-        Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
-
-        next_state =
-          state
-          |> schedule_issue_retry(
-            issue_id,
-            attempt,
-            Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
-          )
-          |> retry_schedule_state()
-
-        {:noreply, next_state}
-    end
-  end
-
   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
     terminal_states = terminal_state_set()
 
@@ -1735,7 +1956,7 @@ defmodule SymphonyElixir.Orchestrator do
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host], affinity_required) do
       {:noreply,
-       dispatch_issue(
+       do_dispatch_issue(
          state,
          issue,
          attempt,
@@ -2174,8 +2395,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec request_refresh(GenServer.server()) :: map() | :unavailable
   def request_refresh(server) do
-    if Process.whereis(server) do
-      GenServer.call(server, :request_refresh)
+    if GenServer.whereis(server) do
+      try do
+        GenServer.call(server, :request_refresh, @refresh_call_timeout_ms)
+      catch
+        :exit, _reason -> :unavailable
+      end
     else
       :unavailable
     end
@@ -2395,8 +2620,15 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_call(:request_refresh, _from, state) do
     now_ms = System.monotonic_time(:millisecond)
     already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
+    in_flight? = is_map(state.poll_task)
     coalesced = state.poll_check_in_progress == true or already_due?
-    state = if coalesced, do: state, else: schedule_tick(state, 0)
+
+    state =
+      cond do
+        in_flight? -> %{state | poll_dirty: true}
+        coalesced -> state
+        true -> schedule_tick(state, 0)
+      end
 
     {:reply,
      %{
@@ -2579,6 +2811,44 @@ defmodule SymphonyElixir.Orchestrator do
         next_poll_due_at_ms: System.monotonic_time(:millisecond) + delay_ms
     }
   end
+
+  defp clear_poll_task(%State{poll_task: %{timeout_ref: timeout_ref}} = state) do
+    if is_reference(timeout_ref), do: Process.cancel_timer(timeout_ref)
+    %{state | poll_task: nil}
+  end
+
+  defp clear_poll_task(%State{} = state), do: %{state | poll_task: nil}
+
+  defp finish_poll_cycle(%State{} = state, :ok) do
+    delay_ms = if state.poll_dirty, do: 0, else: max(state.poll_interval_ms || 1_000, 1)
+
+    state
+    |> Map.put(:poll_check_in_progress, false)
+    |> Map.put(:poll_dirty, false)
+    |> Map.put(:poll_failure_count, 0)
+    |> schedule_tick(delay_ms)
+  end
+
+  defp finish_poll_cycle(%State{} = state, {:error, _reason}) do
+    failure_count = state.poll_failure_count + 1
+
+    state
+    |> Map.put(:poll_check_in_progress, false)
+    |> Map.put(:poll_dirty, false)
+    |> Map.put(:poll_failure_count, failure_count)
+    |> schedule_tick(poll_failure_backoff_ms(failure_count))
+  end
+
+  defp poll_failure_backoff_ms(failure_count) when is_integer(failure_count) and failure_count > 0 do
+    exponent = min(failure_count - 1, 4)
+    min(@poll_failure_backoff_base_ms * (1 <<< exponent), @poll_failure_backoff_max_ms)
+  end
+
+  defp poll_task_timeout_ms(%State{poll_task_timeout_ms: timeout_ms})
+       when is_integer(timeout_ms) and timeout_ms > 0,
+       do: timeout_ms
+
+  defp poll_task_timeout_ms(_state), do: @poll_task_timeout_ms
 
   defp schedule_poll_cycle_start do
     :timer.send_after(@poll_transition_render_delay_ms, self(), :run_poll_cycle)
@@ -2930,33 +3200,6 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp process_operator_comments(%State{} = state) do
-    process_operator_comments(state, operator_user_ids())
-  end
-
-  defp process_operator_comments(%State{} = state, []), do: state
-
-  defp process_operator_comments(%State{} = state, operator_user_ids) do
-    state
-    |> operator_command_issue_ids()
-    |> Enum.reduce(state, fn issue_id, state_acc ->
-      state_acc = ensure_operator_cursor(state_acc, issue_id)
-
-      case Map.get(state_acc.operator_comment_cursors, issue_id) do
-        %{created_at: %DateTime{} = cursor} ->
-          process_issue_operator_comments(
-            state_acc,
-            issue_id,
-            cursor,
-            operator_user_ids
-          )
-
-        _cursor ->
-          state_acc
-      end
-    end)
-  end
-
   defp operator_command_issue_ids(%State{} = state) do
     state.running
     |> Map.keys()
@@ -2980,27 +3223,6 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp initialize_operator_cursor(%State{} = state, issue_id, %DateTime{} = baseline) do
     persist_operator_cursor(state, "operator_cursor_initialized", issue_id, baseline, nil)
-  end
-
-  defp process_issue_operator_comments(
-         %State{} = state,
-         issue_id,
-         cursor,
-         operator_user_ids
-       ) do
-    case Tracker.fetch_comments_since(issue_id, cursor) do
-      {:ok, comments} ->
-        comments
-        |> Enum.sort_by(&operator_comment_sort_key/1)
-        |> Enum.reduce(state, fn comment, state_acc ->
-          process_operator_comment(state_acc, issue_id, comment, operator_user_ids)
-        end)
-
-      {:error, reason} ->
-        Logger.debug("Failed to fetch operator comments issue_id=#{issue_id}: #{inspect(reason)}")
-
-        state
-    end
   end
 
   defp operator_comment_sort_key(%{created_at: %DateTime{} = created_at, id: id}) do

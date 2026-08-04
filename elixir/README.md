@@ -255,10 +255,15 @@ server directly.
 
 The endpoint verifies the HMAC-SHA256 signature over the exact raw body, delivery UUID, event
 identity, and a 60-second timestamp window. A valid Issue or Comment-create event only queues the
-normal serialized poll/reconcile cycle. Symphony then re-fetches Linear and uses existing running,
-claimed, parked, concurrency, command-cursor, and dispatch-revalidation guards. Duplicate or
-out-of-order deliveries therefore do not directly create transitions, and fixed polling remains the
-fallback for lost webhook delivery.
+normal poll/reconcile cycle. Tracker reads run in one supervised, monitored task while the
+orchestrator remains responsive to status, budgets, worker messages, and operator controls. Wake-ups
+during that task coalesce behind one dirty latch and cause exactly one follow-up poll. Task
+references/generations reject stale results; crash and timeout recovery use bounded backoff. The
+webhook wake-up call also has a bounded timeout and returns an unavailable response without crashing
+the request process. Symphony re-fetches Linear and uses existing running, claimed, parked,
+concurrency, command-cursor, and dispatch-revalidation guards. Duplicate or out-of-order deliveries
+therefore do not directly create transitions, and fixed polling remains the fallback for lost
+webhook delivery.
 
 ### Operator commands and global pause
 

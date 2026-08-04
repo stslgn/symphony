@@ -63,6 +63,22 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
   end
 
+  defmodule BlockingRefreshOrchestrator do
+    use GenServer
+
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      GenServer.start_link(__MODULE__, :ok, name: name)
+    end
+
+    def init(:ok), do: {:ok, :ok}
+
+    def handle_call(:request_refresh, _from, state) do
+      Process.sleep(1_000)
+      {:reply, %{queued: true, requested_at: DateTime.utc_now()}, state}
+    end
+  end
+
   defmodule StaticOrchestrator do
     use GenServer
 
@@ -809,6 +825,129 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert_receive :refresh_requested
   end
 
+  test "blocked tracker poll coalesces duplicate webhooks while control paths stay responsive" do
+    webhook_secret = "synthetic-webhook-secret"
+    configure_webhook_secret(webhook_secret)
+    parent = self()
+
+    poll_work_fn = fn request ->
+      send(parent, {:blocked_poll_started, self(), request})
+
+      receive do
+        {:release_blocked_poll, result} -> result
+      end
+    end
+
+    orchestrator_name = Module.concat(__MODULE__, :AsyncPollOrchestrator)
+
+    {:ok, orchestrator_pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        poll_work_fn: poll_work_fn,
+        poll_task_timeout_ms: 2_000
+      )
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator_pid), do: Process.exit(orchestrator_pid, :normal)
+    end)
+
+    assert_receive {:blocked_poll_started, first_poll_pid, first_request}, 500
+
+    assert Enum.any?(Supervisor.which_children(SymphonyElixir.TaskSupervisor), fn
+             {_id, ^first_poll_pid, :worker, _modules} -> true
+             _child -> false
+           end)
+
+    timer_issue_id = "issue-responsive-timer"
+    completion_issue_id = "issue-responsive-completion"
+    completion_ref = make_ref()
+
+    timer_entry = responsive_running_entry(timer_issue_id, "run-responsive-timer")
+
+    completion_entry =
+      responsive_running_entry(completion_issue_id, "run-responsive-completion")
+      |> Map.put(:pid, self())
+      |> Map.put(:ref, completion_ref)
+
+    :sys.replace_state(orchestrator_pid, fn state ->
+      %{
+        state
+        | run_ledger_path: nil,
+          running: %{
+            timer_issue_id => timer_entry,
+            completion_issue_id => completion_entry
+          },
+          claimed: MapSet.new([timer_issue_id, completion_issue_id])
+      }
+    end)
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 250)
+
+    body = linear_webhook_body("Issue", System.system_time(:millisecond), "update")
+    started_ms = System.monotonic_time(:millisecond)
+
+    first_webhook = post_linear_webhook(body, webhook_secret, event: "Issue")
+    second_webhook = post_linear_webhook(body, webhook_secret, event: "Issue")
+
+    assert System.monotonic_time(:millisecond) - started_ms < 250
+    assert %{"accepted" => true, "coalesced" => true} = json_response(first_webhook, 200)
+    assert %{"accepted" => true, "coalesced" => true} = json_response(second_webhook, 200)
+
+    assert %{"dispatch_paused" => true, "changed" => true} =
+             json_response(post(build_conn(), "/api/v1/pause", %{"paused" => true}), 202)
+
+    send(orchestrator_pid, {:run_budget_timeout, timer_issue_id, "run-responsive-timer"})
+    send(orchestrator_pid, {:DOWN, completion_ref, :process, self(), :normal})
+
+    status_started_ms = System.monotonic_time(:millisecond)
+    status_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    assert System.monotonic_time(:millisecond) - status_started_ms < 250
+    assert status_payload["counts"]["parked"] == 1
+    assert status_payload["counts"]["retrying"] == 1
+
+    assert %{polling: %{checking?: true}, parked: [parked], retrying: [retrying]} =
+             Orchestrator.snapshot(orchestrator_name, 250)
+
+    assert parked.issue_id == timer_issue_id
+    assert parked.terminal_reason == "time_budget_exhausted"
+    assert retrying.issue_id == completion_issue_id
+
+    refute_receive {:blocked_poll_started, _pid, _request}, 100
+
+    send(first_poll_pid, {:release_blocked_poll, successful_poll_result(first_request)})
+    assert_receive {:blocked_poll_started, second_poll_pid, second_request}, 500
+    refute first_poll_pid == second_poll_pid
+    refute Process.alive?(first_poll_pid)
+
+    send(second_poll_pid, {:release_blocked_poll, successful_poll_result(second_request)})
+    await_orchestrator_poll_idle(orchestrator_name)
+    refute_receive {:blocked_poll_started, _pid, _request}, 100
+  end
+
+  test "refresh and webhook timeouts return bounded unavailable responses without caller exits" do
+    webhook_secret = "synthetic-webhook-secret"
+    configure_webhook_secret(webhook_secret)
+
+    refresh_name = Module.concat(__MODULE__, :BlockingRefreshApiOrchestrator)
+    start_supervised!({BlockingRefreshOrchestrator, name: refresh_name})
+    start_test_endpoint(orchestrator: refresh_name)
+
+    started_ms = System.monotonic_time(:millisecond)
+
+    assert json_response(post(build_conn(), "/api/v1/refresh", %{}), 503)["error"]["code"] ==
+             "orchestrator_unavailable"
+
+    assert System.monotonic_time(:millisecond) - started_ms < 900
+    Process.sleep(550)
+
+    body = linear_webhook_body("Issue", System.system_time(:millisecond), "update")
+    webhook_started_ms = System.monotonic_time(:millisecond)
+    webhook = post_linear_webhook(body, webhook_secret, event: "Issue")
+
+    assert json_response(webhook, 503)["error"]["code"] == "orchestrator_unavailable"
+    assert System.monotonic_time(:millisecond) - webhook_started_ms < 900
+  end
+
   test "Linear webhook rejects invalid authentication and stale timestamps before wake-up" do
     webhook_secret = "synthetic-webhook-secret"
     configure_webhook_secret(webhook_secret)
@@ -1253,6 +1392,45 @@ defmodule SymphonyElixir.ExtensionsTest do
       end,
       40
     )
+  end
+
+  defp successful_poll_result(request) do
+    %{
+      request: request,
+      running: {:ok, []},
+      parked: {:ok, []},
+      comments: %{},
+      dispatch: {:ok, []}
+    }
+  end
+
+  defp responsive_running_entry(issue_id, run_id) do
+    agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    on_exit(fn ->
+      if Process.alive?(agent_pid), do: Process.exit(agent_pid, :kill)
+    end)
+
+    %{
+      pid: agent_pid,
+      ref: nil,
+      run_id: run_id,
+      retry_attempt: 1,
+      identifier: String.upcase(issue_id),
+      issue: %Issue{id: issue_id, identifier: String.upcase(issue_id), state: "In Progress"},
+      started_at: DateTime.utc_now(),
+      session_id: nil,
+      worker_host: nil,
+      workspace_path: nil,
+      workspace_root: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_token_telemetry_observed: false,
+      turn_count: 0,
+      run_budget: %{max_turns: 20, max_tokens: nil, max_seconds: 60},
+      run_budget_timer_ref: nil
+    }
   end
 
   defp ensure_workflow_store_running do

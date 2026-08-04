@@ -768,14 +768,23 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert_token_usage(mismatched, issue_id, 20, 5, 25, true)
 
-    malformed =
+    explicit_high =
       apply_token_usage(mismatched, issue_id, run_id, %{
+        "input_tokens" => 25,
+        "output_tokens" => 5,
+        "total_tokens" => 40
+      })
+
+    assert_token_usage(explicit_high, issue_id, 25, 5, 40, true)
+
+    malformed =
+      apply_token_usage(explicit_high, issue_id, run_id, %{
         "input_tokens" => 30,
         "output_tokens" => 10,
         "total_tokens" => "40-trailing"
       })
 
-    assert_token_usage(malformed, issue_id, 20, 5, 25, true)
+    assert_token_usage(malformed, issue_id, 25, 5, 40, true)
 
     overflow =
       apply_token_usage(malformed, issue_id, run_id, %{
@@ -783,8 +792,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         "output_tokens" => 1
       })
 
-    assert_token_usage(overflow, issue_id, 20, 5, 25, true)
-    assert overflow.codex_totals == mismatched.codex_totals
+    assert_token_usage(overflow, issue_id, 25, 5, 40, true)
+    assert overflow.codex_totals == explicit_high.codex_totals
   end
 
   test "one-sided token telemetry stays unenforceable and attempts keep independent high-water marks" do
@@ -1312,6 +1321,110 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert is_integer(next_poll_in_ms)
     assert next_poll_in_ms >= 0
     assert next_poll_in_ms <= 50
+  end
+
+  test "supervised poll task crash recovers through bounded backoff" do
+    parent = self()
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    poll_work_fn = fn request ->
+      attempt = Agent.get_and_update(counter, fn count -> {count + 1, count + 1} end)
+      send(parent, {:crash_recovery_poll_started, attempt, System.monotonic_time(:millisecond)})
+
+      if attempt == 1 do
+        raise "synthetic tracker crash"
+      else
+        successful_poll_result(request)
+      end
+    end
+
+    orchestrator_name = Module.concat(__MODULE__, :CrashRecoveryPollOrchestrator)
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        poll_work_fn: poll_work_fn,
+        poll_task_timeout_ms: 1_000
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    assert_receive {:crash_recovery_poll_started, 1, first_started_ms}, 500
+    assert_receive {:crash_recovery_poll_started, 2, second_started_ms}, 1_000
+    assert second_started_ms - first_started_ms >= 200
+    assert second_started_ms - first_started_ms < 900
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(
+               pid,
+               &match?(%{polling: %{checking?: false}}, &1),
+               500
+             )
+
+    state = :sys.get_state(pid)
+    assert state.poll_generation == 2
+    assert state.poll_failure_count == 0
+    assert state.poll_task == nil
+  end
+
+  test "timed-out poll ignores stale results and starts one bounded recovery task" do
+    parent = self()
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    poll_work_fn = fn request ->
+      attempt = Agent.get_and_update(counter, fn count -> {count + 1, count + 1} end)
+      send(parent, {:timeout_recovery_poll_started, attempt, self(), request})
+
+      receive do
+        {:release_timeout_recovery_poll, result} -> result
+      end
+    end
+
+    orchestrator_name = Module.concat(__MODULE__, :TimeoutRecoveryPollOrchestrator)
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        poll_work_fn: poll_work_fn,
+        poll_task_timeout_ms: 500
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    assert_receive {:timeout_recovery_poll_started, 1, first_poll_pid, first_request}, 500
+    first_task = :sys.get_state(pid).poll_task
+    assert first_task.pid == first_poll_pid
+
+    assert_receive {:timeout_recovery_poll_started, 2, second_poll_pid, second_request}, 1_500
+    refute Process.alive?(first_poll_pid)
+
+    send(
+      pid,
+      {first_task.ref, {first_task.generation, Map.put(successful_poll_result(first_request), :dispatch, {:ok, [:stale]})}}
+    )
+
+    Process.sleep(25)
+    current_task = :sys.get_state(pid).poll_task
+    assert current_task.pid == second_poll_pid
+    assert current_task.generation == 2
+
+    send(second_poll_pid, {
+      :release_timeout_recovery_poll,
+      successful_poll_result(second_request)
+    })
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(
+               pid,
+               &match?(%{polling: %{checking?: false}}, &1),
+               500
+             )
+
+    refute_receive {:timeout_recovery_poll_started, 3, _pid, _request}, 100
   end
 
   test "orchestrator restarts stalled workers with retry backoff" do
@@ -2161,5 +2274,15 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     [row] = snapshot.running
     assert row.budget.tokens.telemetry_observed == telemetry_observed?
     assert row.budget.tokens.used == if(telemetry_observed?, do: total)
+  end
+
+  defp successful_poll_result(request) do
+    %{
+      request: request,
+      running: {:ok, []},
+      parked: {:ok, []},
+      comments: %{},
+      dispatch: {:ok, []}
+    }
   end
 end
