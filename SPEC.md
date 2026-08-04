@@ -743,7 +743,14 @@ claim state.
    - A durable typed operator wait exists in `parked`.
    - The issue cannot be dispatched until the wait is explicitly resumed.
 
-6. `Released`
+6. `CleanupPending`
+   - A terminal workspace cleanup is durably owned and the issue remains claimed.
+   - It has no retry deadline and cannot be dispatched while cleanup is pending.
+   - Operator projections expose only stage `cleanup_pending` plus one of
+     `workspace_cleanup_pending`, `workspace_cleanup_failed`, or
+     `workspace_affinity_missing`, with the captured host/path affinity.
+
+7. `Released`
    - Claim removed because issue is terminal, non-active, missing, or retry path completed without
      re-dispatch.
 
@@ -842,6 +849,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
   and queued resumes. A recovered dispatch MUST target that host exclusively; it MUST remain blocked
   and visible when the host or path affinity is missing or unavailable rather than hopping hosts.
 - Startup reconciliation restores global dispatch pause and per-issue operator comment cursors.
+- Startup reconciliation restores pending terminal workspace cleanup ownership and keeps each issue
+  claimed until exact cleanup plus its durable completion event succeed.
 - A parked issue is excluded from automatic retry and pickup even when its tracker state is active.
 - Resuming a wait atomically replaces the runner-side park with a durable `resume_queued` entry;
   normal exact-state eligibility still applies, and the next durable claim consumes the queue entry.
@@ -1541,6 +1550,7 @@ SHOULD return:
 - each running row SHOULD include the resolved model, reasoning effort, and model-catalog source when
   available; any exposed catalog MUST follow the credential-safe bounded contract in Section 10.2
 - `retrying` (list of retry queue rows)
+- `cleanup_pending` (list of durably owned terminal workspace cleanups; no retry deadline)
 - `parked` (list of typed operator waits)
   - Operator surfaces SHOULD share one control-safe, stably sorted projection with per-field byte
     limits, a row cap, an encoded-row byte cap, and exact total/returned/omitted metadata.
@@ -1690,6 +1700,7 @@ Minimum endpoints:
       "counts": {
         "running": 2,
         "retrying": 1,
+        "cleanup_pending": 1,
         "parked": 1
       },
       "running": [
@@ -1729,6 +1740,19 @@ Minimum endpoints:
           "attempt": 3,
           "due_at": "2026-02-24T20:16:00Z",
           "error": "no available orchestrator slots"
+        }
+      ],
+      "cleanup_pending": [
+        {
+          "issue_id": "cleanup123",
+          "issue_identifier": "MT-648",
+          "run_id": "run_cleanup",
+          "attempt": 2,
+          "stage": "cleanup_pending",
+          "due_at": null,
+          "error_code": "workspace_cleanup_failed",
+          "worker_host": "worker-a",
+          "workspace_path": "/srv/symphony/workspaces/MT-648"
         }
       ],
       "parked": [

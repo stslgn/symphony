@@ -14,15 +14,22 @@ defmodule SymphonyElixirWeb.Presenter do
         parked = Map.get(snapshot, :parked, [])
         %{rows: parked_rows, metadata: parked_metadata} = ParkedProjection.collection(parked)
 
+        {cleanup_pending_rows, retry_rows} =
+          snapshot.retrying
+          |> Enum.map(&retry_entry_payload/1)
+          |> Enum.split_with(&(&1[:stage] == "cleanup_pending"))
+
         %{
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
-            retrying: length(snapshot.retrying),
+            retrying: length(retry_rows),
+            cleanup_pending: length(cleanup_pending_rows),
             parked: length(parked)
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
-          retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
+          retrying: retry_rows,
+          cleanup_pending: cleanup_pending_rows,
           parked: parked_rows,
           parked_meta: parked_metadata,
           control: Map.get(snapshot, :control, %{dispatch_paused: false}),
@@ -146,6 +153,7 @@ defmodule SymphonyElixirWeb.Presenter do
   defp issue_status(_running, _retry, parked) when not is_nil(parked), do: "parked"
   defp issue_status(nil, %{stage: "resume_queued"}, nil), do: "resume_queued"
   defp issue_status(nil, %{stage: "recovery_queued"}, nil), do: "recovery_queued"
+  defp issue_status(nil, %{stage: "cleanup_pending"}, nil), do: "cleanup_pending"
   defp issue_status(_running, nil, nil), do: "running"
   defp issue_status(nil, _retry, nil), do: "retrying"
   defp issue_status(_running, _retry, nil), do: "running"
@@ -226,6 +234,14 @@ defmodule SymphonyElixirWeb.Presenter do
       stage: stage,
       run_id: Map.get(entry, :run_id),
       wait_id: Map.get(entry, :wait_id)
+    })
+  end
+
+  defp maybe_add_durable_queue_metadata(payload, %{stage: "cleanup_pending"} = entry) do
+    Map.merge(payload, %{
+      stage: "cleanup_pending",
+      run_id: Map.get(entry, :run_id),
+      due_at: nil
     })
   end
 

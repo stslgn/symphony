@@ -4,7 +4,7 @@ defmodule SymphonyElixir.ObservabilitySanitizer do
   @safe_identifier ~r/\A[A-Za-z0-9][A-Za-z0-9._:\/-]{0,95}\z/
   @safe_error_code ~r/\A[a-z][a-z0-9_-]{0,63}\z/
   @safe_protocol_method ~r/\A(?:account|codex\/event|item|thread|tool|turn)\/[A-Za-z0-9_\/-]{1,80}\z/
-  @retry_error_codes ~w(agent_exit worker_stalled spawn_failed retry_poll_failed capacity_unavailable worker_failure)
+  @retry_error_codes ~w(agent_exit worker_stalled spawn_failed retry_poll_failed capacity_unavailable worker_failure workspace_cleanup_pending workspace_cleanup_failed workspace_affinity_missing)
 
   @spec protocol_method(term()) :: String.t() | nil
   def protocol_method(method) when is_binary(method) do

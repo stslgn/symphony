@@ -358,7 +358,17 @@ defmodule SymphonyElixir.StatusDashboard do
         running_event_width = running_event_width(terminal_columns_override)
         running_rows = format_running_rows(running, running_event_width)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
-        backoff_rows = format_retry_rows(retrying)
+
+        {cleanup_pending, retry_queue} =
+          Enum.split_with(retrying, &(Map.get(&1, :stage) == "cleanup_pending"))
+
+        backoff_rows = format_retry_rows(retry_queue)
+
+        cleanup_pending_rows =
+          format_cleanup_pending_rows(
+            cleanup_pending,
+            terminal_columns_override || terminal_columns()
+          )
 
         parked_rows =
           format_parked_rows(
@@ -394,6 +404,7 @@ defmodule SymphonyElixir.StatusDashboard do
            running_to_backoff_spacer ++
            [colorize("├─ Retry / resume queue", @ansi_bold), "│"] ++
            backoff_rows ++
+           cleanup_pending_rows ++
            parked_rows ++
            [closing_border()])
         |> List.flatten()
@@ -710,6 +721,43 @@ defmodule SymphonyElixir.StatusDashboard do
           colorize(next_in_words(due_in_ms), @ansi_cyan) <>
           error
     end
+  end
+
+  defp format_cleanup_pending_rows([], _terminal_columns), do: []
+
+  defp format_cleanup_pending_rows(cleanup_pending, terminal_columns) do
+    rows =
+      cleanup_pending
+      |> Enum.sort_by(fn entry ->
+        {parked_field(Map.get(entry, :identifier), @parked_identifier_columns), parked_field(Map.get(entry, :run_id), @parked_wait_id_columns)}
+      end)
+      |> Enum.map(&format_cleanup_pending_summary(&1, terminal_columns))
+
+    ["│", colorize("├─ Workspace cleanup pending", @ansi_bold), "│"] ++ rows
+  end
+
+  defp format_cleanup_pending_summary(entry, terminal_columns) do
+    identifier =
+      parked_field(
+        Map.get(entry, :identifier) || Map.get(entry, :issue_id) || "unknown",
+        @parked_identifier_columns
+      )
+
+    run_id = parked_field(Map.get(entry, :run_id) || "missing", @parked_wait_id_columns)
+    attempt = parked_field(Map.get(entry, :attempt) || 0, @parked_attempt_columns)
+    worker_host = parked_field(Map.get(entry, :worker_host) || "local", @parked_host_columns)
+    workspace_path = parked_field(Map.get(entry, :workspace_path) || "missing", @parked_path_columns)
+    error_code = ObservabilitySanitizer.retry_error_code(Map.get(entry, :error)) || "workspace_cleanup_pending"
+
+    row =
+      "│  #{identifier} cleanup_pending run=#{run_id} attempt=#{attempt} " <>
+        "error_code=#{error_code} host=#{worker_host} path=#{workspace_path}"
+
+    truncate_terminal(
+      row,
+      min(terminal_columns, @parked_row_max_columns),
+      @parked_row_max_bytes
+    )
   end
 
   defp format_parked_rows([], _terminal_columns), do: []

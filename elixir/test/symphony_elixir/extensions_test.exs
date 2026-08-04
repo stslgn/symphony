@@ -5,6 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
+  alias SymphonyElixir.RunLedger
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -392,7 +393,12 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "parked" => 1},
+             "counts" => %{
+               "running" => 1,
+               "retrying" => 1,
+               "cleanup_pending" => 0,
+               "parked" => 1
+             },
              "control" => %{"dispatch_paused" => false},
              "capabilities" => %{
                "dynamic_tools" => ["linear_graphql"],
@@ -441,6 +447,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "workspace_path" => nil
                }
              ],
+             "cleanup_pending" => [],
              "parked" => [
                %{
                  "issue_id" => "issue-parked",
@@ -1372,6 +1379,168 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "free_form_reason"
   end
 
+  test "cleanup failure remains durably owned and truthful after restart across every surface" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-cleanup-pending-surfaces-#{System.unique_integer([:positive])}"
+      )
+
+    captured_root = Path.join(test_root, "captured-root")
+    workspace = Path.join(test_root, "outside-root/MT-CLEANUP-RESTART")
+    sentinel = Path.join(workspace, "must-survive")
+    ledger_path = Path.join(test_root, "run-ledger.jsonl")
+    issue_id = "issue-cleanup-restart"
+    identifier = "MT-CLEANUP-RESTART"
+    run_id = "run-cleanup-restart"
+
+    base = %{
+      run_id: run_id,
+      issue_id: issue_id,
+      issue_identifier: identifier,
+      attempt: 2,
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: captured_root
+    }
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+    File.mkdir_p!(workspace)
+    File.write!(sentinel, "preserve")
+
+    assert :ok = RunLedger.append(ledger_path, Map.merge(base, %{transition: "run_claimed", stage: "claimed"}))
+    assert :ok = RunLedger.append(ledger_path, Map.merge(base, %{transition: "run_started", stage: "running"}))
+
+    assert :ok =
+             RunLedger.append(
+               ledger_path,
+               Map.merge(base, %{
+                 transition: "run_stopped",
+                 stage: "released",
+                 terminal_reason: "tracker_terminal",
+                 next_action: "none"
+               })
+             )
+
+    assert :ok =
+             RunLedger.append(
+               ledger_path,
+               Map.merge(base, %{
+                 transition: "workspace_cleanup_requested",
+                 stage: "cleanup",
+                 terminal_reason: "tracker_terminal"
+               })
+             )
+
+    assert {:ok, restarted} = Orchestrator.init(run_ledger_path: ledger_path)
+    if is_reference(restarted.tick_timer_ref), do: Process.cancel_timer(restarted.tick_timer_ref)
+
+    assert File.read!(sentinel) == "preserve"
+    assert MapSet.member?(restarted.claimed, issue_id)
+
+    assert %{
+             status: :cleanup_pending,
+             cleanup_error: {:workspace_outside_root, _canonical_workspace, _canonical_root}
+           } = restarted.cleanup_pending[issue_id]
+
+    assert {:reply, raw_snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, restarted)
+
+    assert [cleanup_row] = Enum.filter(raw_snapshot.retrying, &(&1.stage == "cleanup_pending"))
+    assert cleanup_row.error == "workspace_cleanup_failed"
+    assert cleanup_row.due_in_ms == nil
+    assert cleanup_row.workspace_path == workspace
+
+    pending_entry = restarted.cleanup_pending[issue_id] |> Map.delete(:cleanup_error)
+    pending_state = put_in(restarted.cleanup_pending[issue_id], pending_entry)
+
+    missing_state =
+      put_in(
+        restarted.cleanup_pending[issue_id],
+        Map.put(pending_entry, :cleanup_error, :workspace_affinity_missing)
+      )
+
+    assert {:reply, pending_snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, pending_state)
+
+    assert {:reply, missing_snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, missing_state)
+
+    assert Enum.find(pending_snapshot.retrying, &(&1.stage == "cleanup_pending")).error ==
+             "workspace_cleanup_pending"
+
+    assert Enum.find(missing_snapshot.retrying, &(&1.stage == "cleanup_pending")).error ==
+             "workspace_affinity_missing"
+
+    for code <- ~w(workspace_cleanup_pending workspace_cleanup_failed workspace_affinity_missing) do
+      assert SymphonyElixir.ObservabilitySanitizer.retry_error_code(code) == code
+    end
+
+    terminal = StatusDashboard.format_snapshot_content_for_test({:ok, raw_snapshot}, 0.0, 160)
+    assert terminal =~ "Workspace cleanup pending"
+    assert terminal =~ "cleanup_pending"
+    assert terminal =~ "error_code=workspace_cleanup_failed"
+    assert terminal =~ "host=local"
+    assert terminal =~ "path=#{String.slice(workspace, 0, 16)}"
+    refute terminal =~ " in 0.000s"
+
+    orchestrator_name = Module.concat(__MODULE__, :CleanupPendingRestartOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: raw_snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+
+    assert state_payload["counts"] == %{
+             "running" => 0,
+             "retrying" => 0,
+             "cleanup_pending" => 1,
+             "parked" => 0
+           }
+
+    assert state_payload["retrying"] == []
+
+    assert [
+             %{
+               "issue_identifier" => ^identifier,
+               "stage" => "cleanup_pending",
+               "error_code" => "workspace_cleanup_failed",
+               "due_at" => nil,
+               "worker_host" => nil,
+               "workspace_path" => ^workspace
+             }
+           ] = state_payload["cleanup_pending"]
+
+    assert %{
+             "status" => "cleanup_pending",
+             "retry" => %{
+               "stage" => "cleanup_pending",
+               "error_code" => "workspace_cleanup_failed",
+               "due_at" => nil,
+               "workspace_path" => ^workspace
+             },
+             "last_error_code" => "workspace_cleanup_failed"
+           } = json_response(get(build_conn(), "/api/v1/#{identifier}"), 200)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "Workspace cleanup pending"
+    assert html =~ identifier
+    assert html =~ "cleanup_pending"
+    assert html =~ "workspace_cleanup_failed"
+    assert html =~ workspace
+    assert html =~ "No issues are currently backing off."
+    refute html =~ "0.000s"
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(ledger_path, "runner-cleanup-audit")
+    assert recovery.cleanup_pending[issue_id]["workspace_path"] == workspace
+  end
+
   test "dashboard liveview renders an unavailable state without crashing" do
     start_test_endpoint(
       orchestrator: Module.concat(__MODULE__, :MissingDashboardOrchestrator),
@@ -1417,7 +1586,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "parked" => 1}
+
+    assert response.body["counts"] == %{
+             "running" => 1,
+             "retrying" => 1,
+             "cleanup_pending" => 0,
+             "parked" => 1
+           }
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200

@@ -99,6 +99,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">Cleanup pending</p>
+            <p class="metric-value numeric"><%= @payload.counts.cleanup_pending %></p>
+            <p class="metric-detail">Workspace cleanup owners still holding durable claims.</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -111,6 +117,58 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
             <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
           </article>
+        </section>
+
+        <section class="section-card" id="cleanup-pending">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Workspace cleanup pending</h2>
+              <p class="section-copy">Durably owned cleanups that must finish before the issue claim is released.</p>
+            </div>
+          </div>
+
+          <%= if @payload.cleanup_pending == [] do %>
+            <p class="empty-state">No workspace cleanups are pending.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 980px; table-layout: fixed;">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>Stage</th>
+                    <th>Run / attempt</th>
+                    <th>Error code</th>
+                    <th>Worker host</th>
+                    <th>Canonical workspace path</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- @payload.cleanup_pending}>
+                    <td>
+                      <div class="issue-stack">
+                        <span class="issue-id"><%= entry.issue_identifier %></span>
+                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                      </div>
+                    </td>
+                    <td><span class="state-badge state-badge-warning"><%= entry.stage %></span></td>
+                    <td>
+                      <div class="detail-stack mono">
+                        <span class="bounded-value" title={entry.run_id || "n/a"}><%= entry.run_id || "n/a" %></span>
+                        <span class="muted">attempt <%= entry.attempt %></span>
+                      </div>
+                    </td>
+                    <td><%= entry.error_code %></td>
+                    <td class="mono"><%= entry.worker_host || "local" %></td>
+                    <td>
+                      <span class="mono bounded-value" title={entry.workspace_path || "missing"}>
+                        <%= entry.workspace_path || "missing" %>
+                      </span>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
         </section>
 
         <section class="section-card">

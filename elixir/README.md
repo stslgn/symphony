@@ -313,9 +313,13 @@ The observability UI now runs on a minimal Phoenix stack:
 
 - LiveView for the dashboard at `/`
 - JSON API for operational debugging under `/api/v1/*`
-- `/api/v1/state` exposes separate `running`, `retrying`, and `parked` lists;
+- `/api/v1/state` exposes separate `running`, `retrying`, `cleanup_pending`, and
+  `parked` lists;
   `retrying` also includes durable `resume_queued` and `recovery_queued` rows
   with their next attempt and host/path affinity,
+  while `cleanup_pending` retains its durable claim, has no retry deadline, and
+  exposes captured host/path affinity plus only `workspace_cleanup_pending`,
+  `workspace_cleanup_failed`, or `workspace_affinity_missing`,
   and parked rows include the stable wait id, typed reason, allowed actions,
   issue/run identity, worker host, and canonical workspace path. JSON and
   LiveView share one control-safe, stably sorted parked projection with
