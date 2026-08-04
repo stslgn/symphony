@@ -1,9 +1,9 @@
-.PHONY: help all setup deps build fmt fmt-check lint test coverage ci dialyzer e2e
+.PHONY: help all setup deps build fmt fmt-check lint test scenarios coverage ci dialyzer e2e
 
 MIX ?= mix
 
 help:
-	@echo "Targets: setup, deps, fmt, fmt-check, lint, test, coverage, dialyzer, e2e, ci"
+	@echo "Targets: setup, deps, fmt, fmt-check, lint, test, scenarios, coverage, dialyzer, e2e, ci"
 
 setup:
 	$(MIX) setup
@@ -28,6 +28,9 @@ coverage:
 
 test:
 	$(MIX) test
+
+scenarios:
+	$(MIX) test test/symphony_elixir/scenario_harness_test.exs --trace
 
 dialyzer:
 	$(MIX) deps.get
