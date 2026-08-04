@@ -567,6 +567,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       if Process.alive?(orchestrator_pid), do: Process.exit(orchestrator_pid, :normal)
     end)
 
+    await_orchestrator_poll_idle(orchestrator_name)
     initial_state = :sys.get_state(orchestrator_pid)
 
     running_entry = %{
@@ -674,7 +675,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert snapshot.rate_limits == expected_rate_limits
     refute inspect(snapshot) =~ sentinel
 
-    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    await_orchestrator_poll_idle(orchestrator_name)
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 1_000)
 
     state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
     {:ok, _view, html} = live(build_conn(), "/")
@@ -1236,6 +1238,22 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp assert_eventually(_fun, 0), do: flunk("condition not met in time")
+
+  defp await_orchestrator_poll_idle(orchestrator_name) do
+    assert_eventually(
+      fn ->
+        case Orchestrator.snapshot(orchestrator_name, 250) do
+          %{polling: %{checking?: false, next_poll_in_ms: next_poll_in_ms}}
+          when is_integer(next_poll_in_ms) and next_poll_in_ms > 0 ->
+            true
+
+          _other ->
+            false
+        end
+      end,
+      40
+    )
+  end
 
   defp ensure_workflow_store_running do
     if Process.whereis(WorkflowStore) do
