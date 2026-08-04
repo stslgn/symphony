@@ -982,7 +982,7 @@ defmodule SymphonyElixir.StatusDashboard do
       unlimited ->
         "credits unlimited"
 
-      has_credits and is_number(balance) ->
+      has_credits == true and is_number(balance) ->
         "credits #{format_number(balance)}"
 
       has_credits == true ->

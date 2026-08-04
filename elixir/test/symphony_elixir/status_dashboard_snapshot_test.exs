@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.StatusDashboardSnapshotTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.RateLimitTelemetry
   alias SymphonyElixir.TestSupport.Snapshot
 
   @terminal_columns 115
@@ -192,6 +193,34 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
        }}
 
     Snapshot.assert_dashboard_snapshot!("credits_unlimited", render_snapshot(snapshot_data, 42.0))
+  end
+
+  test "partial credits shapes normalize and render without raising" do
+    cases = [
+      {%{"balance" => 3.5}, %{balance: 3.5}, "credits 3.50"},
+      {%{"unlimited" => false}, %{unlimited: false}, "credits n/a"}
+    ]
+
+    for {raw_credits, normalized_credits, expected_output} <- cases do
+      rate_limits =
+        RateLimitTelemetry.normalize(%{
+          "limit_id" => "codex",
+          "credits" => raw_credits
+        })
+
+      assert rate_limits == %{limit_id: "codex", credits: normalized_credits}
+
+      snapshot_data =
+        {:ok,
+         %{
+           running: [],
+           retrying: [],
+           codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+           rate_limits: rate_limits
+         }}
+
+      assert render_snapshot(snapshot_data, 0.0) =~ expected_output
+    end
   end
 
   defp render_snapshot(snapshot_data, tps) do
