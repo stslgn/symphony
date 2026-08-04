@@ -40,19 +40,21 @@ defmodule SymphonyElixir.RateLimitTelemetry do
   """
   @spec normalize(term()) :: t() | nil
   def normalize(rate_limits) when is_map(rate_limits) do
-    with {:ok, limit_id} <- normalize_identifier(rate_limits) do
-      normalized =
-        %{limit_id: limit_id}
-        |> put_normalized_section(:primary, normalize_bucket(fetch_value(rate_limits, [:primary, "primary"])))
-        |> put_normalized_section(
-          :secondary,
-          normalize_bucket(fetch_value(rate_limits, [:secondary, "secondary"]))
-        )
-        |> put_normalized_section(:credits, normalize_credits(fetch_value(rate_limits, [:credits, "credits"])))
+    case normalize_identifier(rate_limits) do
+      {:ok, limit_id} ->
+        normalized =
+          %{limit_id: limit_id}
+          |> put_normalized_section(:primary, normalize_bucket(fetch_value(rate_limits, [:primary, "primary"])))
+          |> put_normalized_section(
+            :secondary,
+            normalize_bucket(fetch_value(rate_limits, [:secondary, "secondary"]))
+          )
+          |> put_normalized_section(:credits, normalize_credits(fetch_value(rate_limits, [:credits, "credits"])))
 
-      if map_size(normalized) > 1, do: normalized
-    else
-      _reason -> nil
+        if map_size(normalized) > 1, do: normalized
+
+      _reason ->
+        nil
     end
   end
 
