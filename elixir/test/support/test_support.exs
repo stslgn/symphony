@@ -108,7 +108,8 @@ defmodule SymphonyElixir.TestSupport do
       issue_identifier: Map.get(running_entry, :identifier) || Map.fetch!(issue, :identifier),
       attempt: Map.get(running_entry, :retry_attempt, 0),
       worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path)
+      workspace_path: Map.get(running_entry, :workspace_path),
+      workspace_root: Map.get(running_entry, :workspace_root)
     }
 
     :ok =
@@ -136,7 +137,8 @@ defmodule SymphonyElixir.TestSupport do
         identifier: Map.fetch!(wait, :identifier)
       },
       worker_host: Map.get(wait, :worker_host),
-      workspace_path: Map.get(wait, :workspace_path)
+      workspace_path: Map.get(wait, :workspace_path),
+      workspace_root: Map.get(wait, :workspace_root)
     }
 
     :ok = seed_running_ledger!(path, running_entry)

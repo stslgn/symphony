@@ -1127,8 +1127,13 @@ defmodule SymphonyElixir.CoreTest do
           issue_id => %{
             pid: agent_pid,
             ref: nil,
+            run_id: "run-terminal-cleanup",
+            retry_attempt: 0,
             identifier: issue_identifier,
             issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            worker_host: nil,
+            workspace_path: workspace,
+            workspace_root: test_root,
             started_at: DateTime.utc_now()
           }
         },
@@ -1156,6 +1161,105 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "terminal cleanup removes only the captured root path after config changes" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-exact-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    old_root = Path.join(test_root, "old-root")
+    new_root = Path.join(test_root, "new-root")
+    identifier = "MT-ROOT-CHANGE"
+    old_workspace = Path.join(old_root, identifier)
+    new_workspace = Path.join(new_root, identifier)
+    new_sentinel = Path.join(new_workspace, "must-survive")
+    issue_id = "issue-root-change"
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+    File.mkdir_p!(old_workspace)
+    File.mkdir_p!(new_workspace)
+    File.write!(Path.join(old_workspace, "remove-me"), "old")
+    File.write!(new_sentinel, "new")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: new_root,
+      tracker_terminal_states: ["Closed"]
+    )
+
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill) end)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: nil,
+      run_id: "run-root-change",
+      retry_attempt: 0,
+      identifier: identifier,
+      issue: %Issue{id: issue_id, identifier: identifier, state: "In Progress"},
+      worker_host: nil,
+      workspace_path: old_workspace,
+      workspace_root: old_root,
+      started_at: DateTime.utc_now()
+    }
+
+    state = %Orchestrator.State{
+      run_ledger_path: nil,
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    terminal_issue = %Issue{id: issue_id, identifier: identifier, state: "Closed"}
+    cleaned_state = Orchestrator.reconcile_issue_states_for_test([terminal_issue], state)
+
+    refute File.exists?(old_workspace)
+    assert File.read!(new_sentinel) == "new"
+    refute Map.has_key?(cleaned_state.cleanup_pending, issue_id)
+    refute MapSet.member?(cleaned_state.claimed, issue_id)
+  end
+
+  test "terminal cleanup with missing affinity remains claimed and visible" do
+    issue_id = "issue-cleanup-missing-affinity"
+    identifier = "MT-CLEANUP-MISSING"
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill) end)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: nil,
+      run_id: "run-cleanup-missing-affinity",
+      retry_attempt: 0,
+      identifier: identifier,
+      issue: %Issue{id: issue_id, identifier: identifier, state: "In Progress"},
+      worker_host: nil,
+      workspace_path: nil,
+      workspace_root: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    state = %Orchestrator.State{
+      run_ledger_path: nil,
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    terminal_issue = %Issue{id: issue_id, identifier: identifier, state: "Closed"}
+    pending_state = Orchestrator.reconcile_issue_states_for_test([terminal_issue], state)
+
+    assert MapSet.member?(pending_state.claimed, issue_id)
+    assert pending_state.cleanup_pending[issue_id].cleanup_error == :workspace_affinity_missing
+
+    assert {:reply, snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, pending_state)
+
+    assert Enum.any?(snapshot.retrying, fn row ->
+             row.issue_id == issue_id and row.stage == "cleanup_pending" and
+               row.error == "workspace_affinity_missing"
+           end)
   end
 
   test "completion ledger failure retains claim and blocks continuation until persisted" do
@@ -1334,6 +1438,7 @@ defmodule SymphonyElixir.CoreTest do
         issue: %Issue{id: issue_id, identifier: issue_identifier, state: "In Progress"},
         worker_host: nil,
         workspace_path: workspace,
+        workspace_root: test_root,
         started_at: DateTime.utc_now()
       }
 
@@ -1366,9 +1471,11 @@ defmodule SymphonyElixir.CoreTest do
       refute Process.alive?(agent_pid)
       refute File.exists?(workspace)
 
-      assert {:ok, [_claim, _started, event]} = RunLedger.read_events(valid_path)
+      assert {:ok, [_claim, _started, event, cleanup_event]} = RunLedger.read_events(valid_path)
       assert event["transition"] == "run_stopped"
       assert event["terminal_reason"] == "tracker_terminal"
+      assert cleanup_event["transition"] == "workspace_cleanup_completed"
+      assert cleanup_event["workspace_path"] == workspace
     after
       File.rm_rf(test_root)
     end

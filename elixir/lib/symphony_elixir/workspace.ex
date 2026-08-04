@@ -180,6 +180,48 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @spec remove_exact(Path.t(), Path.t(), worker_host()) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_exact(workspace, captured_root, nil)
+      when is_binary(workspace) and is_binary(captured_root) do
+    case validate_path_against_root(workspace, captured_root) do
+      :ok ->
+        maybe_run_before_remove_hook(workspace, nil)
+        File.rm_rf(workspace)
+
+      {:error, reason} ->
+        {:error, reason, ""}
+    end
+  end
+
+  def remove_exact(workspace, captured_root, worker_host)
+      when is_binary(workspace) and is_binary(captured_root) and is_binary(worker_host) do
+    case validate_path_against_root(workspace, captured_root) do
+      :ok -> remove_exact_remote(workspace, worker_host)
+      {:error, reason} -> {:error, reason, ""}
+    end
+  end
+
+  def remove_exact(workspace, captured_root, worker_host),
+    do: {:error, {:invalid_exact_workspace, workspace, captured_root, worker_host}, ""}
+
+  defp remove_exact_remote(workspace, worker_host) do
+    maybe_run_before_remove_hook(workspace, worker_host)
+
+    script =
+      [
+        remote_shell_assign("workspace", workspace),
+        "rm -rf \"$workspace\""
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> {:ok, []}
+      {:ok, {output, status}} -> {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+      {:error, reason} -> {:error, reason, ""}
+    end
+  end
+
   @spec remove_issue_workspaces(term()) :: :ok
   def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil)
 

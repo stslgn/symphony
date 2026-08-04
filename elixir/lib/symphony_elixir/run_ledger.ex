@@ -30,6 +30,8 @@ defmodule SymphonyElixir.RunLedger do
     "resume_queued" => ["resume_queued"],
     "wait_rejected" => ["parked"],
     "wait_released" => ["parked"],
+    "workspace_cleanup_requested" => ["cleanup"],
+    "workspace_cleanup_completed" => ["cleanup"],
     "dispatch_paused" => ["operator"],
     "dispatch_resumed" => ["operator"],
     "operator_cursor_initialized" => ["operator"],
@@ -49,7 +51,8 @@ defmodule SymphonyElixir.RunLedger do
         "tracker_terminal",
         "worker_route_removed"
       ]),
-    "wait_released" => MapSet.new(["tracker_released", "tracker_terminal", "worker_route_removed"])
+    "wait_released" => MapSet.new(["tracker_released", "tracker_terminal", "worker_route_removed"]),
+    "workspace_cleanup_requested" => MapSet.new(["tracker_terminal"])
   }
   @park_terminal_reasons MapSet.new([
                            "operator_stop",
@@ -120,6 +123,14 @@ defmodule SymphonyElixir.RunLedger do
       required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason terminal_reason),
       required_attempt: true,
       typed_wait: true
+    },
+    "workspace_cleanup_completed" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier workspace_path workspace_root),
+      required_attempt: true
+    },
+    "workspace_cleanup_requested" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier terminal_reason),
+      required_attempt: true
     },
     "dispatch_paused" => %{required_strings: ~w(stage runner_generation)},
     "dispatch_resumed" => %{required_strings: ~w(stage runner_generation)},
@@ -243,6 +254,7 @@ defmodule SymphonyElixir.RunLedger do
          recovered_attempts: recovered_attempts,
          recovered_dispatches: recovered_dispatches,
          queued_resumes: recovery.queued_resumes,
+         cleanup_pending: recovery.cleanup_pending,
          parked: parked,
          dispatch_paused: recovery.dispatch_paused,
          processed_operator_comment_ids: recovery.processed_operator_comment_ids,
@@ -338,11 +350,14 @@ defmodule SymphonyElixir.RunLedger do
       operator_comment_cursors =
         Enum.reduce(events, %{}, &update_operator_comment_cursor/2)
 
+      cleanup_pending = Enum.reduce(events, %{}, &update_cleanup_pending_state/2)
+
       {:ok,
        %{
          stale_runs: unfinished,
          parked: parked,
          queued_resumes: queued_resumes,
+         cleanup_pending: cleanup_pending,
          recovered_dispatches: recovered_dispatches,
          dispatch_paused: dispatch_paused,
          processed_operator_comment_ids: processed_operator_comment_ids,
@@ -459,6 +474,36 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp update_recovered_dispatch_state(_event, acc), do: acc
+
+  defp update_cleanup_pending_state(
+         %{
+           "transition" => "run_stopped",
+           "terminal_reason" => "tracker_terminal",
+           "issue_id" => issue_id
+         } = event,
+         acc
+       )
+       when is_binary(issue_id) do
+    Map.put(acc, issue_id, event)
+  end
+
+  defp update_cleanup_pending_state(
+         %{"transition" => "workspace_cleanup_requested", "issue_id" => issue_id} = event,
+         acc
+       )
+       when is_binary(issue_id) do
+    Map.put(acc, issue_id, event)
+  end
+
+  defp update_cleanup_pending_state(
+         %{"transition" => "workspace_cleanup_completed", "issue_id" => issue_id},
+         acc
+       )
+       when is_binary(issue_id) do
+    Map.delete(acc, issue_id)
+  end
+
+  defp update_cleanup_pending_state(_event, acc), do: acc
 
   defp recovered_dispatches_from_stale_runs(stale_runs) do
     Enum.reduce(stale_runs, %{}, fn {_run_id, event}, acc ->
@@ -931,6 +976,28 @@ defmodule SymphonyElixir.RunLedger do
          :ok <- reject_parked_retry(run),
          :ok <- require_increasing_attempt(event["attempt"], event["next_attempt"]) do
       {:ok, put_dispatch(state, event, event["next_attempt"])}
+    end
+  end
+
+  defp validate_ordered_event(
+         %{"transition" => "workspace_cleanup_requested"} = event,
+         state
+       ) do
+    with {:ok, run} <- fetch_run(state, event),
+         :ok <- require_terminal(run),
+         {:ok, run} <- merge_run_affinity(run, event) do
+      {:ok, put_run(state, event["run_id"], run)}
+    end
+  end
+
+  defp validate_ordered_event(
+         %{"transition" => "workspace_cleanup_completed"} = event,
+         state
+       ) do
+    with {:ok, run} <- fetch_run(state, event),
+         :ok <- require_terminal(run),
+         {:ok, run} <- merge_run_affinity(run, event) do
+      {:ok, put_run(state, event["run_id"], run)}
     end
   end
 
