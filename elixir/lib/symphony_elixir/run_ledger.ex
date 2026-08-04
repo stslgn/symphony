@@ -265,29 +265,33 @@ defmodule SymphonyElixir.RunLedger do
   def read_events(path) when is_binary(path) do
     case File.read(path) do
       {:ok, contents} ->
-        contents
-        |> ledger_lines()
-        |> Enum.with_index(1)
-        |> Enum.reduce_while({:ok, []}, fn {line, line_number}, {:ok, events} ->
-          case decode_line(line, line_number) do
-            {:ok, event} -> {:cont, {:ok, [event | events]}}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
-        |> case do
-          {:ok, events} ->
-            events = Enum.reverse(events)
-
-            with :ok <- validate_ordered_events(events) do
-              {:ok, events}
-            end
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        decode_events(contents)
 
       {:error, :enoent} ->
         {:ok, []}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp decode_events(contents) do
+    contents
+    |> ledger_lines()
+    |> Enum.with_index(1)
+    |> Enum.reduce_while({:ok, []}, fn {line, line_number}, {:ok, events} ->
+      case decode_line(line, line_number) do
+        {:ok, event} -> {:cont, {:ok, [event | events]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, events} ->
+        events = Enum.reverse(events)
+
+        with :ok <- validate_ordered_events(events) do
+          {:ok, events}
+        end
 
       {:error, reason} ->
         {:error, reason}
