@@ -25,6 +25,7 @@ defmodule SymphonyElixir.StatusDashboard do
   @running_event_min_width 12
   @running_row_chrome_width 10
   @default_terminal_columns 115
+  @max_parked_rows 5
 
   @ansi_reset IO.ANSI.reset()
   @ansi_bold IO.ANSI.bright()
@@ -315,6 +316,7 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             parked: Map.get(snapshot, :parked, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              control: Map.get(snapshot, :control, %{dispatch_paused: false}),
@@ -348,6 +350,7 @@ defmodule SymphonyElixir.StatusDashboard do
         running_rows = format_running_rows(running, running_event_width)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
+        parked_rows = format_parked_rows(Map.get(snapshot, :parked, []))
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
@@ -377,6 +380,7 @@ defmodule SymphonyElixir.StatusDashboard do
            running_to_backoff_spacer ++
            [colorize("├─ Retry / resume queue", @ansi_bold), "│"] ++
            backoff_rows ++
+           parked_rows ++
            [closing_border()])
         |> List.flatten()
         |> Enum.join("\n")
@@ -571,9 +575,11 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             parked: Map.get(snapshot, :parked, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
-             polling: Map.get(snapshot, :polling)
+             polling: Map.get(snapshot, :polling),
+             control: Map.get(snapshot, :control)
            }}
 
         _ ->
@@ -690,6 +696,34 @@ defmodule SymphonyElixir.StatusDashboard do
           colorize(next_in_words(due_in_ms), @ansi_cyan) <>
           error
     end
+  end
+
+  defp format_parked_rows([]), do: []
+
+  defp format_parked_rows(parked) do
+    visible_rows =
+      parked
+      |> Enum.sort_by(fn wait -> {Map.get(wait, :identifier), Map.get(wait, :wait_id)} end)
+      |> Enum.take(@max_parked_rows)
+      |> Enum.map(&format_parked_summary/1)
+
+    overflow_count = max(0, length(parked) - @max_parked_rows)
+    overflow_rows = if overflow_count == 0, do: [], else: ["│  ... #{overflow_count} more parked waits"]
+
+    ["│", colorize("├─ Parked waits", @ansi_bold), "│"] ++ visible_rows ++ overflow_rows
+  end
+
+  defp format_parked_summary(wait) do
+    identifier = Map.get(wait, :identifier) || Map.get(wait, :issue_id) || "unknown"
+    wait_id = Map.get(wait, :wait_id) || "missing"
+    reason = Map.get(wait, :reason) || "unknown"
+    attempt = Map.get(wait, :attempt) || 0
+    worker_host = Map.get(wait, :worker_host) || "local"
+    workspace_path = Map.get(wait, :workspace_path) || "missing"
+    allowed_actions = wait |> Map.get(:allowed_actions, []) |> Enum.join("|")
+
+    "│  #{identifier} wait=#{wait_id} reason=#{reason} attempt=#{attempt} " <>
+      "host=#{worker_host} path=#{workspace_path} actions=#{allowed_actions}"
   end
 
   defp format_durable_queue_summary(retry_entry, identifier, attempt, label, error) do

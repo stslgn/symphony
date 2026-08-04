@@ -139,6 +139,31 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     Snapshot.assert_dashboard_snapshot!("backoff_queue", render_snapshot(snapshot_data, 15.4))
   end
 
+  test "snapshot fixture: parked wait affinity" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         parked: [
+           %{
+             issue_id: "issue-parked",
+             identifier: "MT-454",
+             wait_id: "wait-owner-approval",
+             reason: "waiting_owner",
+             attempt: 3,
+             worker_host: "worker-b",
+             workspace_path: "/srv/symphony/workspaces/MT-454",
+             allowed_actions: ["approve", "reject"]
+           }
+         ],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    Snapshot.assert_dashboard_snapshot!("parked_wait", render_snapshot(snapshot_data, 0.0))
+  end
+
   test "backoff queue row exposes only a categorical error code" do
     snapshot_data =
       {:ok,
