@@ -209,7 +209,9 @@ codex:
   only client-side dynamic tools in `dynamic_tool_allowlist`.
 - MCP auto-approval is independent of `approval_policy`: tool approvals require
   an exact `server/tool` entry and elicitation approvals require an exact server
-  entry. Missing or malformed identities are denied or declined.
+  entry. Tool approval is correlated to a prior structured `mcpToolCall`
+  lifecycle event by thread, turn, and item id; display prose is never an
+  authorization input. Missing or malformed identities are denied or declined.
 - These MCP checks cover Symphony-mediated non-interactive approval responses;
   MCP servers configured directly in Codex and host/network isolation remain
   separate boundaries.

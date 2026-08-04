@@ -40,22 +40,6 @@ defmodule SymphonyElixir.Codex.CapabilityPolicy do
 
   def mcp_elicitation_allowed?(_policy, _server), do: false
 
-  @spec mcp_tool_identity_from_question(term()) :: {:ok, String.t(), String.t()} | :error
-  def mcp_tool_identity_from_question(question) when is_binary(question) do
-    pattern =
-      ~r/\bthe\s+(?<server>.+?)\s+MCP\s+server\s+wants\s+to\s+run\s+the\s+tool\s+["“](?<tool>.+?)["”]/iu
-
-    case Regex.named_captures(pattern, question) do
-      %{"server" => server, "tool" => tool} ->
-        {:ok, String.trim(server), String.trim(tool)}
-
-      _ ->
-        :error
-    end
-  end
-
-  def mcp_tool_identity_from_question(_question), do: :error
-
   defp normalized_set(values) when is_list(values) do
     values
     |> Enum.filter(&is_binary/1)

@@ -517,6 +517,9 @@ fields locally if they want stricter startup checks.
   - Unknown tool names MUST fail workflow validation.
 - `mcp_tool_auto_approve_allowlist` (list of exact `server/tool` identities)
   - Default: empty list.
+  - Authorization MUST use structured `mcpToolCall` lifecycle identity correlated
+    by thread, turn, and item id. Human-readable approval text MUST NOT authorize
+    a call; missing or mismatched structured identity is denied.
 - `mcp_elicitation_auto_approve_allowlist` (list of exact MCP server names)
   - Default: empty list.
 - `turn_timeout_ms` (integer)

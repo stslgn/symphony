@@ -27,17 +27,6 @@ defmodule SymphonyElixir.CapabilityPolicyTest do
     refute CapabilityPolicy.mcp_elicitation_allowed?(nil, "linear")
   end
 
-  test "extracts structured MCP identity only from recognized approval prompts" do
-    assert {:ok, "linear", "Save issue"} =
-             CapabilityPolicy.mcp_tool_identity_from_question(~s(The linear MCP server wants to run the tool "Save issue", which may modify data.))
-
-    assert {:ok, "GitHub", "merge_pull_request"} =
-             CapabilityPolicy.mcp_tool_identity_from_question("The GitHub MCP server wants to run the tool “merge_pull_request”")
-
-    assert :error = CapabilityPolicy.mcp_tool_identity_from_question("Approve this tool?")
-    assert :error = CapabilityPolicy.mcp_tool_identity_from_question(nil)
-  end
-
   test "malformed policy inputs fail closed" do
     policy =
       CapabilityPolicy.new(%{

@@ -142,7 +142,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     approval_context = %{
       auto_approve_requests: auto_approve_requests,
-      capability_policy: capability_policy
+      capability_policy: capability_policy,
+      mcp_tool_calls: %{}
     }
 
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, session_title) do
@@ -638,6 +639,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          auto_approve_requests
        ) do
     metadata = metadata_from_message(port, payload)
+    approval_context = track_mcp_tool_call(auto_approve_requests, method, payload)
 
     case maybe_handle_approval_request(
            port,
@@ -647,7 +649,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            on_message,
            metadata,
            tool_executor,
-           auto_approve_requests
+           approval_context
          ) do
       :input_required ->
         emit_message(
@@ -660,7 +662,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, approval_context)
 
       :approval_required ->
         emit_message(
@@ -694,10 +696,49 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          receive_loop(port, on_message, timeout_ms, "", tool_executor, approval_context)
         end
     end
   end
+
+  defp track_mcp_tool_call(
+         %{mcp_tool_calls: calls} = approval_context,
+         "item/started",
+         %{
+           "params" => %{
+             "threadId" => thread_id,
+             "turnId" => turn_id,
+             "item" => %{
+               "id" => item_id,
+               "type" => "mcpToolCall",
+               "server" => server,
+               "tool" => tool
+             }
+           }
+         }
+       )
+       when is_binary(thread_id) and is_binary(turn_id) and is_binary(item_id) and
+              is_binary(server) and is_binary(tool) do
+    identity = %{server: server, tool: tool}
+    %{approval_context | mcp_tool_calls: Map.put(calls, {thread_id, turn_id, item_id}, identity)}
+  end
+
+  defp track_mcp_tool_call(
+         %{mcp_tool_calls: calls} = approval_context,
+         "item/completed",
+         %{
+           "params" => %{
+             "threadId" => thread_id,
+             "turnId" => turn_id,
+             "item" => %{"id" => item_id, "type" => "mcpToolCall"}
+           }
+         }
+       )
+       when is_binary(thread_id) and is_binary(turn_id) and is_binary(item_id) do
+    %{approval_context | mcp_tool_calls: Map.delete(calls, {thread_id, turn_id, item_id})}
+  end
+
+  defp track_mcp_tool_call(approval_context, _method, _payload), do: approval_context
 
   defp terminal_protocol_error_reason(payload) when is_map(payload) do
     payload
@@ -1129,13 +1170,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp tool_request_user_input_approval_answers(
-         %{"questions" => questions},
+         %{"questions" => questions} = params,
          approval_context
        )
        when is_list(questions) do
     result =
       Enum.reduce_while(questions, %{answers: %{}, allowed?: true}, fn question, acc ->
-        case tool_request_user_input_approval_answer(question, approval_context) do
+        case tool_request_user_input_approval_answer(question, params, approval_context) do
           {:ok, question_id, answer_label, allowed?} ->
             {:cont,
              %{
@@ -1218,6 +1259,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp tool_request_user_input_approval_answer(
          %{"id" => question_id, "options" => options} = question,
+         params,
          approval_context
        )
        when is_binary(question_id) and is_list(options) do
@@ -1228,7 +1270,12 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       allowed? =
         auto_approve_requests?(approval_context) and
-          mcp_tool_question_allowed?(question, capability_policy(approval_context))
+          mcp_tool_request_allowed?(
+            params,
+            question,
+            approval_context,
+            capability_policy(approval_context)
+          )
 
       cond do
         allowed? ->
@@ -1245,7 +1292,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp tool_request_user_input_approval_answer(_question, _approval_context), do: :not_approval
+  defp tool_request_user_input_approval_answer(_question, _params, _approval_context), do: :not_approval
 
   defp tool_request_user_input_approval_option_label(options) do
     options
@@ -1287,14 +1334,29 @@ defmodule SymphonyElixir.Codex.AppServer do
     Enum.any?(["deny", "decline", "reject", "cancel"], &String.starts_with?(normalized_label, &1))
   end
 
-  defp mcp_tool_question_allowed?(question, policy) do
-    with %{"question" => prompt} when is_binary(prompt) <- question,
-         {:ok, server, tool} <- CapabilityPolicy.mcp_tool_identity_from_question(prompt) do
+  defp mcp_tool_request_allowed?(
+         %{
+           "threadId" => thread_id,
+           "turnId" => turn_id,
+           "itemId" => item_id
+         },
+         %{"id" => question_id},
+         %{mcp_tool_calls: calls},
+         policy
+       )
+       when is_binary(thread_id) and is_binary(turn_id) and is_binary(item_id) and
+              is_binary(question_id) do
+    expected_question_id = "mcp_tool_call_approval_#{item_id}"
+
+    with true <- question_id == expected_question_id,
+         %{server: server, tool: tool} <- Map.get(calls, {thread_id, turn_id, item_id}) do
       CapabilityPolicy.mcp_tool_allowed?(policy, server, tool)
     else
       _ -> false
     end
   end
+
+  defp mcp_tool_request_allowed?(_params, _question, _approval_context, _policy), do: false
 
   defp await_response(port, request_id) do
     with_timeout_response(port, request_id, Config.settings!().codex.read_timeout_ms, "")
