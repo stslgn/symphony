@@ -492,6 +492,18 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp update_cleanup_pending_state(
+         %{
+           "transition" => "wait_released",
+           "release_reason" => "tracker_terminal",
+           "issue_id" => issue_id
+         } = event,
+         acc
+       )
+       when is_binary(issue_id) do
+    Map.put(acc, issue_id, Map.put(event, "terminal_reason", "tracker_terminal"))
+  end
+
+  defp update_cleanup_pending_state(
          %{"transition" => "workspace_cleanup_requested", "issue_id" => issue_id} = event,
          acc
        )

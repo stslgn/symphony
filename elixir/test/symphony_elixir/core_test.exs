@@ -1054,6 +1054,72 @@ defmodule SymphonyElixir.CoreTest do
     refute Enum.any?(events, &String.starts_with?(&1["transition"], "workspace_cleanup_"))
   end
 
+  test "parked terminal release recovers local cleanup when request append crashes" do
+    root = parked_workspace_root("local-release-recovery")
+    workspace = Path.join(root, "MT-PARKED-LOCAL-RELEASE-RECOVERY")
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "remove-after-restart"), "old")
+
+    {state, wait} = parked_reconcile_state("local-release-recovery", workspace, root, nil)
+    state = %{state | run_ledger_append_fn: cleanup_request_failure_append_fn()}
+
+    released =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{id: wait.issue_id, identifier: wait.identifier, state: "Closed"},
+        state
+      )
+
+    refute Map.has_key?(released.parked, wait.issue_id)
+    assert %{status: :request_pending} = released.cleanup_pending[wait.issue_id]
+    assert File.exists?(workspace)
+
+    assert {:ok, events} = RunLedger.read_events(state.run_ledger_path)
+    assert List.last(events)["transition"] == "wait_released"
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(state.run_ledger_path, "runner-local-crash")
+    assert recovery.cleanup_pending[wait.issue_id]["release_reason"] == "tracker_terminal"
+
+    assert {:ok, restarted} = Orchestrator.init(run_ledger_path: state.run_ledger_path)
+    if is_reference(restarted.tick_timer_ref), do: Process.cancel_timer(restarted.tick_timer_ref)
+
+    refute File.exists?(workspace)
+    refute Map.has_key?(restarted.cleanup_pending, wait.issue_id)
+    refute MapSet.member?(restarted.claimed, wait.issue_id)
+  end
+
+  test "parked terminal release recovers exact remote cleanup when request append crashes" do
+    {remote_root, workspace, trace_file} =
+      install_fake_parked_cleanup_ssh!("remote-release-recovery")
+
+    {state, wait} =
+      parked_reconcile_state("remote-release-recovery", workspace, remote_root, "worker-a")
+
+    state = %{state | run_ledger_append_fn: cleanup_request_failure_append_fn()}
+
+    released =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{id: wait.issue_id, identifier: wait.identifier, state: "Closed"},
+        state
+      )
+
+    refute Map.has_key?(released.parked, wait.issue_id)
+    assert %{status: :request_pending} = released.cleanup_pending[wait.issue_id]
+    refute File.exists?(trace_file)
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(state.run_ledger_path, "runner-remote-crash")
+    assert recovery.cleanup_pending[wait.issue_id]["worker_host"] == "worker-a"
+    assert recovery.cleanup_pending[wait.issue_id]["workspace_path"] == workspace
+    assert recovery.cleanup_pending[wait.issue_id]["workspace_root"] == remote_root
+
+    assert {:ok, restarted} = Orchestrator.init(run_ledger_path: state.run_ledger_path)
+    if is_reference(restarted.tick_timer_ref), do: Process.cancel_timer(restarted.tick_timer_ref)
+
+    refute Map.has_key?(restarted.cleanup_pending, wait.issue_id)
+    refute MapSet.member?(restarted.claimed, wait.issue_id)
+    assert File.read!(trace_file) =~ "worker-a bash -lc"
+    assert File.read!(trace_file) =~ workspace
+  end
+
   test "observed token budget exhaustion parks the run without scheduling retry" do
     issue_id = "issue-token-budget"
 
@@ -3983,6 +4049,14 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     {remote_root, workspace, trace_file}
+  end
+
+  defp cleanup_request_failure_append_fn do
+    fn ledger_path, event ->
+      if event.transition == "workspace_cleanup_requested",
+        do: {:error, :forced_cleanup_request_append_failure},
+        else: RunLedger.append(ledger_path, event)
+    end
   end
 
   defp blocked_ledger_path do
