@@ -93,6 +93,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">Parked</p>
+            <p class="metric-value numeric"><%= @payload.counts.parked %></p>
+            <p class="metric-detail">Unresolved waits that require an operator decision.</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -127,7 +133,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </div>
 
           <%= if @payload.running == [] do %>
-            <p class="empty-state">No active sessions.</p>
+            <p class="empty-state">
+              No active sessions.<%= if @payload.counts.parked > 0 do %> Unresolved parked waits are listed separately below.<% end %>
+            </p>
           <% else %>
             <div class="table-wrap">
               <table class="data-table data-table-running">
@@ -200,6 +208,66 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
                       </div>
                     </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
+        </section>
+
+        <section class="section-card" id="parked-waits">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Parked waits</h2>
+              <p class="section-copy">Unresolved issues waiting for an allowlisted operator action.</p>
+            </div>
+          </div>
+
+          <%= if @payload.parked == [] do %>
+            <p class="empty-state">No unresolved operator waits.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table data-table-parked">
+                <thead>
+                  <tr>
+                    <th>Issue / wait</th>
+                    <th>Reason / actions</th>
+                    <th>Run / attempt</th>
+                    <th>Terminal reason</th>
+                    <th>Worker host</th>
+                    <th>Canonical workspace path</th>
+                    <th>Parked at</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- @payload.parked} id={"parked-wait-#{entry.wait_id}"}>
+                    <td>
+                      <div class="issue-stack">
+                        <span class="issue-id"><%= entry.issue_identifier %></span>
+                        <span class="mono bounded-value" title={entry.wait_id}><%= entry.wait_id %></span>
+                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="detail-stack">
+                        <span><%= entry.reason %></span>
+                        <span class="muted"><%= Enum.join(entry.allowed_actions, ", ") %></span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="detail-stack mono">
+                        <span class="bounded-value" title={entry.run_id}><%= entry.run_id %></span>
+                        <span class="muted">attempt <%= entry.attempt %></span>
+                      </div>
+                    </td>
+                    <td><%= entry.terminal_reason || "n/a" %></td>
+                    <td class="mono"><%= entry.worker_host || "n/a" %></td>
+                    <td>
+                      <span class="mono bounded-value" title={entry.workspace_path || "n/a"}>
+                        <%= entry.workspace_path || "n/a" %>
+                      </span>
+                    </td>
+                    <td class="mono"><%= entry.parked_at || "n/a" %></td>
                   </tr>
                 </tbody>
               </table>

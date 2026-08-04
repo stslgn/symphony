@@ -1105,6 +1105,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Operations Dashboard"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
+    assert html =~ "MT-PARKED"
+    assert html =~ "wait-http"
+    assert html =~ "Parked waits"
     refute html =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
     assert html =~ "Runtime"
     assert html =~ "Live"
@@ -1159,6 +1162,73 @@ defmodule SymphonyElixir.ExtensionsTest do
 
       rendered =~ "turn_completed" and
         not String.contains?(rendered, "SENSITIVE-BL10-DO-NOT-EXPOSE")
+    end)
+  end
+
+  test "dashboard liveview keeps parked waits visible without running or retrying work" do
+    orchestrator_name = Module.concat(__MODULE__, :ParkedOnlyDashboardOrchestrator)
+
+    parked_snapshot =
+      static_snapshot()
+      |> Map.put(:running, [])
+      |> Map.put(:retrying, [])
+      |> put_in([:parked, Access.at(0), :worker_host], "worker-a")
+      |> put_in([:parked, Access.at(0), :workspace_path], "/srv/symphony/MT-PARKED")
+
+    {:ok, orchestrator_pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: parked_snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "No active sessions."
+    assert html =~ "Unresolved parked waits are listed separately below."
+    assert html =~ "No issues are currently backing off."
+    assert html =~ ~r/metric-label[^>]*>Parked<\/p>\s*<p class="metric-value numeric">1<\/p>/
+    assert html =~ "MT-PARKED"
+    assert html =~ "wait-http"
+    assert html =~ "waiting_owner"
+    assert html =~ "approve, reject"
+    assert html =~ "run-http"
+    assert html =~ "attempt 1"
+    assert html =~ "turn_budget_exhausted"
+    assert html =~ "worker-a"
+    assert html =~ "/srv/symphony/MT-PARKED"
+
+    refreshed_snapshot =
+      put_in(parked_snapshot.parked, [
+        %{
+          issue_id: "issue-refreshed-parked",
+          identifier: "MT-PARKED-REFRESHED",
+          wait_id: "wait-refreshed",
+          reason: "waiting_infrastructure",
+          allowed_actions: ["retry", "reject"],
+          tracker_state: "Blocked",
+          run_id: "run-refreshed",
+          attempt: 3,
+          stage: "parked",
+          terminal_reason: "worker_start_failed",
+          worker_host: "worker-b",
+          workspace_path: "/srv/symphony/MT-PARKED-REFRESHED",
+          parked_at: DateTime.utc_now()
+        }
+      ])
+
+    :sys.replace_state(orchestrator_pid, fn state ->
+      Keyword.put(state, :snapshot, refreshed_snapshot)
+    end)
+
+    StatusDashboard.notify_update()
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "MT-PARKED-REFRESHED" and rendered =~ "wait-refreshed" and
+        not String.contains?(rendered, "MT-PARKED</span>")
     end)
   end
 
