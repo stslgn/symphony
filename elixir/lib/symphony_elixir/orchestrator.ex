@@ -912,16 +912,24 @@ defmodule SymphonyElixir.Orchestrator do
     !state.dispatch_paused and
       candidate_issue?(issue, active_states, terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
-      !MapSet.member?(claimed, issue.id) and
-      !Map.has_key?(running, issue.id) and
-      !Map.has_key?(parked, issue.id) and
-      !Map.has_key?(state.retry_attempts, issue.id) and
-      available_slots(state) > 0 and
-      state_slots_available?(issue, running) and
-      worker_slots_available?(state)
+      issue_available_for_dispatch?(state, issue.id, claimed, running, parked) and
+      dispatch_capacity_available?(state, issue, running)
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp issue_available_for_dispatch?(state, issue_id, claimed, running, parked) do
+    !MapSet.member?(claimed, issue_id) and
+      !Map.has_key?(running, issue_id) and
+      !Map.has_key?(parked, issue_id) and
+      !Map.has_key?(state.retry_attempts, issue_id)
+  end
+
+  defp dispatch_capacity_available?(state, issue, running) do
+    available_slots(state) > 0 and
+      state_slots_available?(issue, running) and
+      worker_slots_available?(state)
+  end
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -1339,29 +1347,25 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
+    schedule = build_retry_schedule(issue_id, next_attempt, previous_retry, metadata)
+
+    case append_run_event(state, schedule.event) do
+      :ok -> finalize_retry_schedule(state, issue_id, schedule)
+      {:error, reason} -> retain_pending_retry(state, issue_id, schedule, reason)
+    end
+  end
+
+  defp build_retry_schedule(issue_id, next_attempt, previous_retry, metadata) do
     delay_ms = retry_delay(next_attempt, metadata)
-    old_timer = Map.get(previous_retry, :timer_ref)
-    retry_token = make_ref()
-    due_at_ms = System.monotonic_time(:millisecond) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
-
-    error =
-      case pick_retry_error(previous_retry, metadata) do
-        nil -> nil
-        value -> ObservabilitySanitizer.retry_error_code(value)
-      end
-
+    error = sanitized_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
     workspace_root = pick_retry_workspace_root(previous_retry, metadata)
+    previous_run_id = metadata[:previous_run_id] || Map.get(previous_retry, :previous_run_id)
+    previous_attempt = Map.get(metadata, :previous_attempt, Map.get(previous_retry, :previous_attempt, 0))
 
-    previous_run_id =
-      Map.get(metadata, :previous_run_id) || Map.get(previous_retry, :previous_run_id)
-
-    previous_attempt =
-      Map.get(metadata, :previous_attempt, Map.get(previous_retry, :previous_attempt, 0))
-
-    retry_event = %{
+    event = %{
       transition: "retry_scheduled",
       stage: "retry_queued",
       run_id: previous_run_id,
@@ -1374,7 +1378,7 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_root: workspace_root
     }
 
-    retry_entry = %{
+    entry = %{
       attempt: next_attempt,
       timer_ref: nil,
       retry_token: nil,
@@ -1386,37 +1390,56 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: worker_host,
       workspace_path: workspace_path,
       workspace_root: workspace_root,
-      pending_event: retry_event,
+      pending_event: event,
       status: :durability_pending
     }
 
-    case append_run_event(state, retry_event) do
-      :ok ->
-        if is_reference(old_timer), do: Process.cancel_timer(old_timer)
-        timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
-        error_suffix = if is_binary(error), do: " error=#{error}", else: ""
+    %{
+      delay_ms: delay_ms,
+      due_at_ms: System.monotonic_time(:millisecond) + delay_ms,
+      entry: entry,
+      event: event,
+      old_timer: Map.get(previous_retry, :timer_ref),
+      retry_token: make_ref()
+    }
+  end
 
-        Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
-
-        scheduled_entry = %{
-          retry_entry
-          | timer_ref: timer_ref,
-            retry_token: retry_token,
-            due_at_ms: due_at_ms,
-            pending_event: nil,
-            status: :scheduled
-        }
-
-        {:ok, put_retry_entry(state, issue_id, scheduled_entry)}
-
-      {:error, reason} ->
-        if is_reference(old_timer), do: Process.cancel_timer(old_timer)
-
-        Logger.error("Failed to append Symphony retry ledger event issue_id=#{issue_id}: #{inspect(reason)}; retaining pending durable retry and claim")
-
-        pending_entry = Map.put(retry_entry, :persistence_error, reason)
-        {:error, put_retry_entry(state, issue_id, pending_entry)}
+  defp sanitized_retry_error(previous_retry, metadata) do
+    case pick_retry_error(previous_retry, metadata) do
+      nil -> nil
+      value -> ObservabilitySanitizer.retry_error_code(value)
     end
+  end
+
+  defp finalize_retry_schedule(state, issue_id, schedule) do
+    if is_reference(schedule.old_timer), do: Process.cancel_timer(schedule.old_timer)
+
+    timer_ref =
+      Process.send_after(self(), {:retry_issue, issue_id, schedule.retry_token}, schedule.delay_ms)
+
+    error_suffix = if is_binary(schedule.entry.error), do: " error=#{schedule.entry.error}", else: ""
+
+    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{schedule.entry.identifier} in #{schedule.delay_ms}ms (attempt #{schedule.entry.attempt})#{error_suffix}")
+
+    scheduled_entry = %{
+      schedule.entry
+      | timer_ref: timer_ref,
+        retry_token: schedule.retry_token,
+        due_at_ms: schedule.due_at_ms,
+        pending_event: nil,
+        status: :scheduled
+    }
+
+    {:ok, put_retry_entry(state, issue_id, scheduled_entry)}
+  end
+
+  defp retain_pending_retry(state, issue_id, schedule, reason) do
+    if is_reference(schedule.old_timer), do: Process.cancel_timer(schedule.old_timer)
+
+    Logger.error("Failed to append Symphony retry ledger event issue_id=#{issue_id}: #{inspect(reason)}; retaining pending durable retry and claim")
+
+    pending_entry = Map.put(schedule.entry, :persistence_error, reason)
+    {:error, put_retry_entry(state, issue_id, pending_entry)}
   end
 
   defp put_retry_entry(state, issue_id, retry_entry) do
@@ -1828,33 +1851,42 @@ defmodule SymphonyElixir.Orchestrator do
         {state, {:error, :run_not_active}}
 
       running_entry ->
-        if runtime_affinity_matches_run?(runtime_info, running_entry) do
-          updated_running_entry =
-            running_entry
-            |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
-            |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
-            |> maybe_put_runtime_value(:workspace_root, runtime_info[:workspace_root])
-            |> maybe_put_runtime_value(:session_title, runtime_info[:session_title])
-
-          event = run_event(updated_running_entry, "run_runtime_ready", "running")
-
-          case append_run_event(state, event) do
-            :ok ->
-              {%{state | running: Map.put(running, issue_id, updated_running_entry)}, :ok}
-
-            {:error, reason} ->
-              Logger.error("Failed to durably acknowledge worker runtime issue_id=#{issue_id}: #{inspect(reason)}")
-              {state, {:error, {:ledger_write_failed, reason}}}
-          end
-        else
-          Logger.warning("Rejecting mismatched worker runtime info issue_id=#{issue_id} run_id=#{inspect(runtime_info[:run_id])}")
-          {state, {:error, :workspace_affinity_mismatch}}
-        end
+        accept_worker_runtime_info_for_run(state, issue_id, running_entry, runtime_info)
     end
   end
 
   defp accept_worker_runtime_info(state, _issue_id, _runtime_info),
     do: {state, {:error, :invalid_runtime_info}}
+
+  defp accept_worker_runtime_info_for_run(state, issue_id, running_entry, runtime_info) do
+    if runtime_affinity_matches_run?(runtime_info, running_entry) do
+      persist_worker_runtime_info(state, issue_id, running_entry, runtime_info)
+    else
+      Logger.warning("Rejecting mismatched worker runtime info issue_id=#{issue_id} run_id=#{inspect(runtime_info[:run_id])}")
+      {state, {:error, :workspace_affinity_mismatch}}
+    end
+  end
+
+  defp persist_worker_runtime_info(state, issue_id, running_entry, runtime_info) do
+    updated_running_entry =
+      running_entry
+      |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
+      |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+      |> maybe_put_runtime_value(:workspace_root, runtime_info[:workspace_root])
+      |> maybe_put_runtime_value(:session_title, runtime_info[:session_title])
+
+    event = run_event(updated_running_entry, "run_runtime_ready", "running")
+
+    case append_run_event(state, event) do
+      :ok ->
+        updated_running = Map.put(state.running, issue_id, updated_running_entry)
+        {%{state | running: updated_running}, :ok}
+
+      {:error, reason} ->
+        Logger.error("Failed to durably acknowledge worker runtime issue_id=#{issue_id}: #{inspect(reason)}")
+        {state, {:error, {:ledger_write_failed, reason}}}
+    end
+  end
 
   defp runtime_affinity_matches_run?(runtime_info, running_entry) do
     runtime_info[:run_id] == running_entry[:run_id] and
@@ -2573,27 +2605,34 @@ defmodule SymphonyElixir.Orchestrator do
         |> retry_schedule_state()
 
       {:stop, cleanup_workspace, retry} ->
-        case retry do
-          %{attempt: attempt, metadata: metadata} ->
-            state
-            |> schedule_issue_retry(issue_id, attempt, metadata)
-            |> retry_schedule_state()
-
-          _other ->
-            state = %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
-
-            if cleanup_workspace do
-              cleanup_entry = cleanup_entry_from_running(issue_id, running_entry)
-
-              state
-              |> put_cleanup_pending(issue_id, cleanup_entry)
-              |> perform_workspace_cleanup(issue_id)
-            else
-              release_issue_claim(state, issue_id)
-            end
-        end
+        apply_terminal_stop(state, issue_id, running_entry, cleanup_workspace, retry)
     end
   end
+
+  defp apply_terminal_stop(state, issue_id, _running_entry, _cleanup_workspace, %{
+         attempt: attempt,
+         metadata: metadata
+       }) do
+    state
+    |> schedule_issue_retry(issue_id, attempt, metadata)
+    |> retry_schedule_state()
+  end
+
+  defp apply_terminal_stop(state, issue_id, running_entry, cleanup_workspace, _retry) do
+    state = %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
+    finish_terminal_stop(state, issue_id, running_entry, cleanup_workspace)
+  end
+
+  defp finish_terminal_stop(state, issue_id, running_entry, true) do
+    cleanup_entry = cleanup_entry_from_running(issue_id, running_entry)
+
+    state
+    |> put_cleanup_pending(issue_id, cleanup_entry)
+    |> perform_workspace_cleanup(issue_id)
+  end
+
+  defp finish_terminal_stop(state, issue_id, _running_entry, false),
+    do: release_issue_claim(state, issue_id)
 
   defp record_run_event(%State{} = state, running_entry, transition, stage, extra \\ [])
        when is_map(running_entry) and is_binary(transition) and is_binary(stage) do

@@ -161,7 +161,12 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
          rate_limits: nil
        }}
 
-    Snapshot.assert_dashboard_snapshot!("parked_wait", render_snapshot(snapshot_data, 0.0))
+    rendered = render_snapshot(snapshot_data, 0.0)
+
+    Snapshot.assert_snapshot!(
+      "status_dashboard_snapshots/parked_wait.snapshot.txt",
+      Snapshot.escape_ansi(rendered)
+    )
   end
 
   test "backoff queue row exposes only a categorical error code" do

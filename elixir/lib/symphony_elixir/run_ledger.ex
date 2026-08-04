@@ -796,13 +796,7 @@ defmodule SymphonyElixir.RunLedger do
     action = event["next_action"]
     next_attempt = event["next_attempt"]
 
-    allowed_actions =
-      case transition do
-        "run_completed" -> ["continuation"]
-        "run_failed" -> ["retry"]
-        "run_interrupted" -> ["retry"]
-        "run_stopped" -> ["none", "retry"]
-      end
+    allowed_actions = allowed_next_actions(transition)
 
     cond do
       is_nil(action) ->
@@ -825,6 +819,11 @@ defmodule SymphonyElixir.RunLedger do
   defp validate_next_action(event) do
     if is_nil(event["next_action"]), do: :ok, else: {:error, {:invalid_field, "next_action"}}
   end
+
+  defp allowed_next_actions("run_completed"), do: ["continuation"]
+  defp allowed_next_actions("run_failed"), do: ["retry"]
+  defp allowed_next_actions("run_interrupted"), do: ["retry"]
+  defp allowed_next_actions("run_stopped"), do: ["none", "retry"]
 
   defp validate_event_fields(event) do
     if event |> Map.keys() |> MapSet.new() |> MapSet.subset?(@persisted_fields) do
