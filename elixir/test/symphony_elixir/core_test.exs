@@ -2430,6 +2430,236 @@ defmodule SymphonyElixir.CoreTest do
     assert Enum.count(recovered_events, &(&1["transition"] == "operator_command_applied")) == 1
   end
 
+  test "pending reject command is suppressed across polls and later comments" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"],
+      poll_interval_ms: 60_000
+    )
+
+    ledger_path = ledger_path("pending-reject-command")
+    issue_id = "issue-pending-reject-command"
+    cursor_at = ~U[2026-08-03 11:00:00Z]
+    command_at = ~U[2026-08-03 11:00:01Z]
+    later_at = ~U[2026-08-03 11:00:02Z]
+
+    assert {:ok, wait} =
+             SymphonyElixir.OperatorWait.new("waiting_secret", %{
+               issue_id: issue_id,
+               identifier: "MT-PENDING-REJECT",
+               run_id: "run-pending-reject",
+               parked_at: cursor_at
+             })
+
+    seed_parked_ledger!(ledger_path, wait)
+
+    command = %SymphonyElixir.Linear.Comment{
+      id: "comment-pending-reject",
+      body: "$reject",
+      created_at: command_at,
+      author_id: "operator-1"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue_id => [command]})
+
+    assert Config.settings!().tracker.operator_user_ids == ["operator-1"]
+    assert {:ok, [^command]} = Tracker.fetch_comments_since(issue_id, cursor_at)
+
+    append_fn = fn path, event ->
+      if event.transition == "operator_command_applied",
+        do: {:error, :forced_operator_outcome_failure},
+        else: RunLedger.append(path, event)
+    end
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 60_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: append_fn,
+      runner_generation: "runner-pending-reject",
+      dispatch_paused: true,
+      parked: %{issue_id => wait},
+      operator_comment_cursors: %{
+        issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    first_failed = Orchestrator.run_poll_cycle_for_test(state)
+    assert Map.has_key?(first_failed.pending_operator_outcomes, command.id)
+
+    second_failed = Orchestrator.run_poll_cycle_for_test(first_failed)
+
+    later_comment = %SymphonyElixir.Linear.Comment{
+      id: "comment-after-pending-reject",
+      body: "ordinary operator note",
+      created_at: later_at,
+      author_id: "operator-1"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue_id => [command, later_comment]
+    })
+
+    advanced_state = Orchestrator.run_poll_cycle_for_test(second_failed)
+
+    if is_reference(advanced_state.tick_timer_ref),
+      do: Process.cancel_timer(advanced_state.tick_timer_ref)
+
+    assert Map.has_key?(advanced_state.pending_operator_outcomes, command.id)
+    refute MapSet.member?(advanced_state.processed_operator_comment_ids, command.id)
+
+    assert %{created_at: ^later_at, comment_ids: later_comment_ids} =
+             advanced_state.operator_comment_cursors[issue_id]
+
+    assert MapSet.member?(later_comment_ids, later_comment.id)
+
+    assert {:ok, pending_events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(pending_events, &(&1["transition"] == "wait_rejected")) == 1
+    assert Enum.count(pending_events, &(&1["transition"] == "operator_command_applied")) == 0
+
+    completed_state =
+      advanced_state
+      |> Map.put(:run_ledger_append_fn, &RunLedger.append/2)
+      |> Orchestrator.retry_pending_operator_outcomes_for_test()
+
+    assert completed_state.pending_operator_outcomes == %{}
+    assert MapSet.member?(completed_state.processed_operator_comment_ids, command.id)
+    assert completed_state.operator_comment_cursors[issue_id].created_at == later_at
+
+    assert {:ok, completed_events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(completed_events, &(&1["transition"] == "wait_rejected")) == 1
+    assert Enum.count(completed_events, &(&1["transition"] == "operator_command_applied")) == 1
+  end
+
+  test "pending stop command cannot be reclassified as rejected" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"],
+      poll_interval_ms: 60_000
+    )
+
+    ledger_path = ledger_path("pending-stop-command")
+    issue_id = "issue-pending-stop-command"
+    cursor_at = ~U[2026-08-03 12:00:00Z]
+    command_at = ~U[2026-08-03 12:00:01Z]
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-PENDING-STOP",
+      title: "Do not reclassify the stop",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    command = %SymphonyElixir.Linear.Comment{
+      id: "comment-pending-stop",
+      body: "$stop",
+      created_at: command_at,
+      author_id: "operator-1"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue_id => [command]})
+
+    assert Config.settings!().tracker.operator_user_ids == ["operator-1"]
+    assert {:ok, [^command]} = Tracker.fetch_comments_since(issue_id, cursor_at)
+
+    assert {:ok, wait} =
+             SymphonyElixir.OperatorWait.new("operator_stopped", %{
+               issue_id: issue_id,
+               identifier: issue.identifier,
+               run_id: "run-pending-stop",
+               attempt: 0,
+               tracker_state: issue.state,
+               terminal_reason: "operator_stop",
+               parked_at: cursor_at
+             })
+
+    seed_running_ledger!(ledger_path, %{
+      run_id: wait.run_id,
+      retry_attempt: wait.attempt,
+      identifier: wait.identifier,
+      issue: issue
+    })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "run_parked",
+               stage: "parked",
+               run_id: wait.run_id,
+               issue_id: wait.issue_id,
+               issue_identifier: wait.identifier,
+               attempt: wait.attempt,
+               wait_id: wait.wait_id,
+               parked_reason: wait.reason,
+               allowed_actions: wait.allowed_actions,
+               tracker_state: wait.tracker_state,
+               terminal_reason: wait.terminal_reason,
+               comment_id: command.id,
+               comment_created_at: DateTime.to_iso8601(command.created_at),
+               operator_command: "stop"
+             })
+
+    append_fn = fn path, event ->
+      if event.transition == "operator_command_applied",
+        do: {:error, :forced_operator_outcome_failure},
+        else: RunLedger.append(path, event)
+    end
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 60_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: append_fn,
+      runner_generation: "runner-pending-stop",
+      dispatch_paused: true,
+      parked: %{issue_id => wait},
+      pending_operator_outcomes: %{
+        command.id => %{
+          transition: "operator_command_applied",
+          issue_id: issue_id,
+          comment_id: command.id,
+          comment_created_at: command.created_at,
+          operator_command: "stop"
+        }
+      },
+      operator_comment_cursors: %{
+        issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    first_failed = Orchestrator.run_poll_cycle_for_test(state)
+    assert Map.has_key?(first_failed.pending_operator_outcomes, command.id)
+
+    second_failed = Orchestrator.run_poll_cycle_for_test(first_failed)
+
+    if is_reference(second_failed.tick_timer_ref),
+      do: Process.cancel_timer(second_failed.tick_timer_ref)
+
+    assert Map.has_key?(second_failed.pending_operator_outcomes, command.id)
+    assert Map.has_key?(second_failed.parked, issue_id)
+
+    assert {:ok, pending_events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(pending_events, &(&1["transition"] == "run_parked")) == 1
+    assert Enum.count(pending_events, &(&1["transition"] == "operator_command_applied")) == 0
+    assert Enum.count(pending_events, &(&1["transition"] == "operator_command_rejected")) == 0
+
+    completed_state =
+      second_failed
+      |> Map.put(:run_ledger_append_fn, &RunLedger.append/2)
+      |> Orchestrator.retry_pending_operator_outcomes_for_test()
+
+    assert completed_state.pending_operator_outcomes == %{}
+
+    assert {:ok, completed_events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(completed_events, &(&1["transition"] == "run_parked")) == 1
+    assert Enum.count(completed_events, &(&1["transition"] == "operator_command_applied")) == 1
+    assert Enum.count(completed_events, &(&1["transition"] == "operator_command_rejected")) == 0
+  end
+
   test "first operator cursor does not execute historical comments for recovered waits" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",

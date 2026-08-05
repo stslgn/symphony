@@ -3439,6 +3439,9 @@ defmodule SymphonyElixir.Orchestrator do
         {:processed, updated_state} ->
           advance_operator_cursor_in_memory(updated_state, issue_id, created_at, comment_id)
 
+        {:pending, updated_state} ->
+          updated_state
+
         {:command, updated_state} ->
           updated_state
       end
@@ -3464,12 +3467,34 @@ defmodule SymphonyElixir.Orchestrator do
          comment,
          operator_user_ids
        ) do
-    if MapSet.member?(state.processed_operator_comment_ids, comment.id) do
-      {:processed, state}
-    else
-      parse_and_apply_operator_comment(state, issue_id, comment, operator_user_ids)
+    cond do
+      Map.has_key?(state.pending_operator_outcomes, comment.id) ->
+        log_pending_operator_comment_identity(state, issue_id, comment)
+        {:pending, state}
+
+      MapSet.member?(state.processed_operator_comment_ids, comment.id) ->
+        {:processed, state}
+
+      true ->
+        parse_and_apply_operator_comment(state, issue_id, comment, operator_user_ids)
     end
   end
+
+  defp log_pending_operator_comment_identity(state, issue_id, comment) do
+    pending = state.pending_operator_outcomes[comment.id]
+
+    unless pending_operator_comment_identity_matches?(pending, issue_id, comment.created_at) do
+      Logger.warning("Suppressing refetched pending operator comment with mismatched identity issue_id=#{issue_id} comment_id=#{comment.id}")
+    end
+  end
+
+  defp pending_operator_comment_identity_matches?(pending, issue_id, %DateTime{} = created_at)
+       when is_map(pending) do
+    pending.issue_id == issue_id and
+      DateTime.compare(pending.comment_created_at, created_at) == :eq
+  end
+
+  defp pending_operator_comment_identity_matches?(_pending, _issue_id, _created_at), do: false
 
   defp parse_and_apply_operator_comment(state, issue_id, comment, operator_user_ids) do
     case OperatorCommand.parse_comment(comment, operator_user_ids) do
@@ -3592,14 +3617,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp persist_operator_command_outcome(%State{} = state, outcome) do
-    event = %{
-      transition: outcome.transition,
-      stage: "operator",
-      issue_id: outcome.issue_id,
-      comment_id: outcome.comment_id,
-      comment_created_at: DateTime.to_iso8601(outcome.comment_created_at),
-      operator_command: outcome.operator_command
-    }
+    case validate_pending_operator_outcome(state, outcome) do
+      :ok -> do_persist_operator_command_outcome(state, outcome)
+      {:error, reason} -> reject_mismatched_operator_outcome(state, outcome, reason)
+    end
+  end
+
+  defp do_persist_operator_command_outcome(%State{} = state, outcome) do
+    event = operator_command_outcome_event(outcome)
 
     case append_run_event(state, event) do
       :ok ->
@@ -3623,6 +3648,41 @@ defmodule SymphonyElixir.Orchestrator do
 
         state
     end
+  end
+
+  defp operator_command_outcome_event(outcome) do
+    %{
+      transition: outcome.transition,
+      stage: "operator",
+      issue_id: outcome.issue_id,
+      comment_id: outcome.comment_id,
+      comment_created_at: DateTime.to_iso8601(outcome.comment_created_at),
+      operator_command: outcome.operator_command
+    }
+  end
+
+  defp validate_pending_operator_outcome(state, outcome) do
+    case Map.get(state.pending_operator_outcomes, outcome.comment_id) do
+      nil ->
+        :ok
+
+      pending ->
+        if pending_operator_outcomes_match?(pending, outcome),
+          do: :ok,
+          else: {:error, :pending_operator_outcome_mismatch}
+    end
+  end
+
+  defp pending_operator_outcomes_match?(pending, outcome) do
+    pending.transition == outcome.transition and
+      pending.issue_id == outcome.issue_id and
+      pending.operator_command == outcome.operator_command and
+      DateTime.compare(pending.comment_created_at, outcome.comment_created_at) == :eq
+  end
+
+  defp reject_mismatched_operator_outcome(state, outcome, reason) do
+    Logger.error("Refusing mismatched operator outcome issue_id=#{outcome.issue_id} comment_id=#{outcome.comment_id}: #{inspect(reason)}")
+    state
   end
 
   defp retry_pending_operator_outcomes(%State{} = state) do
