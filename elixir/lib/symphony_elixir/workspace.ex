@@ -657,20 +657,6 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp validate_workspace_path(workspace, worker_host)
-       when is_binary(workspace) and is_binary(worker_host) do
-    cond do
-      String.trim(workspace) == "" ->
-        {:error, {:workspace_path_unreadable, workspace, :empty}}
-
-      String.contains?(workspace, ["\n", "\r", <<0>>]) ->
-        {:error, {:workspace_path_unreadable, workspace, :invalid_characters}}
-
-      true ->
-        :ok
-    end
-  end
-
   defp validate_path_against_root(workspace, root, nil)
        when is_binary(workspace) and is_binary(root) do
     with {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace),
