@@ -2903,6 +2903,11 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, []} = Client.fetch_issues_by_states([])
   end
 
+  test "candidate revalidation rejects invalid tracker collections" do
+    assert {:error, :invalid_candidate_collection} =
+             Orchestrator.revalidate_poll_candidates_for_test(%{unexpected: "shape"})
+  end
+
   test "prompt builder renders issue and attempt values from workflow template" do
     workflow_prompt =
       "Ticket {{ issue.identifier }} {{ issue.title }} labels={{ issue.labels }} attempt={{ attempt }}"

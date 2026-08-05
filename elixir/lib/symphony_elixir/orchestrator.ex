@@ -565,7 +565,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp revalidate_poll_candidates(issues) do
+  defp revalidate_poll_candidates(issues) when is_list(issues) do
     issue_ids =
       Enum.flat_map(issues, fn
         %Issue{id: issue_id} when is_binary(issue_id) -> [issue_id]
@@ -574,6 +574,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     fetch_issue_states(issue_ids)
   end
+
+  defp revalidate_poll_candidates(_issues), do: {:error, :invalid_candidate_collection}
 
   defp apply_poll_result(%State{} = state, %{request: request} = result) when is_map(request) do
     state
@@ -769,6 +771,12 @@ defmodule SymphonyElixir.Orchestrator do
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
       when is_function(issue_fetcher, 1) do
     revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set())
+  end
+
+  @doc false
+  @spec revalidate_poll_candidates_for_test(term()) :: {:ok, [term()]} | {:error, term()}
+  def revalidate_poll_candidates_for_test(issues) do
+    revalidate_poll_candidates(issues)
   end
 
   @doc false
