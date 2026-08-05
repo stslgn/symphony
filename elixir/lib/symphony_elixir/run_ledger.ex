@@ -1268,9 +1268,6 @@ defmodule SymphonyElixir.RunLedger do
   defp require_unresolved_model(%{model_resolution: nil}), do: :ok
   defp require_unresolved_model(_run), do: {:error, :duplicate_model_resolution}
 
-  defp maybe_record_operator_action_context(state, %{"comment_id" => nil}),
-    do: {:ok, state}
-
   defp maybe_record_operator_action_context(state, %{"comment_id" => comment_id} = event)
        when is_binary(comment_id) do
     if Map.has_key?(state.operator_commands, comment_id) do
