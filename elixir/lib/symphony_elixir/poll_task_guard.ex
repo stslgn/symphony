@@ -50,12 +50,15 @@ defmodule SymphonyElixir.PollTaskGuard do
   end
 
   defp guard_loop(owner, owner_ref, registry_key, generation, task, task_result) do
+    task_ref = task.ref
+    task_pid = task.pid
+
     receive do
-      {ref, result} when ref == task.ref ->
+      {^task_ref, result} ->
         guard_loop(owner, owner_ref, registry_key, generation, task, {:ok, result})
 
-      {:DOWN, ref, :process, pid, reason} when ref == task.ref and pid == task.pid ->
-        Process.unlink(task.pid)
+      {:DOWN, ^task_ref, :process, ^task_pid, reason} ->
+        Process.unlink(task_pid)
         Process.demonitor(owner_ref, [:flush])
         Registry.unregister(@registry, registry_key)
         report_worker_completion(owner, generation, task_result, reason)
@@ -89,23 +92,28 @@ defmodule SymphonyElixir.PollTaskGuard do
   end
 
   defp stop_worker(task) do
-    _result = Task.Supervisor.terminate_child(@task_supervisor, task.pid)
+    task_ref = task.ref
+    task_pid = task.pid
+    _result = Task.Supervisor.terminate_child(@task_supervisor, task_pid)
 
     receive do
-      {:DOWN, ref, :process, pid, _reason} when ref == task.ref and pid == task.pid ->
-        Process.unlink(task.pid)
+      {:DOWN, ^task_ref, :process, ^task_pid, _reason} ->
+        Process.unlink(task_pid)
         :ok
     after
       @worker_stop_timeout_ms ->
-        Process.exit(task.pid, :kill)
+        Process.exit(task_pid, :kill)
         await_forced_worker_stop(task)
     end
   end
 
   defp await_forced_worker_stop(task) do
+    task_ref = task.ref
+    task_pid = task.pid
+
     receive do
-      {:DOWN, ref, :process, pid, _reason} when ref == task.ref and pid == task.pid ->
-        Process.unlink(task.pid)
+      {:DOWN, ^task_ref, :process, ^task_pid, _reason} ->
+        Process.unlink(task_pid)
         :ok
     end
   end
