@@ -875,6 +875,91 @@ defmodule SymphonyElixir.RunLedgerTest do
              RunLedger.append(invalid_path, partial_context_event)
   end
 
+  test "ordered validation rejects duplicate model resolution" do
+    path = ledger_path()
+    run_id = "run-duplicate-model"
+    issue_id = "issue-duplicate-model"
+
+    assert :ok = append_claim!(path, run_id, issue_id, "DUD-DUPLICATE-MODEL", 0)
+    assert :ok = append_started!(path, run_id, issue_id, "DUD-DUPLICATE-MODEL", 0)
+
+    model_event = %{
+      transition: "model_resolved",
+      stage: "running",
+      run_id: run_id,
+      issue_id: issue_id,
+      issue_identifier: "DUD-DUPLICATE-MODEL",
+      attempt: 0,
+      resolved_model: "gpt-live",
+      reasoning_effort: "high",
+      model_catalog_source: "live"
+    }
+
+    assert :ok = RunLedger.append(path, model_event)
+    assert :ok = RunLedger.append(path, model_event)
+
+    assert {:error, {:invalid_ledger_record, 4, {:invalid_transition_sequence, "model_resolved", :duplicate_model_resolution}}} = RunLedger.read_events(path)
+  end
+
+  test "ordered validation rejects duplicate operator actions and outcomes" do
+    action_path = ledger_path()
+    action = append_context_operator_action!(action_path, "duplicate-action")
+    assert :ok = RunLedger.append(action_path, action)
+
+    assert {:error, {:invalid_ledger_record, 5, {:invalid_transition_sequence, "wait_rejected", :duplicate_operator_action}}} =
+             RunLedger.read_events(action_path)
+
+    outcome_path = ledger_path()
+    outcome_action = append_context_operator_action!(outcome_path, "duplicate-outcome")
+    outcome = operator_outcome_event(outcome_action, "operator_command_applied")
+    assert :ok = RunLedger.append(outcome_path, outcome)
+    assert :ok = RunLedger.append(outcome_path, outcome)
+
+    assert {:error, {:invalid_ledger_record, 6, {:invalid_transition_sequence, "operator_command_applied", :duplicate_operator_outcome}}} = RunLedger.read_events(outcome_path)
+  end
+
+  test "ordered validation correlates operator outcome identity and decision" do
+    mismatches = [
+      {:issue_id, "wrong-issue", "operator_command_applied", :operator_command_identity_mismatch},
+      {:comment_created_at, "2026-08-03T10:01:00.000Z", "operator_command_applied", :operator_command_identity_mismatch},
+      {:operator_command, "retry", "operator_command_applied", :operator_command_identity_mismatch},
+      {:transition, nil, "operator_command_rejected", :operator_command_outcome_mismatch}
+    ]
+
+    Enum.with_index(mismatches, 1)
+    |> Enum.each(fn {{field, value, transition, expected_reason}, index} ->
+      path = ledger_path()
+      action = append_context_operator_action!(path, "mismatch-#{index}")
+
+      outcome =
+        action
+        |> operator_outcome_event(transition)
+        |> maybe_override_operator_outcome(field, value)
+
+      assert :ok = RunLedger.append(path, outcome)
+
+      assert {:error, {:invalid_ledger_record, 5, {:invalid_transition_sequence, ^transition, ^expected_reason}}} =
+               RunLedger.read_events(path)
+    end)
+  end
+
+  test "ordered validation keeps one legacy outcome-only record compatible" do
+    path = ledger_path()
+
+    legacy_outcome = %{
+      transition: "operator_command_rejected",
+      stage: "operator",
+      issue_id: "issue-legacy-outcome",
+      comment_id: "comment-legacy-outcome",
+      comment_created_at: "2026-08-03T10:00:00.000Z",
+      operator_command: "retry",
+      runner_generation: "runner-legacy-outcome"
+    }
+
+    assert :ok = RunLedger.append(path, legacy_outcome)
+    assert {:ok, [_event]} = RunLedger.read_events(path)
+  end
+
   test "returns filesystem read and create errors" do
     assert {:ok, []} = RunLedger.read_events(ledger_path())
 
@@ -1349,6 +1434,40 @@ defmodule SymphonyElixir.RunLedgerTest do
       allowed_actions: ["approve", "reject"]
     }
   end
+
+  defp append_context_operator_action!(path, tag) do
+    run_id = "run-operator-#{tag}"
+    issue_id = "issue-operator-#{tag}"
+    append_parked_run!(path, run_id, issue_id)
+
+    action =
+      run_id
+      |> valid_parked_event(issue_id)
+      |> Map.merge(%{
+        transition: "wait_rejected",
+        comment_id: "comment-operator-#{tag}",
+        comment_created_at: "2026-08-03T10:00:00.000Z",
+        operator_command: "reject"
+      })
+
+    assert :ok = RunLedger.append(path, action)
+    action
+  end
+
+  defp operator_outcome_event(action, transition) do
+    %{
+      transition: transition,
+      stage: "operator",
+      issue_id: action.issue_id,
+      comment_id: action.comment_id,
+      comment_created_at: action.comment_created_at,
+      operator_command: action.operator_command,
+      runner_generation: "runner-operator-validation"
+    }
+  end
+
+  defp maybe_override_operator_outcome(event, :transition, _value), do: event
+  defp maybe_override_operator_outcome(event, field, value), do: Map.put(event, field, value)
 
   defp append_claim!(path, run_id, issue_id, issue_identifier, attempt, opts \\ []) do
     RunLedger.append(path, %{

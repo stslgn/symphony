@@ -1006,16 +1006,19 @@ defmodule SymphonyElixir.RunLedger do
   defp validate_ordered_events(events) do
     events
     |> Enum.with_index(1)
-    |> Enum.reduce_while({:ok, %{runs: %{}, waits: %{}, dispatches: %{}}}, fn {event, line}, {:ok, state} ->
-      case validate_ordered_event(event, state) do
-        {:ok, next_state} ->
-          {:cont, {:ok, next_state}}
+    |> Enum.reduce_while(
+      {:ok, %{runs: %{}, waits: %{}, dispatches: %{}, operator_commands: %{}}},
+      fn {event, line}, {:ok, state} ->
+        case validate_ordered_event(event, state) do
+          {:ok, next_state} ->
+            {:cont, {:ok, next_state}}
 
-        {:error, reason} ->
-          transition = event["transition"]
-          {:halt, {:error, {:invalid_ledger_record, line, {:invalid_transition_sequence, transition, reason}}}}
+          {:error, reason} ->
+            transition = event["transition"]
+            {:halt, {:error, {:invalid_ledger_record, line, {:invalid_transition_sequence, transition, reason}}}}
+        end
       end
-    end)
+    )
     |> case do
       {:ok, _state} -> :ok
       {:error, reason} -> {:error, reason}
@@ -1042,6 +1045,7 @@ defmodule SymphonyElixir.RunLedger do
               terminal: nil,
               terminal_reason: nil,
               dispatch_intent: nil,
+              model_resolution: nil,
               retry_event: nil,
               cleanup_intent: false,
               cleanup_requested: nil,
@@ -1066,12 +1070,26 @@ defmodule SymphonyElixir.RunLedger do
     end
   end
 
-  defp validate_ordered_event(%{"transition" => transition} = event, state)
-       when transition in ["run_runtime_ready", "model_resolved"] do
+  defp validate_ordered_event(%{"transition" => "run_runtime_ready"} = event, state) do
     with {:ok, run} <- fetch_run(state, event),
          :ok <- require_phase(run, [:started]),
          {:ok, run} <- merge_run_affinity(run, event) do
       {:ok, put_run(state, event["run_id"], run)}
+    end
+  end
+
+  defp validate_ordered_event(%{"transition" => "model_resolved"} = event, state) do
+    with {:ok, run} <- fetch_run(state, event),
+         :ok <- require_phase(run, [:started]),
+         :ok <- require_unresolved_model(run),
+         {:ok, run} <- merge_run_affinity(run, event) do
+      resolution = %{
+        resolved_model: event["resolved_model"],
+        reasoning_effort: event["reasoning_effort"],
+        model_catalog_source: event["model_catalog_source"]
+      }
+
+      {:ok, put_run(state, event["run_id"], %{run | model_resolution: resolution})}
     end
   end
 
@@ -1082,10 +1100,10 @@ defmodule SymphonyElixir.RunLedger do
          :ok <- ensure_wait_available(state.waits, event) do
       wait = wait_identity(event)
 
-      {:ok,
-       state
-       |> put_run(event["run_id"], %{run | phase: :terminal, terminal: "run_parked"})
-       |> Map.update!(:waits, &Map.put(&1, event["issue_id"], wait))}
+      state
+      |> put_run(event["run_id"], %{run | phase: :terminal, terminal: "run_parked"})
+      |> Map.update!(:waits, &Map.put(&1, event["issue_id"], wait))
+      |> maybe_record_operator_action_context(event)
     end
   end
 
@@ -1153,23 +1171,29 @@ defmodule SymphonyElixir.RunLedger do
     with {:ok, wait} <- fetch_wait(state.waits, event),
          :ok <- validate_wait_identity(wait, event),
          :ok <- validate_wait_attempt(wait, event) do
-      case transition do
-        transition when transition in ["wait_resumed", "resume_queued"] ->
-          {:ok,
-           state
-           |> Map.update!(:waits, &Map.delete(&1, event["issue_id"]))
-           |> put_dispatch(event, event["attempt"])}
+      next_state =
+        case transition do
+          transition when transition in ["wait_resumed", "resume_queued"] ->
+            state
+            |> Map.update!(:waits, &Map.delete(&1, event["issue_id"]))
+            |> put_dispatch(event, event["attempt"])
 
-        "wait_released" ->
-          {:ok,
-           state
-           |> Map.update!(:waits, &Map.delete(&1, event["issue_id"]))
-           |> maybe_record_wait_cleanup_intent(wait, event)}
+          "wait_released" ->
+            state
+            |> Map.update!(:waits, &Map.delete(&1, event["issue_id"]))
+            |> maybe_record_wait_cleanup_intent(wait, event)
 
-        "wait_rejected" ->
-          {:ok, state}
-      end
+          "wait_rejected" ->
+            state
+        end
+
+      maybe_record_operator_action_context(next_state, event)
     end
+  end
+
+  defp validate_ordered_event(%{"transition" => transition} = event, state)
+       when transition in ["operator_command_applied", "operator_command_rejected"] do
+    record_operator_command_outcome(state, event)
   end
 
   defp validate_ordered_event(_event, state), do: {:ok, state}
@@ -1241,6 +1265,88 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp require_phase(_run, _phases), do: {:error, :illegal_predecessor}
+
+  defp require_unresolved_model(%{model_resolution: nil}), do: :ok
+  defp require_unresolved_model(_run), do: {:error, :duplicate_model_resolution}
+
+  defp maybe_record_operator_action_context(state, %{"comment_id" => nil}),
+    do: {:ok, state}
+
+  defp maybe_record_operator_action_context(state, %{"comment_id" => comment_id} = event)
+       when is_binary(comment_id) do
+    if Map.has_key?(state.operator_commands, comment_id) do
+      {:error, :duplicate_operator_action}
+    else
+      command =
+        event
+        |> operator_command_identity()
+        |> Map.merge(%{
+          action_transition: event["transition"],
+          expected_outcome: "operator_command_applied",
+          outcome: nil
+        })
+
+      {:ok, Map.update!(state, :operator_commands, &Map.put(&1, comment_id, command))}
+    end
+  end
+
+  defp maybe_record_operator_action_context(state, _event), do: {:ok, state}
+
+  defp record_operator_command_outcome(state, event) do
+    comment_id = event["comment_id"]
+
+    case Map.get(state.operator_commands, comment_id) do
+      nil ->
+        command =
+          event
+          |> operator_command_identity()
+          |> Map.merge(%{
+            action_transition: nil,
+            expected_outcome: event["transition"],
+            outcome: event["transition"]
+          })
+
+        {:ok, Map.update!(state, :operator_commands, &Map.put(&1, comment_id, command))}
+
+      %{outcome: outcome} when is_binary(outcome) ->
+        {:error, :duplicate_operator_outcome}
+
+      command ->
+        with :ok <- validate_operator_command_identity(command, event),
+             :ok <- validate_operator_command_outcome(command, event) do
+          updated_command = %{command | outcome: event["transition"]}
+
+          {:ok,
+           Map.update!(state, :operator_commands, fn commands ->
+             Map.put(commands, comment_id, updated_command)
+           end)}
+        end
+    end
+  end
+
+  defp operator_command_identity(event) do
+    %{
+      issue_id: event["issue_id"],
+      comment_id: event["comment_id"],
+      comment_created_at: event["comment_created_at"],
+      operator_command: event["operator_command"]
+    }
+  end
+
+  defp validate_operator_command_identity(command, event) do
+    if Map.take(command, [:issue_id, :comment_id, :comment_created_at, :operator_command]) ==
+         operator_command_identity(event) do
+      :ok
+    else
+      {:error, :operator_command_identity_mismatch}
+    end
+  end
+
+  defp validate_operator_command_outcome(command, event) do
+    if command.expected_outcome == event["transition"],
+      do: :ok,
+      else: {:error, :operator_command_outcome_mismatch}
+  end
 
   defp require_terminal(%{phase: :terminal, terminal: terminal}) when is_binary(terminal), do: :ok
   defp require_terminal(_run), do: {:error, :illegal_predecessor}
