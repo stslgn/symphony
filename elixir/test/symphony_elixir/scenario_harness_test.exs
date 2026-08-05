@@ -308,6 +308,62 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
     end
   end
 
+  test "consistency check rejects duplicate issue ids inside retrying" do
+    root = scenario_root("duplicate-retrying")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: Path.join(root, "workspaces"),
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    harness =
+      ScenarioHarness.start!(
+        Module.concat(__MODULE__, :DuplicateRetryRunner),
+        Path.join(root, "run-ledger.jsonl")
+      )
+
+    try do
+      ScenarioHarness.await_poll_idle(harness)
+      issue_id = "issue-duplicate-retrying"
+
+      :sys.replace_state(harness.pid, fn state ->
+        %{
+          state
+          | retry_attempts: %{
+              issue_id => %{
+                attempt: 2,
+                status: :durability_pending,
+                due_at_ms: nil,
+                identifier: "SCN-DUP",
+                previous_run_id: "run-duplicate-retry"
+              }
+            },
+            queued_resumes: %{
+              issue_id => %{
+                issue_id: issue_id,
+                identifier: "SCN-DUP",
+                run_id: "run-duplicate-resume",
+                wait_id: "wait-duplicate-resume",
+                attempt: 2,
+                stage: "resume_queued",
+                queued_at: DateTime.utc_now()
+              }
+            }
+        }
+      end)
+
+      assert_raise ExUnit.AssertionError, ~r/duplicate issue ids in retrying/, fn ->
+        ScenarioHarness.assert_consistent!(harness)
+      end
+    after
+      ScenarioHarness.stop(harness)
+    end
+  end
+
   defp scenario_root(name) do
     Path.join(
       System.tmp_dir!(),

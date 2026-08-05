@@ -169,6 +169,10 @@ defmodule SymphonyElixir.ScenarioHarness do
     snapshot = Orchestrator.snapshot(harness.name, 1_000)
     assert is_map(snapshot)
 
+    assert_unique_issue_ids!(snapshot.running, "running")
+    assert_unique_issue_ids!(snapshot.parked, "parked")
+    assert_unique_issue_ids!(snapshot.retrying, "retrying")
+
     running_ids = ids(snapshot.running)
     parked_ids = ids(snapshot.parked)
     retrying_ids = ids(snapshot.retrying)
@@ -245,6 +249,20 @@ defmodule SymphonyElixir.ScenarioHarness do
     entries
     |> Enum.map(& &1.issue_id)
     |> MapSet.new()
+  end
+
+  defp assert_unique_issue_ids!(entries, location) do
+    issue_ids = Enum.map(entries, & &1.issue_id)
+
+    duplicates =
+      issue_ids
+      |> Enum.frequencies()
+      |> Enum.filter(fn {_issue_id, count} -> count > 1 end)
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.sort()
+
+    assert duplicates == [],
+           "duplicate issue ids in #{location}: #{Enum.join(duplicates, ", ")}"
   end
 
   defp count_transition(events, transition) do
