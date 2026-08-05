@@ -898,7 +898,11 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert :ok = RunLedger.append(path, model_event)
     assert :ok = RunLedger.append(path, model_event)
 
-    assert {:error, {:invalid_ledger_record, 4, {:invalid_transition_sequence, "model_resolved", :duplicate_model_resolution}}} = RunLedger.read_events(path)
+    assert {:error, {:invalid_ledger_record, 4, sequence_error}} =
+             RunLedger.read_events(path)
+
+    assert sequence_error ==
+             {:invalid_transition_sequence, "model_resolved", :duplicate_model_resolution}
   end
 
   test "ordered validation rejects duplicate operator actions and outcomes" do
@@ -906,8 +910,11 @@ defmodule SymphonyElixir.RunLedgerTest do
     action = append_context_operator_action!(action_path, "duplicate-action")
     assert :ok = RunLedger.append(action_path, action)
 
-    assert {:error, {:invalid_ledger_record, 5, {:invalid_transition_sequence, "wait_rejected", :duplicate_operator_action}}} =
+    assert {:error, {:invalid_ledger_record, 5, sequence_error}} =
              RunLedger.read_events(action_path)
+
+    assert sequence_error ==
+             {:invalid_transition_sequence, "wait_rejected", :duplicate_operator_action}
 
     outcome_path = ledger_path()
     outcome_action = append_context_operator_action!(outcome_path, "duplicate-outcome")
@@ -915,7 +922,11 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert :ok = RunLedger.append(outcome_path, outcome)
     assert :ok = RunLedger.append(outcome_path, outcome)
 
-    assert {:error, {:invalid_ledger_record, 6, {:invalid_transition_sequence, "operator_command_applied", :duplicate_operator_outcome}}} = RunLedger.read_events(outcome_path)
+    assert {:error, {:invalid_ledger_record, 6, sequence_error}} =
+             RunLedger.read_events(outcome_path)
+
+    assert sequence_error ==
+             {:invalid_transition_sequence, "operator_command_applied", :duplicate_operator_outcome}
   end
 
   test "ordered validation correlates operator outcome identity and decision" do

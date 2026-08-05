@@ -845,9 +845,8 @@ defmodule SymphonyElixir.RunLedger do
         :ok
 
       ^fields ->
-        with :ok <- validate_required_strings(event, fields),
-             :ok <- validate_timestamp_field(event, "comment_created_at") do
-          :ok
+        with :ok <- validate_required_strings(event, fields) do
+          validate_timestamp_field(event, "comment_created_at")
         end
 
       _partial ->

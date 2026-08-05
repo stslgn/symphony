@@ -40,6 +40,12 @@ defmodule SymphonyElixir.Orchestrator do
     seconds_running: 0
   }
 
+  defmodule OperatorCommandState do
+    @moduledoc false
+
+    defstruct processed_comment_ids: MapSet.new(), pending_outcomes: %{}
+  end
+
   defmodule State do
     @moduledoc """
     Runtime state for the orchestrator polling loop.
@@ -73,9 +79,8 @@ defmodule SymphonyElixir.Orchestrator do
       queued_resumes: %{},
       retry_attempts: %{},
       cleanup_pending: %{},
-      processed_operator_comment_ids: MapSet.new(),
+      operator_commands: %OperatorCommandState{},
       operator_comment_cursors: %{},
-      pending_operator_outcomes: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -121,9 +126,11 @@ defmodule SymphonyElixir.Orchestrator do
             cleanup_pending: restore_cleanup_pending(recovery.cleanup_pending),
             parked: parked,
             claimed: recovery.cleanup_pending |> Map.keys() |> MapSet.new(),
-            processed_operator_comment_ids: recovery.processed_operator_comment_ids,
+            operator_commands: %OperatorCommandState{
+              processed_comment_ids: recovery.processed_operator_comment_ids,
+              pending_outcomes: restore_pending_operator_outcomes(recovery.pending_operator_outcomes)
+            },
             operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
-            pending_operator_outcomes: restore_pending_operator_outcomes(recovery.pending_operator_outcomes),
             codex_totals: @empty_codex_totals,
             codex_rate_limits: nil
           }
@@ -3468,11 +3475,11 @@ defmodule SymphonyElixir.Orchestrator do
          operator_user_ids
        ) do
     cond do
-      Map.has_key?(state.pending_operator_outcomes, comment.id) ->
+      Map.has_key?(state.operator_commands.pending_outcomes, comment.id) ->
         log_pending_operator_comment_identity(state, issue_id, comment)
         {:pending, state}
 
-      MapSet.member?(state.processed_operator_comment_ids, comment.id) ->
+      MapSet.member?(state.operator_commands.processed_comment_ids, comment.id) ->
         {:processed, state}
 
       true ->
@@ -3481,7 +3488,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp log_pending_operator_comment_identity(state, issue_id, comment) do
-    pending = state.pending_operator_outcomes[comment.id]
+    pending = state.operator_commands.pending_outcomes[comment.id]
 
     unless pending_operator_comment_identity_matches?(pending, issue_id, comment.created_at) do
       Logger.warning("Suppressing refetched pending operator comment with mismatched identity issue_id=#{issue_id} comment_id=#{comment.id}")
@@ -3610,9 +3617,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp put_pending_operator_outcome(%State{} = state, outcome) do
+    operator_commands = %{
+      state.operator_commands
+      | pending_outcomes: Map.put(state.operator_commands.pending_outcomes, outcome.comment_id, outcome)
+    }
+
     %{
       state
-      | pending_operator_outcomes: Map.put(state.pending_operator_outcomes, outcome.comment_id, outcome)
+      | operator_commands: operator_commands
     }
   end
 
@@ -3630,11 +3642,13 @@ defmodule SymphonyElixir.Orchestrator do
       :ok ->
         Logger.info("Operator command #{outcome.operator_command} #{operator_outcome_label(outcome.transition)} issue_id=#{outcome.issue_id} comment_id=#{outcome.comment_id}")
 
-        state = %{
-          state
-          | processed_operator_comment_ids: MapSet.put(state.processed_operator_comment_ids, outcome.comment_id),
-            pending_operator_outcomes: Map.delete(state.pending_operator_outcomes, outcome.comment_id)
+        operator_commands = %{
+          state.operator_commands
+          | processed_comment_ids: MapSet.put(state.operator_commands.processed_comment_ids, outcome.comment_id),
+            pending_outcomes: Map.delete(state.operator_commands.pending_outcomes, outcome.comment_id)
         }
+
+        state = %{state | operator_commands: operator_commands}
 
         advance_operator_cursor_in_memory(
           state,
@@ -3662,7 +3676,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp validate_pending_operator_outcome(state, outcome) do
-    case Map.get(state.pending_operator_outcomes, outcome.comment_id) do
+    case Map.get(state.operator_commands.pending_outcomes, outcome.comment_id) do
       nil ->
         :ok
 
@@ -3686,7 +3700,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_pending_operator_outcomes(%State{} = state) do
-    state.pending_operator_outcomes
+    state.operator_commands.pending_outcomes
     |> Map.values()
     |> Enum.sort_by(fn outcome ->
       {DateTime.to_unix(outcome.comment_created_at, :microsecond), outcome.comment_id}

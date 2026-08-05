@@ -1619,7 +1619,10 @@ defmodule SymphonyElixir.CoreTest do
                state
              )
 
-    assert_receive {:worker_model_resolution_ack, ^first_ref, {:error, {:ledger_write_failed, :forced_model_resolution_failure}}}
+    assert_receive {:worker_model_resolution_ack, ^first_ref, resolution_error}
+
+    assert resolution_error ==
+             {:error, {:ledger_write_failed, :forced_model_resolution_failure}}
 
     assert is_nil(failed_state.running[issue_id].resolved_model)
 
@@ -2299,7 +2302,7 @@ defmodule SymphonyElixir.CoreTest do
 
     resumed_state = Orchestrator.run_poll_cycle_for_test(state)
     refute Map.has_key?(resumed_state.parked, issue_id)
-    assert MapSet.member?(resumed_state.processed_operator_comment_ids, comment.id)
+    assert MapSet.member?(resumed_state.operator_commands.processed_comment_ids, comment.id)
 
     repeated_state = Orchestrator.run_poll_cycle_for_test(resumed_state)
 
@@ -2387,8 +2390,8 @@ defmodule SymphonyElixir.CoreTest do
 
     refute Map.has_key?(failed_state.parked, issue_id)
     assert Map.has_key?(failed_state.queued_resumes, issue_id)
-    assert Map.has_key?(failed_state.pending_operator_outcomes, comment.id)
-    refute MapSet.member?(failed_state.processed_operator_comment_ids, comment.id)
+    assert Map.has_key?(failed_state.operator_commands.pending_outcomes, comment.id)
+    refute MapSet.member?(failed_state.operator_commands.processed_comment_ids, comment.id)
 
     assert %{created_at: ^cursor_at, comment_ids: comment_ids} =
              failed_state.operator_comment_cursors[issue_id]
@@ -2397,7 +2400,7 @@ defmodule SymphonyElixir.CoreTest do
 
     assert {:ok, failed_events} = RunLedger.read_events(ledger_path)
     assert Enum.count(failed_events, &(&1["transition"] == "resume_queued")) == 1
-    assert Enum.count(failed_events, &(&1["transition"] == "operator_command_applied")) == 0
+    refute Enum.any?(failed_events, &(&1["transition"] == "operator_command_applied"))
 
     assert Enum.any?(failed_events, fn event ->
              event["transition"] == "resume_queued" and
@@ -2417,8 +2420,12 @@ defmodule SymphonyElixir.CoreTest do
     on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
 
     recovered_state = :sys.get_state(pid)
-    assert recovered_state.pending_operator_outcomes == %{}
-    assert MapSet.member?(recovered_state.processed_operator_comment_ids, comment.id)
+    assert recovered_state.operator_commands.pending_outcomes == %{}
+
+    assert MapSet.member?(
+             recovered_state.operator_commands.processed_comment_ids,
+             comment.id
+           )
 
     assert %{created_at: ^command_at, comment_ids: recovered_comment_ids} =
              recovered_state.operator_comment_cursors[issue_id]
@@ -2486,7 +2493,7 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     first_failed = Orchestrator.run_poll_cycle_for_test(state)
-    assert Map.has_key?(first_failed.pending_operator_outcomes, command.id)
+    assert Map.has_key?(first_failed.operator_commands.pending_outcomes, command.id)
 
     second_failed = Orchestrator.run_poll_cycle_for_test(first_failed)
 
@@ -2506,8 +2513,8 @@ defmodule SymphonyElixir.CoreTest do
     if is_reference(advanced_state.tick_timer_ref),
       do: Process.cancel_timer(advanced_state.tick_timer_ref)
 
-    assert Map.has_key?(advanced_state.pending_operator_outcomes, command.id)
-    refute MapSet.member?(advanced_state.processed_operator_comment_ids, command.id)
+    assert Map.has_key?(advanced_state.operator_commands.pending_outcomes, command.id)
+    refute MapSet.member?(advanced_state.operator_commands.processed_comment_ids, command.id)
 
     assert %{created_at: ^later_at, comment_ids: later_comment_ids} =
              advanced_state.operator_comment_cursors[issue_id]
@@ -2516,15 +2523,20 @@ defmodule SymphonyElixir.CoreTest do
 
     assert {:ok, pending_events} = RunLedger.read_events(ledger_path)
     assert Enum.count(pending_events, &(&1["transition"] == "wait_rejected")) == 1
-    assert Enum.count(pending_events, &(&1["transition"] == "operator_command_applied")) == 0
+    refute Enum.any?(pending_events, &(&1["transition"] == "operator_command_applied"))
 
     completed_state =
       advanced_state
       |> Map.put(:run_ledger_append_fn, &RunLedger.append/2)
       |> Orchestrator.retry_pending_operator_outcomes_for_test()
 
-    assert completed_state.pending_operator_outcomes == %{}
-    assert MapSet.member?(completed_state.processed_operator_comment_ids, command.id)
+    assert completed_state.operator_commands.pending_outcomes == %{}
+
+    assert MapSet.member?(
+             completed_state.operator_commands.processed_comment_ids,
+             command.id
+           )
+
     assert completed_state.operator_comment_cursors[issue_id].created_at == later_at
 
     assert {:ok, completed_events} = RunLedger.read_events(ledger_path)
@@ -2616,13 +2628,15 @@ defmodule SymphonyElixir.CoreTest do
       runner_generation: "runner-pending-stop",
       dispatch_paused: true,
       parked: %{issue_id => wait},
-      pending_operator_outcomes: %{
-        command.id => %{
-          transition: "operator_command_applied",
-          issue_id: issue_id,
-          comment_id: command.id,
-          comment_created_at: command.created_at,
-          operator_command: "stop"
+      operator_commands: %Orchestrator.OperatorCommandState{
+        pending_outcomes: %{
+          command.id => %{
+            transition: "operator_command_applied",
+            issue_id: issue_id,
+            comment_id: command.id,
+            comment_created_at: command.created_at,
+            operator_command: "stop"
+          }
         }
       },
       operator_comment_cursors: %{
@@ -2632,32 +2646,32 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     first_failed = Orchestrator.run_poll_cycle_for_test(state)
-    assert Map.has_key?(first_failed.pending_operator_outcomes, command.id)
+    assert Map.has_key?(first_failed.operator_commands.pending_outcomes, command.id)
 
     second_failed = Orchestrator.run_poll_cycle_for_test(first_failed)
 
     if is_reference(second_failed.tick_timer_ref),
       do: Process.cancel_timer(second_failed.tick_timer_ref)
 
-    assert Map.has_key?(second_failed.pending_operator_outcomes, command.id)
+    assert Map.has_key?(second_failed.operator_commands.pending_outcomes, command.id)
     assert Map.has_key?(second_failed.parked, issue_id)
 
     assert {:ok, pending_events} = RunLedger.read_events(ledger_path)
     assert Enum.count(pending_events, &(&1["transition"] == "run_parked")) == 1
-    assert Enum.count(pending_events, &(&1["transition"] == "operator_command_applied")) == 0
-    assert Enum.count(pending_events, &(&1["transition"] == "operator_command_rejected")) == 0
+    refute Enum.any?(pending_events, &(&1["transition"] == "operator_command_applied"))
+    refute Enum.any?(pending_events, &(&1["transition"] == "operator_command_rejected"))
 
     completed_state =
       second_failed
       |> Map.put(:run_ledger_append_fn, &RunLedger.append/2)
       |> Orchestrator.retry_pending_operator_outcomes_for_test()
 
-    assert completed_state.pending_operator_outcomes == %{}
+    assert completed_state.operator_commands.pending_outcomes == %{}
 
     assert {:ok, completed_events} = RunLedger.read_events(ledger_path)
     assert Enum.count(completed_events, &(&1["transition"] == "run_parked")) == 1
     assert Enum.count(completed_events, &(&1["transition"] == "operator_command_applied")) == 1
-    assert Enum.count(completed_events, &(&1["transition"] == "operator_command_rejected")) == 0
+    refute Enum.any?(completed_events, &(&1["transition"] == "operator_command_rejected"))
   end
 
   test "first operator cursor does not execute historical comments for recovered waits" do
