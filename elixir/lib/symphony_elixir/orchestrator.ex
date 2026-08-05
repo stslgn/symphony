@@ -318,6 +318,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
+        {:worker_model_resolution, issue_id, resolution_info, worker_pid, acknowledgment_ref},
+        state
+      )
+      when is_pid(worker_pid) and is_reference(acknowledgment_ref) do
+    {state, result} = accept_worker_model_resolution(state, issue_id, resolution_info)
+    send(worker_pid, {:worker_model_resolution_ack, acknowledgment_ref, result})
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info(
         {:codex_worker_update, issue_id, %{event: _, timestamp: _} = update},
         %{running: running} = state
       ) do
@@ -2308,6 +2319,78 @@ defmodule SymphonyElixir.Orchestrator do
     incoming_run_id = Map.get(runtime_info, :run_id)
     active_run_id = Map.get(running_entry, :run_id)
     is_nil(incoming_run_id) or is_nil(active_run_id) or incoming_run_id == active_run_id
+  end
+
+  defp accept_worker_model_resolution(
+         %{running: running} = state,
+         issue_id,
+         resolution_info
+       )
+       when is_binary(issue_id) and is_map(resolution_info) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {state, {:error, :run_not_active}}
+
+      running_entry ->
+        persist_worker_model_resolution(state, issue_id, running_entry, resolution_info)
+    end
+  end
+
+  defp accept_worker_model_resolution(state, _issue_id, _resolution_info),
+    do: {state, {:error, :invalid_model_resolution}}
+
+  defp persist_worker_model_resolution(state, issue_id, running_entry, resolution_info) do
+    cond do
+      not model_resolution_matches_run?(state, running_entry, resolution_info) ->
+        Logger.warning("Rejecting mismatched worker model resolution issue_id=#{issue_id} run_id=#{inspect(resolution_info[:run_id])}")
+        {state, {:error, :run_identity_mismatch}}
+
+      is_nil(resolution_info[:resolved_model]) ->
+        {state, :ok}
+
+      not is_binary(resolution_info[:resolved_model]) ->
+        {state, {:error, :invalid_model_resolution}}
+
+      is_binary(Map.get(running_entry, :resolved_model)) ->
+        accept_existing_model_resolution(state, running_entry, resolution_info)
+
+      true ->
+        append_worker_model_resolution(state, issue_id, running_entry, resolution_info)
+    end
+  end
+
+  defp accept_existing_model_resolution(state, running_entry, resolution_info) do
+    if running_entry.resolved_model == resolution_info.resolved_model do
+      {state, :ok}
+    else
+      {state, {:error, :model_resolution_mismatch}}
+    end
+  end
+
+  defp append_worker_model_resolution(state, issue_id, running_entry, resolution_info) do
+    updated_running_entry =
+      running_entry
+      |> maybe_put_runtime_value(:resolved_model, resolution_info[:resolved_model])
+      |> maybe_put_runtime_value(:reasoning_effort, resolution_info[:reasoning_effort])
+      |> maybe_put_runtime_value(:model_catalog_source, resolution_info[:model_catalog_source])
+      |> maybe_put_runtime_value(:model_catalog, resolution_info[:model_catalog])
+
+    event = run_event(updated_running_entry, "model_resolved", "running")
+
+    case append_run_event(state, event) do
+      :ok ->
+        updated_running = Map.put(state.running, issue_id, updated_running_entry)
+        {%{state | running: updated_running}, :ok}
+
+      {:error, reason} ->
+        Logger.error("Failed to durably acknowledge worker model resolution issue_id=#{issue_id}: #{inspect(reason)}")
+        {state, {:error, {:ledger_write_failed, reason}}}
+    end
+  end
+
+  defp model_resolution_matches_run?(state, running_entry, resolution_info) do
+    resolution_info[:run_id] == running_entry[:run_id] and
+      resolution_info[:runner_generation] == state.runner_generation
   end
 
   defp select_worker_host(%State{} = state, preferred_worker_host) do

@@ -1557,6 +1557,87 @@ defmodule SymphonyElixir.CoreTest do
     Process.cancel_timer(scheduled_state.retry_attempts[issue_id].timer_ref)
   end
 
+  test "model resolution is acknowledged only after its ledger event is durable" do
+    issue_id = "issue-model-resolution-ack"
+    ledger_path = ledger_path("model-resolution-ack")
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-MODEL-ACK",
+      title: "Persist model before prompt",
+      state: "In Progress"
+    }
+
+    running_entry = %{
+      run_id: "run-model-resolution-ack",
+      retry_attempt: 0,
+      identifier: issue.identifier,
+      issue: issue,
+      resolved_model: nil,
+      reasoning_effort: nil,
+      model_catalog_source: nil,
+      model_catalog: nil
+    }
+
+    seed_running_ledger!(ledger_path, running_entry)
+    append_attempts = :counters.new(1, [])
+
+    append_fn = fn path, event ->
+      if event.transition == "model_resolved" do
+        :counters.add(append_attempts, 1, 1)
+        attempt = :counters.get(append_attempts, 1)
+
+        if attempt == 1,
+          do: {:error, :forced_model_resolution_failure},
+          else: RunLedger.append(path, event)
+      else
+        RunLedger.append(path, event)
+      end
+    end
+
+    state = %Orchestrator.State{
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: append_fn,
+      runner_generation: "runner-model-resolution-ack",
+      running: %{issue_id => running_entry}
+    }
+
+    resolution_info = %{
+      run_id: running_entry.run_id,
+      runner_generation: state.runner_generation,
+      resolved_model: "gpt-live",
+      reasoning_effort: "high",
+      model_catalog_source: "live",
+      model_catalog: %{source: "live"}
+    }
+
+    first_ref = make_ref()
+
+    assert {:noreply, failed_state} =
+             Orchestrator.handle_info(
+               {:worker_model_resolution, issue_id, resolution_info, self(), first_ref},
+               state
+             )
+
+    assert_receive {:worker_model_resolution_ack, ^first_ref, {:error, {:ledger_write_failed, :forced_model_resolution_failure}}}
+
+    assert is_nil(failed_state.running[issue_id].resolved_model)
+
+    second_ref = make_ref()
+
+    assert {:noreply, acknowledged_state} =
+             Orchestrator.handle_info(
+               {:worker_model_resolution, issue_id, resolution_info, self(), second_ref},
+               failed_state
+             )
+
+    assert_receive {:worker_model_resolution_ack, ^second_ref, :ok}
+    assert acknowledged_state.running[issue_id].resolved_model == "gpt-live"
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(events, &(&1["transition"] == "model_resolved")) == 1
+  end
+
   test "preparation and claim failures keep durable retry dispatch visible across restart" do
     {prepare_state, prepare_issue, prepare_path, prepare_root} =
       pending_dispatch_fixture("prepare-failure")
@@ -2887,6 +2968,75 @@ defmodule SymphonyElixir.CoreTest do
     assert Task.await(task, 5_000) == :agent_failed_after_hooks
     assert File.exists?(after_create_marker)
     assert File.exists?(before_run_marker)
+  end
+
+  test "model resolution acknowledgment blocks the first Codex prompt" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-model-resolution-boundary-#{System.unique_integer([:positive])}"
+      )
+
+    previous_discovery =
+      Application.get_env(:symphony_elixir, :codex_model_discovery_enabled)
+
+    on_exit(fn ->
+      restore_app_env(:codex_model_discovery_enabled, previous_discovery)
+      File.rm_rf(test_root)
+    end)
+
+    Application.put_env(:symphony_elixir, :codex_model_discovery_enabled, true)
+    fake = SymphonyElixir.ScenarioHarness.write_fake_codex!(test_root, :live_ok)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: Path.join(test_root, "workspaces"),
+      codex_command: "#{fake.binary} app-server"
+    )
+
+    issue = %Issue{
+      id: "issue-model-boundary",
+      identifier: "MT-MODEL-BOUNDARY",
+      title: "Block prompt until the model is durable",
+      state: "In Progress"
+    }
+
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        try do
+          AgentRunner.run(issue, parent,
+            runtime_ack_required: true,
+            run_id: "run-model-boundary",
+            runner_generation: "runner-model-boundary"
+          )
+        rescue
+          RuntimeError -> :agent_failed_before_prompt
+        end
+      end)
+
+    assert_receive {:worker_runtime_info, "issue-model-boundary", _runtime_info, worker_pid, runtime_ack_ref},
+                   1_000
+
+    send(worker_pid, {:worker_runtime_ack, runtime_ack_ref, :ok})
+
+    assert_receive {:worker_model_resolution, "issue-model-boundary", resolution_info, ^worker_pid, model_ack_ref},
+                   1_000
+
+    assert resolution_info.resolved_model == "gpt-live"
+    assert resolution_info.runner_generation == "runner-model-boundary"
+
+    trace_before_ack = File.read!(fake.trace)
+    assert trace_before_ack =~ ~s("method":"thread/start")
+    refute trace_before_ack =~ ~s("method":"turn/start")
+
+    send(
+      worker_pid,
+      {:worker_model_resolution_ack, model_ack_ref, {:error, {:ledger_write_failed, :forced_model_resolution_failure}}}
+    )
+
+    assert Task.await(task, 5_000) == :agent_failed_before_prompt
+    refute File.read!(fake.trace) =~ ~s("method":"turn/start")
   end
 
   defp assert_scheduled_delay(due_at_ms, scheduled_from_ms, expected_delay_ms) do

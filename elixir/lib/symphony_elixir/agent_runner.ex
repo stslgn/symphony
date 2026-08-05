@@ -113,12 +113,51 @@ defmodule SymphonyElixir.AgentRunner do
              session_title: AppServer.session_title(issue)
            ) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        with :ok <- send_worker_model_resolution(codex_update_recipient, issue, session, opts) do
+          do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        end
       after
         AppServer.stop_session(session)
       end
     end
   end
+
+  defp send_worker_model_resolution(
+         recipient,
+         %Issue{id: issue_id},
+         session,
+         opts
+       )
+       when is_binary(issue_id) and is_pid(recipient) and is_map(session) do
+    if Keyword.get(opts, :runtime_ack_required, false) do
+      acknowledgment_ref = make_ref()
+
+      resolution_info = %{
+        run_id: Keyword.get(opts, :run_id),
+        runner_generation: Keyword.get(opts, :runner_generation),
+        resolved_model: session.resolved_model,
+        reasoning_effort: session.reasoning_effort,
+        model_catalog_source: get_in(session, [:metadata, :model_catalog_source]),
+        model_catalog: get_in(session, [:metadata, :model_catalog])
+      }
+
+      send(
+        recipient,
+        {:worker_model_resolution, issue_id, resolution_info, self(), acknowledgment_ref}
+      )
+
+      receive do
+        {:worker_model_resolution_ack, ^acknowledgment_ref, :ok} -> :ok
+        {:worker_model_resolution_ack, ^acknowledgment_ref, {:error, reason}} -> {:error, reason}
+      after
+        Config.settings!().codex.read_timeout_ms -> {:error, :worker_model_resolution_ack_timeout}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp send_worker_model_resolution(_recipient, _issue, _session, _opts), do: :ok
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
