@@ -2311,6 +2311,125 @@ defmodule SymphonyElixir.CoreTest do
     assert Enum.count(events, &(&1["transition"] == "operator_command_applied")) == 1
   end
 
+  test "applied operator command retries its durable outcome without reapplying the action" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"],
+      poll_interval_ms: 60_000
+    )
+
+    ledger_path = ledger_path("operator-outcome-retry")
+    issue_id = "issue-operator-outcome-retry"
+    cursor_at = ~U[2026-08-03 10:00:00Z]
+    command_at = ~U[2026-08-03 10:00:01Z]
+
+    assert {:ok, wait} =
+             SymphonyElixir.OperatorWait.new("waiting_secret", %{
+               issue_id: issue_id,
+               identifier: "MT-OPERATOR-OUTCOME",
+               run_id: "run-operator-outcome",
+               parked_at: cursor_at
+             })
+
+    seed_parked_ledger!(ledger_path, wait)
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "operator_cursor_initialized",
+               stage: "operator",
+               issue_id: issue_id,
+               comment_created_at: DateTime.to_iso8601(cursor_at),
+               runner_generation: "runner-operator-outcome"
+             })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "dispatch_paused",
+               stage: "operator",
+               runner_generation: "runner-operator-outcome"
+             })
+
+    comment = %SymphonyElixir.Linear.Comment{
+      id: "comment-outcome-retry",
+      body: "$retry",
+      created_at: command_at,
+      author_id: "operator-1"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue_id => [comment]
+    })
+
+    append_fn = fn path, event ->
+      if event.transition == "operator_command_applied",
+        do: {:error, :forced_operator_outcome_failure},
+        else: RunLedger.append(path, event)
+    end
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 60_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: append_fn,
+      runner_generation: "runner-operator-outcome",
+      dispatch_paused: true,
+      parked: %{issue_id => wait},
+      operator_comment_cursors: %{
+        issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    failed_state = Orchestrator.run_poll_cycle_for_test(state)
+
+    if is_reference(failed_state.tick_timer_ref),
+      do: Process.cancel_timer(failed_state.tick_timer_ref)
+
+    refute Map.has_key?(failed_state.parked, issue_id)
+    assert Map.has_key?(failed_state.queued_resumes, issue_id)
+    assert Map.has_key?(failed_state.pending_operator_outcomes, comment.id)
+    refute MapSet.member?(failed_state.processed_operator_comment_ids, comment.id)
+
+    assert %{created_at: ^cursor_at, comment_ids: comment_ids} =
+             failed_state.operator_comment_cursors[issue_id]
+
+    assert MapSet.size(comment_ids) == 0
+
+    assert {:ok, failed_events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(failed_events, &(&1["transition"] == "resume_queued")) == 1
+    assert Enum.count(failed_events, &(&1["transition"] == "operator_command_applied")) == 0
+
+    assert Enum.any?(failed_events, fn event ->
+             event["transition"] == "resume_queued" and
+               event["comment_id"] == comment.id and
+               event["operator_command"] == "retry"
+           end)
+
+    assert {:ok, recovery} =
+             RunLedger.reconcile_startup(ledger_path, "runner-operator-outcome-check")
+
+    assert recovery.pending_operator_outcomes[comment.id]["operator_command"] == "retry"
+
+    name =
+      {:global, {__MODULE__, :operator_outcome_restart, System.unique_integer([:positive])}}
+
+    assert {:ok, pid} = Orchestrator.start_link(name: name, run_ledger_path: ledger_path)
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    recovered_state = :sys.get_state(pid)
+    assert recovered_state.pending_operator_outcomes == %{}
+    assert MapSet.member?(recovered_state.processed_operator_comment_ids, comment.id)
+
+    assert %{created_at: ^command_at, comment_ids: recovered_comment_ids} =
+             recovered_state.operator_comment_cursors[issue_id]
+
+    assert MapSet.member?(recovered_comment_ids, comment.id)
+
+    assert {:ok, recovered_events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(recovered_events, &(&1["transition"] == "resume_queued")) == 1
+    assert Enum.count(recovered_events, &(&1["transition"] == "operator_command_applied")) == 1
+  end
+
   test "first operator cursor does not execute historical comments for recovered waits" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",

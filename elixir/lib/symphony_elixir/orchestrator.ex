@@ -75,6 +75,7 @@ defmodule SymphonyElixir.Orchestrator do
       cleanup_pending: %{},
       processed_operator_comment_ids: MapSet.new(),
       operator_comment_cursors: %{},
+      pending_operator_outcomes: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -122,11 +123,16 @@ defmodule SymphonyElixir.Orchestrator do
             claimed: recovery.cleanup_pending |> Map.keys() |> MapSet.new(),
             processed_operator_comment_ids: recovery.processed_operator_comment_ids,
             operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
+            pending_operator_outcomes: restore_pending_operator_outcomes(recovery.pending_operator_outcomes),
             codex_totals: @empty_codex_totals,
             codex_rate_limits: nil
           }
 
-          state = state |> retry_pending_workspace_cleanups() |> schedule_tick(0)
+          state =
+            state
+            |> retry_pending_operator_outcomes()
+            |> retry_pending_workspace_cleanups()
+            |> schedule_tick(0)
 
           {:ok, state}
         else
@@ -486,6 +492,7 @@ defmodule SymphonyElixir.Orchestrator do
     state
     |> retry_pending_terminal_transitions()
     |> retry_pending_durable_retries()
+    |> retry_pending_operator_outcomes()
     |> retry_pending_workspace_cleanups()
     |> reconcile_stalled_running_issues()
     |> ensure_operator_cursors_for_poll()
@@ -823,6 +830,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec retry_pending_operator_outcomes_for_test(term()) :: term()
+  def retry_pending_operator_outcomes_for_test(%State{} = state) do
+    retry_pending_operator_outcomes(state)
+  end
+
+  @doc false
   @spec claim_and_start_issue_for_test(
           term(),
           Issue.t(),
@@ -979,7 +992,14 @@ defmodule SymphonyElixir.Orchestrator do
                  workspace_path: Map.get(running_entry, :workspace_path),
                  workspace_root: Map.get(running_entry, :workspace_root)
                }),
-             :ok <- append_run_event(state, operator_wait_event(wait, "run_parked")) do
+             park_event =
+               wait
+               |> operator_wait_event("run_parked")
+               |> maybe_put_operator_command_context(
+                 Keyword.get(opts, :operator_comment),
+                 Keyword.get(opts, :operator_action)
+               ),
+             :ok <- append_run_event(state, park_event) do
           Logger.info("Issue parked for operator action: #{issue_context(issue)} reason=#{reason} wait_id=#{wait.wait_id}")
 
           state = record_session_completion_totals(state, running_entry)
@@ -3290,15 +3310,15 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp apply_operator_wait_action(state, wait, action) do
+  defp apply_operator_wait_action(state, wait, action, opts \\ []) do
     if OperatorWait.action_allowed?(wait, action) do
-      apply_allowed_operator_wait_action(state, wait, action)
+      apply_allowed_operator_wait_action(state, wait, action, opts)
     else
       {:error, :action_not_allowed, state}
     end
   end
 
-  defp apply_allowed_operator_wait_action(state, wait, action) do
+  defp apply_allowed_operator_wait_action(state, wait, action, opts) do
     transition = if action == "reject", do: "wait_rejected", else: "resume_queued"
     next_attempt = max(wait.attempt + 1, 1)
 
@@ -3307,6 +3327,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> operator_wait_event(transition)
       |> maybe_mark_resume_queued(action)
       |> maybe_put_resumed_attempt(action, next_attempt)
+      |> maybe_put_operator_command_context(Keyword.get(opts, :operator_comment), action)
 
     case append_run_event(state, event) do
       :ok when action == "reject" ->
@@ -3333,6 +3354,21 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_mark_resume_queued(event, "reject"), do: event
   defp maybe_mark_resume_queued(event, _action), do: Map.put(event, :stage, "resume_queued")
+
+  defp maybe_put_operator_command_context(
+         event,
+         %{id: comment_id, created_at: %DateTime{} = created_at},
+         action
+       )
+       when is_binary(comment_id) and is_binary(action) do
+    Map.merge(event, %{
+      comment_id: comment_id,
+      comment_created_at: DateTime.to_iso8601(created_at),
+      operator_command: action
+    })
+  end
+
+  defp maybe_put_operator_command_context(event, _comment, _action), do: event
 
   defp queued_resume_entry(wait, next_attempt) do
     %{
@@ -3390,14 +3426,22 @@ defmodule SymphonyElixir.Orchestrator do
     if operator_comment_seen_at_cursor?(state, issue_id, comment) do
       state
     else
-      state
-      |> maybe_apply_operator_comment(issue_id, comment, operator_user_ids)
-      |> persist_operator_cursor(
-        "operator_cursor_advanced",
-        issue_id,
-        created_at,
-        comment_id
-      )
+      case maybe_apply_operator_comment(state, issue_id, comment, operator_user_ids) do
+        {:ignored, updated_state} ->
+          persist_operator_cursor(
+            updated_state,
+            "operator_cursor_advanced",
+            issue_id,
+            created_at,
+            comment_id
+          )
+
+        {:processed, updated_state} ->
+          advance_operator_cursor_in_memory(updated_state, issue_id, created_at, comment_id)
+
+        {:command, updated_state} ->
+          updated_state
+      end
     end
   end
 
@@ -3421,7 +3465,7 @@ defmodule SymphonyElixir.Orchestrator do
          operator_user_ids
        ) do
     if MapSet.member?(state.processed_operator_comment_ids, comment.id) do
-      state
+      {:processed, state}
     else
       parse_and_apply_operator_comment(state, issue_id, comment, operator_user_ids)
     end
@@ -3429,8 +3473,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp parse_and_apply_operator_comment(state, issue_id, comment, operator_user_ids) do
     case OperatorCommand.parse_comment(comment, operator_user_ids) do
-      {:ok, action} -> apply_operator_comment(state, issue_id, comment, action)
-      :ignore -> state
+      {:ok, action} -> {:command, apply_operator_comment(state, issue_id, comment, action)}
+      :ignore -> {:ignored, state}
     end
   end
 
@@ -3442,7 +3486,11 @@ defmodule SymphonyElixir.Orchestrator do
     case Map.get(state.running, issue_id) do
       %{issue: %Issue{} = issue} ->
         updated_state =
-          park_running_issue(state, issue, "operator_stopped", terminal_reason: "operator_stop")
+          park_running_issue(state, issue, "operator_stopped",
+            terminal_reason: "operator_stop",
+            operator_comment: comment,
+            operator_action: "stop"
+          )
 
         if Map.has_key?(updated_state.parked, issue_id) do
           record_operator_command_outcome(
@@ -3485,7 +3533,7 @@ defmodule SymphonyElixir.Orchestrator do
         )
 
       wait ->
-        case apply_operator_wait_action(state, wait, action) do
+        case apply_operator_wait_action(state, wait, action, operator_comment: comment) do
           {:ok, _payload, updated_state} ->
             record_operator_command_outcome(
               updated_state,
@@ -3514,33 +3562,91 @@ defmodule SymphonyElixir.Orchestrator do
          action,
          transition
        ) do
-    event = %{
+    outcome = operator_command_outcome(issue_id, comment, action, transition)
+
+    state =
+      if transition == "operator_command_applied" do
+        put_pending_operator_outcome(state, outcome)
+      else
+        state
+      end
+
+    persist_operator_command_outcome(state, outcome)
+  end
+
+  defp operator_command_outcome(issue_id, comment, action, transition) do
+    %{
       transition: transition,
-      stage: "operator",
       issue_id: issue_id,
       comment_id: comment.id,
-      comment_created_at: DateTime.to_iso8601(comment.created_at),
+      comment_created_at: comment.created_at,
       operator_command: action
+    }
+  end
+
+  defp put_pending_operator_outcome(%State{} = state, outcome) do
+    %{
+      state
+      | pending_operator_outcomes: Map.put(state.pending_operator_outcomes, outcome.comment_id, outcome)
+    }
+  end
+
+  defp persist_operator_command_outcome(%State{} = state, outcome) do
+    event = %{
+      transition: outcome.transition,
+      stage: "operator",
+      issue_id: outcome.issue_id,
+      comment_id: outcome.comment_id,
+      comment_created_at: DateTime.to_iso8601(outcome.comment_created_at),
+      operator_command: outcome.operator_command
     }
 
     case append_run_event(state, event) do
       :ok ->
-        Logger.info("Operator command #{action} #{operator_outcome_label(transition)} issue_id=#{issue_id} comment_id=#{comment.id}")
+        Logger.info("Operator command #{outcome.operator_command} #{operator_outcome_label(outcome.transition)} issue_id=#{outcome.issue_id} comment_id=#{outcome.comment_id}")
 
-        %{
+        state = %{
           state
-          | processed_operator_comment_ids: MapSet.put(state.processed_operator_comment_ids, comment.id)
+          | processed_operator_comment_ids: MapSet.put(state.processed_operator_comment_ids, outcome.comment_id),
+            pending_operator_outcomes: Map.delete(state.pending_operator_outcomes, outcome.comment_id)
         }
 
+        advance_operator_cursor_in_memory(
+          state,
+          outcome.issue_id,
+          outcome.comment_created_at,
+          outcome.comment_id
+        )
+
       {:error, reason} ->
-        Logger.error("Failed to record operator command issue_id=#{issue_id} comment_id=#{comment.id}: #{inspect(reason)}")
+        Logger.error("Failed to record operator command issue_id=#{outcome.issue_id} comment_id=#{outcome.comment_id}: #{inspect(reason)}")
 
         state
     end
   end
 
+  defp retry_pending_operator_outcomes(%State{} = state) do
+    state.pending_operator_outcomes
+    |> Map.values()
+    |> Enum.sort_by(fn outcome ->
+      {DateTime.to_unix(outcome.comment_created_at, :microsecond), outcome.comment_id}
+    end)
+    |> Enum.reduce(state, fn outcome, state_acc ->
+      persist_operator_command_outcome(state_acc, outcome)
+    end)
+  end
+
   defp operator_outcome_label("operator_command_applied"), do: "applied"
   defp operator_outcome_label(_transition), do: "rejected"
+
+  defp advance_operator_cursor_in_memory(state, issue_id, created_at, comment_id) do
+    cursor = advance_operator_cursor(state, issue_id, created_at, comment_id)
+
+    %{
+      state
+      | operator_comment_cursors: Map.put(state.operator_comment_cursors, issue_id, cursor)
+    }
+  end
 
   defp persist_operator_cursor(
          %State{} = state,
@@ -3625,6 +3731,27 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp restore_operator_comment_cursors(_cursors), do: %{}
+
+  defp restore_pending_operator_outcomes(events) when is_map(events) do
+    Enum.reduce(events, %{}, fn {comment_id, event}, pending ->
+      with true <- is_binary(comment_id),
+           {:ok, created_at, _offset} <- DateTime.from_iso8601(event["comment_created_at"]),
+           issue_id when is_binary(issue_id) <- event["issue_id"],
+           operator_command when is_binary(operator_command) <- event["operator_command"] do
+        Map.put(pending, comment_id, %{
+          transition: "operator_command_applied",
+          issue_id: issue_id,
+          comment_id: comment_id,
+          comment_created_at: created_at,
+          operator_command: operator_command
+        })
+      else
+        _invalid -> pending
+      end
+    end)
+  end
+
+  defp restore_pending_operator_outcomes(_events), do: %{}
 
   defp restore_parked_waits(events) when is_map(events) do
     Enum.reduce_while(events, {:ok, %{}}, fn {issue_id, event}, {:ok, restored} ->

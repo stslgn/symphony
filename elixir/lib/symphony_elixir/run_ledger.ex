@@ -94,7 +94,8 @@ defmodule SymphonyElixir.RunLedger do
     "run_parked" => %{
       required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason),
       required_attempt: true,
-      typed_wait: true
+      typed_wait: true,
+      optional_operator_context: true
     },
     "run_stopped" => %{
       required_strings: ~w(stage run_id issue_id issue_identifier terminal_reason),
@@ -113,12 +114,14 @@ defmodule SymphonyElixir.RunLedger do
     "resume_queued" => %{
       required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason),
       required_attempt: true,
-      typed_wait: true
+      typed_wait: true,
+      optional_operator_context: true
     },
     "wait_rejected" => %{
       required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason),
       required_attempt: true,
-      typed_wait: true
+      typed_wait: true,
+      optional_operator_context: true
     },
     "wait_released" => %{
       required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason release_reason),
@@ -256,7 +259,8 @@ defmodule SymphonyElixir.RunLedger do
          parked: parked,
          dispatch_paused: recovery.dispatch_paused,
          processed_operator_comment_ids: recovery.processed_operator_comment_ids,
-         operator_comment_cursors: recovery.operator_comment_cursors
+         operator_comment_cursors: recovery.operator_comment_cursors,
+         pending_operator_outcomes: recovery.pending_operator_outcomes
        }}
     end
   end
@@ -355,6 +359,9 @@ defmodule SymphonyElixir.RunLedger do
       operator_comment_cursors =
         Enum.reduce(events, %{}, &update_operator_comment_cursor/2)
 
+      pending_operator_outcomes =
+        Enum.reduce(events, %{}, &update_pending_operator_outcome/2)
+
       cleanup_pending = Enum.reduce(events, %{}, &update_cleanup_pending_state/2)
 
       {:ok,
@@ -366,7 +373,8 @@ defmodule SymphonyElixir.RunLedger do
          recovered_dispatches: recovered_dispatches,
          dispatch_paused: dispatch_paused,
          processed_operator_comment_ids: processed_operator_comment_ids,
-         operator_comment_cursors: operator_comment_cursors
+         operator_comment_cursors: operator_comment_cursors,
+         pending_operator_outcomes: pending_operator_outcomes
        }}
     end
   end
@@ -609,7 +617,12 @@ defmodule SymphonyElixir.RunLedger do
          } = event,
          cursors
        )
-       when transition in ["operator_cursor_initialized", "operator_cursor_advanced"] and
+       when transition in [
+              "operator_cursor_initialized",
+              "operator_cursor_advanced",
+              "operator_command_applied",
+              "operator_command_rejected"
+            ] and
               is_binary(issue_id) and is_binary(created_at) do
     comment_id = event["comment_id"]
 
@@ -637,6 +650,32 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp update_operator_comment_cursor(_event, cursors), do: cursors
+
+  defp update_pending_operator_outcome(
+         %{
+           "transition" => transition,
+           "comment_id" => comment_id,
+           "comment_created_at" => created_at,
+           "operator_command" => operator_command
+         } = event,
+         pending
+       )
+       when transition in ["run_parked", "resume_queued", "wait_rejected"] and
+              is_binary(comment_id) and is_binary(created_at) and
+              is_binary(operator_command) do
+    Map.put(pending, comment_id, event)
+  end
+
+  defp update_pending_operator_outcome(
+         %{"transition" => transition, "comment_id" => comment_id},
+         pending
+       )
+       when transition in ["operator_command_applied", "operator_command_rejected"] and
+              is_binary(comment_id) do
+    Map.delete(pending, comment_id)
+  end
+
+  defp update_pending_operator_outcome(_event, pending), do: pending
 
   defp maybe_put_comment_id(comment_ids, comment_id) when is_binary(comment_id),
     do: MapSet.put(comment_ids, comment_id)
@@ -730,6 +769,11 @@ defmodule SymphonyElixir.RunLedger do
          :ok <- validate_required_attempt(event, Map.get(schema, :required_attempt, false)),
          :ok <- validate_required_next_attempt(event, Map.get(schema, :required_next_attempt, false)),
          :ok <- validate_typed_wait(event, Map.get(schema, :typed_wait, false)),
+         :ok <-
+           validate_optional_operator_context(
+             event,
+             Map.get(schema, :optional_operator_context, false)
+           ),
          :ok <- validate_timestamp_field(event, Map.get(schema, :timestamp_field)),
          :ok <- validate_transition_stage(event),
          :ok <- validate_terminal_reason(event),
@@ -787,6 +831,27 @@ defmodule SymphonyElixir.RunLedger do
     case SymphonyElixir.OperatorWait.validate_persisted_fields(event) do
       :ok -> :ok
       {:error, {:invalid_wait_field, field}} -> {:error, {:invalid_field, field}}
+    end
+  end
+
+  defp validate_optional_operator_context(_event, false), do: :ok
+
+  defp validate_optional_operator_context(event, true) do
+    fields = ~w(comment_id comment_created_at operator_command)
+    present_fields = Enum.filter(fields, &Map.has_key?(event, &1))
+
+    case present_fields do
+      [] ->
+        :ok
+
+      ^fields ->
+        with :ok <- validate_required_strings(event, fields),
+             :ok <- validate_timestamp_field(event, "comment_created_at") do
+          :ok
+        end
+
+      _partial ->
+        {:error, {:invalid_field, "operator_command_context"}}
     end
   end
 

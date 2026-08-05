@@ -803,6 +803,78 @@ defmodule SymphonyElixir.RunLedgerTest do
     refute resumed_recovery.dispatch_paused
   end
 
+  test "operator action context restores a pending outcome until the audit event lands" do
+    path = ledger_path()
+    run_id = "run-pending-operator-outcome"
+    issue_id = "issue-pending-operator-outcome"
+    comment_at = "2026-08-03T10:00:01.000Z"
+
+    append_parked_run!(path, run_id, issue_id)
+
+    resume_event =
+      run_id
+      |> valid_parked_event(issue_id)
+      |> Map.merge(%{
+        transition: "resume_queued",
+        stage: "resume_queued",
+        attempt: 2,
+        comment_id: "comment-pending-outcome",
+        comment_created_at: comment_at,
+        operator_command: "approve"
+      })
+
+    assert :ok = RunLedger.append(path, resume_event)
+
+    assert {:ok, pending_recovery} =
+             RunLedger.reconcile_startup(path, "runner-pending-outcome")
+
+    assert pending_recovery.pending_operator_outcomes["comment-pending-outcome"][
+             "transition"
+           ] == "resume_queued"
+
+    refute MapSet.member?(
+             pending_recovery.processed_operator_comment_ids,
+             "comment-pending-outcome"
+           )
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "operator_command_applied",
+               stage: "operator",
+               issue_id: issue_id,
+               comment_id: "comment-pending-outcome",
+               comment_created_at: comment_at,
+               operator_command: "approve",
+               runner_generation: "runner-pending-outcome"
+             })
+
+    assert {:ok, completed_recovery} =
+             RunLedger.reconcile_startup(path, "runner-completed-outcome")
+
+    assert completed_recovery.pending_operator_outcomes == %{}
+
+    assert MapSet.member?(
+             completed_recovery.processed_operator_comment_ids,
+             "comment-pending-outcome"
+           )
+
+    assert completed_recovery.operator_comment_cursors[issue_id] == %{
+             created_at: comment_at,
+             comment_ids: MapSet.new(["comment-pending-outcome"])
+           }
+
+    invalid_path = ledger_path()
+    append_parked_predecessors!(invalid_path, "run-partial-context", "issue-partial-context")
+
+    partial_context_event =
+      "run-partial-context"
+      |> valid_parked_event("issue-partial-context")
+      |> Map.put(:comment_id, "comment-without-context")
+
+    assert {:error, {:invalid_field, "operator_command_context"}} =
+             RunLedger.append(invalid_path, partial_context_event)
+  end
+
   test "returns filesystem read and create errors" do
     assert {:ok, []} = RunLedger.read_events(ledger_path())
 
