@@ -733,13 +733,15 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp validate_event(event, line_number) do
-    case validate_event_payload(event) do
+    case validate_event_payload(event, :recovery) do
       :ok -> {:ok, event}
       {:error, reason} -> {:error, {:invalid_ledger_record, line_number, reason}}
     end
   end
 
-  defp validate_event_payload(event) do
+  defp validate_event_payload(event), do: validate_event_payload(event, :append)
+
+  defp validate_event_payload(event, mode) do
     with :ok <- validate_event_fields(event),
          :ok <- validate_schema_version(event),
          :ok <- validate_required_string(event, "event_id"),
@@ -749,7 +751,7 @@ defmodule SymphonyElixir.RunLedger do
          :ok <- validate_optional_attempt(event),
          :ok <- validate_optional_actions(event),
          :ok <- validate_optional_strings(event) do
-      validate_transition_fields(event, transition_schema)
+      validate_transition_fields(event, transition_schema, mode)
     end
   end
 
@@ -764,8 +766,10 @@ defmodule SymphonyElixir.RunLedger do
     end
   end
 
-  defp validate_transition_fields(event, schema) do
-    with :ok <- validate_required_strings(event, Map.get(schema, :required_strings, [])),
+  defp validate_transition_fields(event, schema, mode) do
+    required_strings = required_strings_for_mode(event, schema, mode)
+
+    with :ok <- validate_required_strings(event, required_strings),
          :ok <- validate_required_attempt(event, Map.get(schema, :required_attempt, false)),
          :ok <- validate_required_next_attempt(event, Map.get(schema, :required_next_attempt, false)),
          :ok <- validate_typed_wait(event, Map.get(schema, :typed_wait, false)),
@@ -776,11 +780,26 @@ defmodule SymphonyElixir.RunLedger do
            ),
          :ok <- validate_timestamp_field(event, Map.get(schema, :timestamp_field)),
          :ok <- validate_transition_stage(event),
-         :ok <- validate_terminal_reason(event),
-         :ok <- validate_release_reason(event) do
+         :ok <- validate_terminal_reason(event, mode),
+         :ok <- validate_release_reason(event, mode) do
       validate_next_action(event)
     end
   end
+
+  defp required_strings_for_mode(
+         %{"transition" => "wait_released"} = event,
+         schema,
+         :recovery
+       ) do
+    required_strings = Map.get(schema, :required_strings, [])
+
+    if legacy_wait_release?(event, :recovery),
+      do: List.delete(required_strings, "release_reason"),
+      else: required_strings
+  end
+
+  defp required_strings_for_mode(_event, schema, _mode),
+    do: Map.get(schema, :required_strings, [])
 
   defp validate_required_strings(event, fields) do
     Enum.reduce_while(fields, :ok, fn field, :ok ->
@@ -889,6 +908,14 @@ defmodule SymphonyElixir.RunLedger do
     end
   end
 
+  defp validate_terminal_reason(event, :recovery) do
+    if legacy_wait_release?(event, :recovery),
+      do: :ok,
+      else: validate_terminal_reason(event)
+  end
+
+  defp validate_terminal_reason(event, _mode), do: validate_terminal_reason(event)
+
   defp validate_release_reason(%{"transition" => "wait_released", "release_reason" => reason}) do
     if MapSet.member?(@release_reasons, reason),
       do: :ok,
@@ -900,6 +927,28 @@ defmodule SymphonyElixir.RunLedger do
       do: :ok,
       else: {:error, {:invalid_field, "release_reason"}}
   end
+
+  defp validate_release_reason(
+         %{"transition" => "wait_released"} = event,
+         :recovery
+       ) do
+    if legacy_wait_release?(event, :recovery),
+      do: :ok,
+      else: validate_release_reason(event)
+  end
+
+  defp validate_release_reason(event, _mode), do: validate_release_reason(event)
+
+  defp legacy_wait_release?(
+         %{
+           "transition" => "wait_released",
+           "terminal_reason" => "tracker_released"
+         } = event,
+         :recovery
+       ),
+       do: is_nil(event["release_reason"])
+
+  defp legacy_wait_release?(_event, _mode), do: false
 
   defp validate_next_action(%{"transition" => transition} = event)
        when transition in ["run_completed", "run_failed", "run_interrupted", "run_stopped"] do
@@ -1505,6 +1554,11 @@ defmodule SymphonyElixir.RunLedger do
       :workspace_path,
       :workspace_root
     ]
+
+    fields =
+      if legacy_wait_release?(event, :recovery),
+        do: List.delete(fields, :terminal_reason),
+        else: fields
 
     if Enum.all?(fields, fn field -> Map.fetch!(wait, field) == event[Atom.to_string(field)] end) do
       :ok

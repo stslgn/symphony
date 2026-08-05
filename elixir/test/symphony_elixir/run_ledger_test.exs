@@ -971,6 +971,59 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert {:ok, [_event]} = RunLedger.read_events(path)
   end
 
+  test "recovery accepts a legacy wait release without weakening new appends" do
+    path = ledger_path()
+    run_id = "run-legacy-wait-release"
+    issue_id = "issue-legacy-wait-release"
+    append_parked_run!(path, run_id, issue_id)
+
+    release_event =
+      run_id
+      |> valid_parked_event(issue_id)
+      |> Map.merge(%{transition: "wait_released", release_reason: "tracker_terminal"})
+
+    assert :ok = RunLedger.append(path, release_event)
+
+    strict_path = ledger_path()
+    append_parked_run!(strict_path, run_id, issue_id)
+
+    assert {:error, {:invalid_field, "release_reason"}} =
+             strict_path
+             |> RunLedger.append(Map.delete(release_event, :release_reason))
+
+    assert :ok = RunLedger.append(strict_path, release_event)
+
+    invalid_records = valid_records(strict_path)
+
+    invalid_release =
+      invalid_records
+      |> List.last()
+      |> Map.delete("release_reason")
+      |> Map.put("terminal_reason", "tracker_terminal")
+
+    rewrite_records!(strict_path, List.replace_at(invalid_records, -1, invalid_release))
+
+    assert {:error, {:invalid_ledger_record, 4, {:invalid_field, "release_reason"}}} =
+             RunLedger.read_events(strict_path)
+
+    records = valid_records(path)
+
+    legacy_release =
+      records
+      |> List.last()
+      |> Map.delete("release_reason")
+      |> Map.put("terminal_reason", "tracker_released")
+
+    rewrite_records!(path, List.replace_at(records, -1, legacy_release))
+
+    assert {:ok, events} = RunLedger.read_events(path)
+    assert is_nil(events |> List.last() |> Map.get("release_reason"))
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-after-legacy-release")
+    assert recovery.parked == %{}
+    assert recovery.cleanup_pending == %{}
+  end
+
   test "returns filesystem read and create errors" do
     assert {:ok, []} = RunLedger.read_events(ledger_path())
 
