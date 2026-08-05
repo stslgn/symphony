@@ -408,9 +408,7 @@ defmodule SymphonyElixir.RunLedger do
        )
        when transition in ["wait_resumed", "resume_queued"] and is_binary(issue_id) and
               is_integer(attempt) and attempt >= 1 do
-    Map.update(acc, issue_id, event, fn current ->
-      if current["attempt"] >= attempt, do: current, else: event
-    end)
+    Map.put(acc, issue_id, event)
   end
 
   defp update_queued_resume_state(
@@ -463,10 +461,7 @@ defmodule SymphonyElixir.RunLedger do
        )
        when is_binary(issue_id) do
     dispatch = recovered_dispatch(event)
-
-    Map.update(acc, issue_id, dispatch, fn current ->
-      if current.attempt >= dispatch.attempt, do: current, else: dispatch
-    end)
+    Map.put(acc, issue_id, dispatch)
   end
 
   defp update_recovered_dispatch_state(
@@ -532,15 +527,7 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp merge_recovered_dispatches(recovered_dispatches, stale_runs) do
-    Map.merge(
-      recovered_dispatches,
-      recovered_dispatches_from_stale_runs(stale_runs),
-      &prefer_recovered_dispatch/3
-    )
-  end
-
-  defp prefer_recovered_dispatch(_issue_id, current, candidate) do
-    prefer_recovered_dispatch(current, candidate)
+    Map.merge(recovered_dispatches, recovered_dispatches_from_stale_runs(stale_runs))
   end
 
   defp prefer_recovered_dispatch(current, candidate) do
@@ -549,7 +536,7 @@ defmodule SymphonyElixir.RunLedger do
 
   defp recovered_dispatch(event) do
     %{
-      attempt: max(integer_value(event["attempt"], 0) + 1, 1),
+      attempt: event["attempt"] + 1,
       previous_run_id: event["run_id"],
       identifier: event["issue_identifier"],
       worker_host: event["worker_host"],
@@ -663,12 +650,12 @@ defmodule SymphonyElixir.RunLedger do
         stage: "released",
         terminal_reason: "runner_restarted",
         next_action: "retry",
-        next_attempt: integer_value(event["attempt"], 0) + 1,
+        next_attempt: event["attempt"] + 1,
         runner_generation: runner_generation,
         run_id: run_id,
         issue_id: event["issue_id"],
         issue_identifier: event["issue_identifier"],
-        attempt: integer_value(event["attempt"], 0),
+        attempt: event["attempt"],
         worker_host: event["worker_host"],
         workspace_path: event["workspace_path"],
         workspace_root: event["workspace_root"]
@@ -950,9 +937,6 @@ defmodule SymphonyElixir.RunLedger do
       {:ok, value} -> if predicate.(value), do: :ok, else: {:error, {:invalid_field, field}}
     end
   end
-
-  defp integer_value(value, _default) when is_integer(value), do: value
-  defp integer_value(_value, default), do: default
 
   defp validate_ordered_events(events) do
     events
