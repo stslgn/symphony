@@ -13,6 +13,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_terminal_states: nil,
       codex_command: nil,
       codex_dynamic_tool_allowlist: nil,
+      codex_required_dynamic_tools: nil,
       codex_mcp_tool_auto_approve_allowlist: nil,
       codex_mcp_elicitation_auto_approve_allowlist: nil
     )
@@ -26,7 +27,9 @@ defmodule SymphonyElixir.CoreTest do
     assert config.agent.max_turns == 20
     assert config.agent.max_run_tokens == nil
     assert config.agent.max_run_seconds == nil
+    assert config.workflow.runtime_prompt_mode == "full_prompt_compat"
     assert config.codex.dynamic_tool_allowlist == []
+    assert config.codex.required_dynamic_tools == []
     assert config.codex.mcp_tool_auto_approve_allowlist == []
     assert config.codex.mcp_elicitation_auto_approve_allowlist == []
 
@@ -133,12 +136,14 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_dynamic_tool_allowlist: [" linear_graphql ", "linear_graphql"],
+      codex_required_dynamic_tools: [" linear_graphql ", "linear_graphql"],
       codex_mcp_tool_auto_approve_allowlist: [" Linear / Save issue "],
       codex_mcp_elicitation_auto_approve_allowlist: [" Linear "]
     )
 
     assert config = Config.settings!().codex
     assert config.dynamic_tool_allowlist == ["linear_graphql"]
+    assert config.required_dynamic_tools == ["linear_graphql"]
     assert config.mcp_tool_auto_approve_allowlist == ["Linear/Save issue"]
     assert config.mcp_elicitation_auto_approve_allowlist == ["Linear"]
 
@@ -148,6 +153,23 @@ defmodule SymphonyElixir.CoreTest do
 
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.dynamic_tool_allowlist"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_dynamic_tool_allowlist: [],
+      codex_required_dynamic_tools: ["linear_graphql"]
+    )
+
+    assert :ok = Config.validate!()
+
+    assert {:error, {:missing_required_dynamic_tools, ["linear_graphql"]}} =
+             Config.validate_runtime_capabilities()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_required_dynamic_tools: ["unknown_tool"]
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.required_dynamic_tools"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_mcp_tool_auto_approve_allowlist: ["missing-separator"]
@@ -182,6 +204,13 @@ defmodule SymphonyElixir.CoreTest do
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
 
+    workflow = Map.get(config, "workflow", %{})
+    assert Map.get(workflow, "runtime_prompt_mode") == "managed"
+
+    codex = Map.get(config, "codex", %{})
+    assert Map.get(codex, "dynamic_tool_allowlist") == ["linear_graphql"]
+    assert Map.get(codex, "required_dynamic_tools") == ["linear_graphql"]
+
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
     assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
@@ -190,8 +219,25 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
 
     assert String.trim(prompt) != ""
+    assert prompt =~ "This preamble is operator-only."
     assert is_binary(Config.workflow_prompt())
-    assert Config.workflow_prompt() == prompt
+    assert String.starts_with?(Config.workflow_prompt(), "## Symphony Runtime Prompt")
+    refute Config.workflow_prompt() =~ "This preamble is operator-only."
+    refute Config.workflow_prompt() =~ "Symphony Operator Contract"
+    assert :ok = Config.validate_runtime_capabilities()
+
+    worker_prompt =
+      PromptBuilder.build_prompt(%Issue{
+        id: "managed-boundary",
+        identifier: "MT-BOUNDARY",
+        title: "Managed prompt boundary",
+        state: "Todo",
+        labels: []
+      })
+
+    assert worker_prompt =~ "## Symphony Runtime Prompt"
+    refute worker_prompt =~ "This preamble is operator-only."
+    refute worker_prompt =~ "Symphony Operator Contract"
   end
 
   test "linear api token resolves from LINEAR_API_KEY env var" do
@@ -252,12 +298,32 @@ defmodule SymphonyElixir.CoreTest do
     assert Workflow.workflow_file_path() == app_workflow_path
   end
 
-  test "workflow load accepts prompt-only files without front matter" do
+  test "managed workflow rejects prompt-only files without a runtime heading" do
     workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "PROMPT_ONLY_WORKFLOW.md")
     File.write!(workflow_path, "Prompt only\n")
 
-    assert {:ok, %{config: %{}, prompt: "Prompt only", prompt_template: "Prompt only"}} =
+    assert {:error, {:workflow_parse_error, :missing_runtime_prompt_heading}} =
              Workflow.load(workflow_path)
+  end
+
+  test "workflow full-prompt fallback requires explicit compatibility mode" do
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "COMPAT_WORKFLOW.md")
+
+    File.write!(workflow_path, """
+    ---
+    workflow:
+      runtime_prompt_mode: full_prompt_compat
+    ---
+
+    Compatibility worker prompt.
+    """)
+
+    assert {:ok,
+            %{
+              prompt: "Compatibility worker prompt.",
+              prompt_template: "Compatibility worker prompt.",
+              runtime_prompt_mode: "full_prompt_compat"
+            }} = Workflow.load(workflow_path)
   end
 
   test "workflow load uses Symphony Runtime Prompt section as worker prompt template" do
@@ -327,11 +393,29 @@ defmodule SymphonyElixir.CoreTest do
     refute prompt_template =~ "Operator workflow"
   end
 
-  test "workflow load accepts unterminated front matter with an empty prompt" do
+  test "managed workflow rejects a non-exact runtime prompt heading" do
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "INEXACT_RUNTIME_PROMPT_WORKFLOW.md")
+
+    File.write!(workflow_path, """
+    ---
+    workflow:
+      runtime_prompt_mode: managed
+    ---
+
+    ### Symphony Runtime Prompt
+
+    This heading has the wrong level.
+    """)
+
+    assert {:error, {:workflow_parse_error, :missing_runtime_prompt_heading}} =
+             Workflow.load(workflow_path)
+  end
+
+  test "managed workflow rejects unterminated front matter with no runtime heading" do
     workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "UNTERMINATED_WORKFLOW.md")
     File.write!(workflow_path, "---\ntracker:\n  kind: linear\n")
 
-    assert {:ok, %{config: %{"tracker" => %{"kind" => "linear"}}, prompt: "", prompt_template: ""}} =
+    assert {:error, {:workflow_parse_error, :missing_runtime_prompt_heading}} =
              Workflow.load(workflow_path)
   end
 
@@ -369,6 +453,16 @@ defmodule SymphonyElixir.CoreTest do
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
     assert {:ok, []} = Client.fetch_issue_states_by_ids([])
+  end
+
+  test "orchestrator startup aborts when a parked wait cannot be restored" do
+    ledger_path = ledger_path("restore-wait-failure")
+
+    assert {:stop, {:operator_wait_restore_failed, :forced_restore_failure}} =
+             Orchestrator.init(
+               run_ledger_path: ledger_path,
+               restore_parked_waits_fn: fn _parked -> {:error, :forced_restore_failure} end
+             )
   end
 
   test "non-active issue state stops running agent without cleaning workspace" do
@@ -469,6 +563,8 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
       retry_attempts: %{}
     }
+
+    seed_running_ledger!(ledger_path, state.running[issue_id])
 
     issue = %Issue{
       id: issue_id,
@@ -598,7 +694,7 @@ defmodule SymphonyElixir.CoreTest do
           retry_token: retry_token,
           due_at_ms: System.monotonic_time(:millisecond),
           identifier: "MT-PAUSED-RETRY",
-          error: "agent exited: :boom"
+          error: "agent_exit"
         }
       }
     }
@@ -628,6 +724,121 @@ defmodule SymphonyElixir.CoreTest do
     Process.cancel_timer(resumed_state.tick_timer_ref)
   end
 
+  test "queued resumes stay visible while pause, capacity, tracker, or legacy affinity blocks dispatch" do
+    issue_id = "issue-blocked-resume"
+
+    queued_resumes = %{
+      issue_id => %{
+        issue_id: issue_id,
+        identifier: "MT-BLOCKED-RESUME",
+        run_id: "run-blocked-resume-source",
+        wait_id: "wait-blocked-resume",
+        attempt: 3,
+        stage: "resume_queued",
+        queued_at: DateTime.utc_now()
+      }
+    }
+
+    base_state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: nil,
+      queued_resumes: queued_resumes,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    paused_state =
+      Orchestrator.run_poll_cycle_for_test(%{base_state | dispatch_paused: true})
+
+    assert paused_state.queued_resumes == queued_resumes
+
+    if is_reference(paused_state.tick_timer_ref), do: Process.cancel_timer(paused_state.tick_timer_ref)
+
+    dummy_issue = %Issue{
+      id: "issue-capacity-holder",
+      identifier: "MT-CAPACITY-HOLDER",
+      title: "Occupy the only slot",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    resumed_issue = %Issue{
+      id: issue_id,
+      identifier: "MT-BLOCKED-RESUME",
+      title: "Remain queued",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    dummy_pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(dummy_pid), do: Process.exit(dummy_pid, :kill) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_concurrent_agents: 1
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [dummy_issue, resumed_issue])
+
+    capacity_state = %{
+      base_state
+      | running: %{
+          dummy_issue.id => %{
+            pid: dummy_pid,
+            ref: nil,
+            run_id: "run-capacity-holder",
+            retry_attempt: 0,
+            identifier: dummy_issue.identifier,
+            issue: dummy_issue,
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([dummy_issue.id])
+    }
+
+    capacity_blocked_state = Orchestrator.run_poll_cycle_for_test(capacity_state)
+
+    assert capacity_blocked_state.queued_resumes == queued_resumes
+
+    if is_reference(capacity_blocked_state.tick_timer_ref),
+      do: Process.cancel_timer(capacity_blocked_state.tick_timer_ref)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_api_token: nil
+    )
+
+    tracker_blocked_state = Orchestrator.run_poll_cycle_for_test(base_state)
+
+    assert tracker_blocked_state.queued_resumes == queued_resumes
+
+    assert {:reply, snapshot, ^tracker_blocked_state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, tracker_blocked_state)
+
+    assert [%{issue_id: ^issue_id, attempt: 3, stage: "resume_queued"}] = snapshot.retrying
+
+    if is_reference(tracker_blocked_state.tick_timer_ref),
+      do: Process.cancel_timer(tracker_blocked_state.tick_timer_ref)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [resumed_issue])
+
+    affinity_blocked_state = Orchestrator.run_poll_cycle_for_test(base_state)
+
+    assert affinity_blocked_state.queued_resumes == queued_resumes
+    assert affinity_blocked_state.running == %{}
+    assert affinity_blocked_state.claimed == MapSet.new()
+
+    assert {:reply, affinity_snapshot, ^affinity_blocked_state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, affinity_blocked_state)
+
+    assert [%{stage: "resume_queued", error: "workspace_affinity_missing"}] =
+             affinity_snapshot.retrying
+
+    if is_reference(affinity_blocked_state.tick_timer_ref),
+      do: Process.cancel_timer(affinity_blocked_state.tick_timer_ref)
+  end
+
   test "typed waits require matching ids and allowed actions before resume" do
     issue_id = "issue-secret-wait"
 
@@ -650,12 +861,16 @@ defmodule SymphonyElixir.CoreTest do
           retry_attempt: 1,
           identifier: "MT-SECRET",
           issue: %Issue{id: issue_id, identifier: "MT-SECRET", state: "In Progress"},
+          worker_host: "worker-a",
+          workspace_path: "/srv/symphony/MT-SECRET",
           started_at: DateTime.utc_now()
         }
       },
       claimed: MapSet.new([issue_id]),
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
+
+    seed_running_ledger!(ledger_path, state.running[issue_id])
 
     assert {:reply, {:ok, wait}, parked_state} =
              Orchestrator.handle_call(
@@ -666,6 +881,8 @@ defmodule SymphonyElixir.CoreTest do
 
     assert wait.reason == "waiting_secret"
     assert wait.allowed_actions == ["retry", "reject"]
+    assert wait.worker_host == "worker-a"
+    assert wait.workspace_path == "/srv/symphony/MT-SECRET"
 
     assert {:reply, {:error, :wait_id_mismatch}, ^parked_state} =
              Orchestrator.handle_call(
@@ -699,10 +916,205 @@ defmodule SymphonyElixir.CoreTest do
 
     refute Map.has_key?(resumed_state.parked, issue_id)
 
+    assert %{
+             attempt: 2,
+             stage: "resume_queued",
+             run_id: "run-secret",
+             wait_id: wait_id,
+             worker_host: "worker-a",
+             workspace_path: "/srv/symphony/MT-SECRET"
+           } = resumed_state.queued_resumes[issue_id]
+
+    assert wait_id == wait.wait_id
+
+    assert {:reply, snapshot, snapshotted_state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, resumed_state)
+
+    assert [%{issue_id: ^issue_id, attempt: 2, stage: "resume_queued"}] = snapshot.retrying
+
     assert {:ok, events} = RunLedger.read_events(ledger_path)
     assert Enum.count(events, &(&1["transition"] == "run_parked")) == 1
     assert Enum.count(events, &(&1["transition"] == "wait_rejected")) == 1
-    assert Enum.count(events, &(&1["transition"] == "wait_resumed")) == 1
+    assert Enum.count(events, &(&1["transition"] == "resume_queued")) == 1
+
+    assert Enum.any?(events, fn event ->
+             event["transition"] == "resume_queued" and event["attempt"] == 2 and
+               event["worker_host"] == "worker-a" and
+               event["workspace_path"] == "/srv/symphony/MT-SECRET"
+           end)
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(ledger_path, "runner-after-resume")
+    assert recovery.queued_resumes[issue_id]["attempt"] == 2
+    assert recovery.queued_resumes[issue_id]["worker_host"] == "worker-a"
+    assert recovery.queued_resumes[issue_id]["workspace_path"] == "/srv/symphony/MT-SECRET"
+
+    if is_reference(snapshotted_state.tick_timer_ref),
+      do: Process.cancel_timer(snapshotted_state.tick_timer_ref)
+  end
+
+  test "terminal parked issue releases durably and removes its local recorded workspace" do
+    root = parked_workspace_root("local-terminal")
+    workspace = Path.join(root, "MT-PARKED-LOCAL-TERMINAL")
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "remove-me"), "old")
+
+    {state, wait} = parked_reconcile_state("local-terminal", workspace, root, nil)
+
+    reconciled =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{id: wait.issue_id, identifier: wait.identifier, state: "Closed"},
+        state
+      )
+
+    refute File.exists?(workspace)
+    refute Map.has_key?(reconciled.parked, wait.issue_id)
+    refute Map.has_key?(reconciled.cleanup_pending, wait.issue_id)
+
+    assert {:ok, events} = RunLedger.read_events(state.run_ledger_path)
+    assert Enum.any?(events, &(&1["transition"] == "wait_released" and &1["release_reason"] == "tracker_terminal"))
+    assert Enum.any?(events, &(&1["transition"] == "workspace_cleanup_completed"))
+  end
+
+  test "unrouted parked issue releases durably but preserves its local workspace" do
+    root = parked_workspace_root("local-unrouted")
+    workspace = Path.join(root, "MT-PARKED-LOCAL-UNROUTED")
+    sentinel = Path.join(workspace, "must-survive")
+    File.mkdir_p!(workspace)
+    File.write!(sentinel, "kept")
+
+    {state, wait} = parked_reconcile_state("local-unrouted", workspace, root, nil)
+
+    reconciled =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{
+          id: wait.issue_id,
+          identifier: wait.identifier,
+          state: "In Progress",
+          assigned_to_worker: false
+        },
+        state
+      )
+
+    assert File.read!(sentinel) == "kept"
+    refute Map.has_key?(reconciled.parked, wait.issue_id)
+    refute Map.has_key?(reconciled.cleanup_pending, wait.issue_id)
+
+    assert {:ok, events} = RunLedger.read_events(state.run_ledger_path)
+
+    assert Enum.any?(events, fn event ->
+             event["transition"] == "wait_released" and
+               event["release_reason"] == "worker_route_removed"
+           end)
+
+    refute Enum.any?(events, &String.starts_with?(&1["transition"], "workspace_cleanup_"))
+  end
+
+  test "terminal parked issue releases durably and removes its remote recorded workspace" do
+    {remote_root, workspace, trace_file} = install_fake_parked_cleanup_ssh!("remote-terminal")
+    {state, wait} = parked_reconcile_state("remote-terminal", workspace, remote_root, "worker-a")
+
+    reconciled =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{id: wait.issue_id, identifier: wait.identifier, state: "Closed"},
+        state
+      )
+
+    refute Map.has_key?(reconciled.parked, wait.issue_id)
+    refute Map.has_key?(reconciled.cleanup_pending, wait.issue_id)
+
+    trace = File.read!(trace_file)
+    assert trace =~ "worker-a bash -lc"
+    assert trace =~ "rm -rf"
+    assert trace =~ workspace
+  end
+
+  test "unrouted parked issue releases durably without touching its remote workspace" do
+    {remote_root, workspace, trace_file} = install_fake_parked_cleanup_ssh!("remote-unrouted")
+    {state, wait} = parked_reconcile_state("remote-unrouted", workspace, remote_root, "worker-a")
+
+    reconciled =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{
+          id: wait.issue_id,
+          identifier: wait.identifier,
+          state: "In Progress",
+          assigned_to_worker: false
+        },
+        state
+      )
+
+    refute Map.has_key?(reconciled.parked, wait.issue_id)
+    refute Map.has_key?(reconciled.cleanup_pending, wait.issue_id)
+    refute File.exists?(trace_file)
+
+    assert {:ok, events} = RunLedger.read_events(state.run_ledger_path)
+    refute Enum.any?(events, &String.starts_with?(&1["transition"], "workspace_cleanup_"))
+  end
+
+  test "parked terminal release recovers local cleanup when request append crashes" do
+    root = parked_workspace_root("local-release-recovery")
+    workspace = Path.join(root, "MT-PARKED-LOCAL-RELEASE-RECOVERY")
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "remove-after-restart"), "old")
+
+    {state, wait} = parked_reconcile_state("local-release-recovery", workspace, root, nil)
+    state = %{state | run_ledger_append_fn: cleanup_request_failure_append_fn()}
+
+    released =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{id: wait.issue_id, identifier: wait.identifier, state: "Closed"},
+        state
+      )
+
+    refute Map.has_key?(released.parked, wait.issue_id)
+    assert %{status: :request_pending} = released.cleanup_pending[wait.issue_id]
+    assert File.exists?(workspace)
+
+    assert {:ok, events} = RunLedger.read_events(state.run_ledger_path)
+    assert List.last(events)["transition"] == "wait_released"
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(state.run_ledger_path, "runner-local-crash")
+    assert recovery.cleanup_pending[wait.issue_id]["release_reason"] == "tracker_terminal"
+
+    assert {:ok, restarted} = Orchestrator.init(run_ledger_path: state.run_ledger_path)
+    if is_reference(restarted.tick_timer_ref), do: Process.cancel_timer(restarted.tick_timer_ref)
+
+    refute File.exists?(workspace)
+    refute Map.has_key?(restarted.cleanup_pending, wait.issue_id)
+    refute MapSet.member?(restarted.claimed, wait.issue_id)
+  end
+
+  test "parked terminal release recovers exact remote cleanup when request append crashes" do
+    {remote_root, workspace, trace_file} =
+      install_fake_parked_cleanup_ssh!("remote-release-recovery")
+
+    {state, wait} =
+      parked_reconcile_state("remote-release-recovery", workspace, remote_root, "worker-a")
+
+    state = %{state | run_ledger_append_fn: cleanup_request_failure_append_fn()}
+
+    released =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{id: wait.issue_id, identifier: wait.identifier, state: "Closed"},
+        state
+      )
+
+    refute Map.has_key?(released.parked, wait.issue_id)
+    assert %{status: :request_pending} = released.cleanup_pending[wait.issue_id]
+    refute File.exists?(trace_file)
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(state.run_ledger_path, "runner-remote-crash")
+    assert recovery.cleanup_pending[wait.issue_id]["worker_host"] == "worker-a"
+    assert recovery.cleanup_pending[wait.issue_id]["workspace_path"] == workspace
+    assert recovery.cleanup_pending[wait.issue_id]["workspace_root"] == remote_root
+
+    assert {:ok, restarted} = Orchestrator.init(run_ledger_path: state.run_ledger_path)
+    if is_reference(restarted.tick_timer_ref), do: Process.cancel_timer(restarted.tick_timer_ref)
+
+    refute Map.has_key?(restarted.cleanup_pending, wait.issue_id)
+    refute MapSet.member?(restarted.claimed, wait.issue_id)
+    assert File.read!(trace_file) =~ "worker-a bash -lc"
+    assert File.read!(trace_file) =~ workspace
   end
 
   test "observed token budget exhaustion parks the run without scheduling retry" do
@@ -749,6 +1161,8 @@ defmodule SymphonyElixir.CoreTest do
       claimed: MapSet.new([issue_id]),
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
+
+    seed_running_ledger!(ledger_path, running_entry)
 
     update = %{
       event: :notification,
@@ -857,10 +1271,16 @@ defmodule SymphonyElixir.CoreTest do
       File.mkdir_p!(test_root)
       File.mkdir_p!(workspace)
 
+      parent = self()
+      shutdown_marker = Path.join(workspace, "worker-shutdown-established")
+
       agent_pid =
         spawn(fn ->
+          Process.flag(:trap_exit, true)
+
           receive do
-            :stop -> :ok
+            {:EXIT, _from, :shutdown} ->
+              send(parent, {:worker_shutdown_write, File.write(shutdown_marker, "stopped")})
           end
         end)
 
@@ -869,8 +1289,13 @@ defmodule SymphonyElixir.CoreTest do
           issue_id => %{
             pid: agent_pid,
             ref: nil,
+            run_id: "run-terminal-cleanup",
+            retry_attempt: 0,
             identifier: issue_identifier,
             issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            worker_host: nil,
+            workspace_path: workspace,
+            workspace_root: test_root,
             started_at: DateTime.utc_now()
           }
         },
@@ -890,10 +1315,526 @@ defmodule SymphonyElixir.CoreTest do
 
       updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
 
+      assert_receive {:worker_shutdown_write, :ok}
       refute Map.has_key?(updated_state.running, issue_id)
       refute MapSet.member?(updated_state.claimed, issue_id)
       refute Process.alive?(agent_pid)
       refute File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "terminal cleanup removes only the captured root path after config changes" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-exact-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    old_root = Path.join(test_root, "old-root")
+    new_root = Path.join(test_root, "new-root")
+    identifier = "MT-ROOT-CHANGE"
+    old_workspace = Path.join(old_root, identifier)
+    new_workspace = Path.join(new_root, identifier)
+    new_sentinel = Path.join(new_workspace, "must-survive")
+    issue_id = "issue-root-change"
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+    File.mkdir_p!(old_workspace)
+    File.mkdir_p!(new_workspace)
+    File.write!(Path.join(old_workspace, "remove-me"), "old")
+    File.write!(new_sentinel, "new")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: new_root,
+      tracker_terminal_states: ["Closed"]
+    )
+
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill) end)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: nil,
+      run_id: "run-root-change",
+      retry_attempt: 0,
+      identifier: identifier,
+      issue: %Issue{id: issue_id, identifier: identifier, state: "In Progress"},
+      worker_host: nil,
+      workspace_path: old_workspace,
+      workspace_root: old_root,
+      started_at: DateTime.utc_now()
+    }
+
+    state = %Orchestrator.State{
+      run_ledger_path: nil,
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    terminal_issue = %Issue{id: issue_id, identifier: identifier, state: "Closed"}
+    cleaned_state = Orchestrator.reconcile_issue_states_for_test([terminal_issue], state)
+
+    refute File.exists?(old_workspace)
+    assert File.read!(new_sentinel) == "new"
+    refute Map.has_key?(cleaned_state.cleanup_pending, issue_id)
+    refute MapSet.member?(cleaned_state.claimed, issue_id)
+  end
+
+  test "terminal cleanup with missing affinity remains claimed and visible" do
+    issue_id = "issue-cleanup-missing-affinity"
+    identifier = "MT-CLEANUP-MISSING"
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill) end)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: nil,
+      run_id: "run-cleanup-missing-affinity",
+      retry_attempt: 0,
+      identifier: identifier,
+      issue: %Issue{id: issue_id, identifier: identifier, state: "In Progress"},
+      worker_host: nil,
+      workspace_path: nil,
+      workspace_root: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    state = %Orchestrator.State{
+      run_ledger_path: nil,
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    terminal_issue = %Issue{id: issue_id, identifier: identifier, state: "Closed"}
+    pending_state = Orchestrator.reconcile_issue_states_for_test([terminal_issue], state)
+
+    assert MapSet.member?(pending_state.claimed, issue_id)
+    assert pending_state.cleanup_pending[issue_id].cleanup_error == :workspace_affinity_missing
+
+    assert {:reply, snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, pending_state)
+
+    assert Enum.any?(snapshot.retrying, fn row ->
+             row.issue_id == issue_id and row.stage == "cleanup_pending" and
+               row.error == "workspace_affinity_missing"
+           end)
+  end
+
+  test "completion ledger failure retains claim and blocks continuation until persisted" do
+    issue_id = "issue-terminal-completion"
+    ref = make_ref()
+    blocked_path = blocked_ledger_path()
+    valid_path = ledger_path("completion-retry")
+    state = terminal_transition_state(issue_id, ref, blocked_path, retry_attempt: 3)
+
+    assert {:noreply, blocked_state} =
+             Orchestrator.handle_info({:DOWN, ref, :process, self(), :normal}, state)
+
+    assert blocked_state.running[issue_id].terminal_pending.transition == "run_completed"
+    assert MapSet.member?(blocked_state.claimed, issue_id)
+    refute MapSet.member?(blocked_state.completed, issue_id)
+    refute Map.has_key?(blocked_state.retry_attempts, issue_id)
+
+    seed_running_ledger!(valid_path, blocked_state.running[issue_id])
+
+    recovered_state =
+      blocked_state
+      |> Map.put(:run_ledger_path, valid_path)
+      |> Orchestrator.retry_pending_terminal_transitions_for_test()
+
+    assert {:ok, events} = RunLedger.read_events(valid_path)
+
+    assert Enum.map(events, & &1["transition"]) == [
+             "run_claimed",
+             "run_started",
+             "run_completed",
+             "retry_scheduled"
+           ]
+
+    refute Map.has_key?(recovered_state.running, issue_id)
+    assert MapSet.member?(recovered_state.completed, issue_id)
+    assert recovered_state.retry_attempts[issue_id].attempt == 4
+
+    Process.cancel_timer(recovered_state.retry_attempts[issue_id].timer_ref)
+  end
+
+  test "failure ledger failure retains claim and blocks retry until persisted" do
+    issue_id = "issue-terminal-failure"
+    ref = make_ref()
+    blocked_path = blocked_ledger_path()
+    valid_path = ledger_path("failure-retry")
+    state = terminal_transition_state(issue_id, ref, blocked_path, retry_attempt: 3)
+
+    assert {:noreply, blocked_state} =
+             Orchestrator.handle_info({:DOWN, ref, :process, self(), :worker_crashed}, state)
+
+    assert blocked_state.running[issue_id].terminal_pending.transition == "run_failed"
+    assert MapSet.member?(blocked_state.claimed, issue_id)
+    refute Map.has_key?(blocked_state.retry_attempts, issue_id)
+
+    seed_running_ledger!(valid_path, blocked_state.running[issue_id])
+
+    recovered_state =
+      blocked_state
+      |> Map.put(:run_ledger_path, valid_path)
+      |> Orchestrator.retry_pending_terminal_transitions_for_test()
+
+    refute Map.has_key?(recovered_state.running, issue_id)
+    assert recovered_state.retry_attempts[issue_id].attempt == 4
+
+    assert {:ok, events} = RunLedger.read_events(valid_path)
+
+    assert Enum.map(events, & &1["transition"]) == [
+             "run_claimed",
+             "run_started",
+             "run_failed",
+             "retry_scheduled"
+           ]
+
+    Process.cancel_timer(recovered_state.retry_attempts[issue_id].timer_ref)
+  end
+
+  test "retry append failure retains a claimed durable-retry pending state" do
+    issue_id = "issue-retry-durability"
+    ref = make_ref()
+    path = ledger_path("retry-durability")
+    state = terminal_transition_state(issue_id, ref, path, retry_attempt: 3)
+    seed_running_ledger!(path, state.running[issue_id])
+
+    append_fn = fn ledger_path, event ->
+      if event.transition == "retry_scheduled" do
+        {:error, :forced_retry_append_failure}
+      else
+        RunLedger.append(ledger_path, event)
+      end
+    end
+
+    state = %{state | run_ledger_append_fn: append_fn}
+
+    assert {:noreply, pending_state} =
+             Orchestrator.handle_info({:DOWN, ref, :process, self(), :worker_crashed}, state)
+
+    refute Map.has_key?(pending_state.running, issue_id)
+    assert MapSet.member?(pending_state.claimed, issue_id)
+
+    assert %{
+             attempt: 4,
+             status: :durability_pending,
+             timer_ref: nil,
+             retry_token: nil,
+             persistence_error: :forced_retry_append_failure
+           } = pending_state.retry_attempts[issue_id]
+
+    candidate = %Issue{
+      id: issue_id,
+      identifier: "MT-TERMINAL",
+      title: "Retry durability",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(candidate, pending_state)
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-retry-durability")
+    assert recovery.recovered_attempts[issue_id] == 4
+
+    scheduled_state =
+      pending_state
+      |> Map.put(:run_ledger_append_fn, &RunLedger.append/2)
+      |> Orchestrator.retry_pending_durable_retries_for_test()
+
+    assert scheduled_state.retry_attempts[issue_id].status == :scheduled
+    assert is_reference(scheduled_state.retry_attempts[issue_id].timer_ref)
+    assert MapSet.member?(scheduled_state.claimed, issue_id)
+
+    assert {:ok, events} = RunLedger.read_events(path)
+    assert Enum.count(events, &(&1["transition"] == "retry_scheduled")) == 1
+
+    Process.cancel_timer(scheduled_state.retry_attempts[issue_id].timer_ref)
+  end
+
+  test "model resolution is acknowledged only after its ledger event is durable" do
+    issue_id = "issue-model-resolution-ack"
+    ledger_path = ledger_path("model-resolution-ack")
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-MODEL-ACK",
+      title: "Persist model before prompt",
+      state: "In Progress"
+    }
+
+    running_entry = %{
+      run_id: "run-model-resolution-ack",
+      retry_attempt: 0,
+      identifier: issue.identifier,
+      issue: issue,
+      resolved_model: nil,
+      reasoning_effort: nil,
+      model_catalog_source: nil,
+      model_catalog: nil
+    }
+
+    seed_running_ledger!(ledger_path, running_entry)
+    append_attempts = :counters.new(1, [])
+
+    append_fn = fn path, event ->
+      if event.transition == "model_resolved" do
+        :counters.add(append_attempts, 1, 1)
+        attempt = :counters.get(append_attempts, 1)
+
+        if attempt == 1,
+          do: {:error, :forced_model_resolution_failure},
+          else: RunLedger.append(path, event)
+      else
+        RunLedger.append(path, event)
+      end
+    end
+
+    state = %Orchestrator.State{
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: append_fn,
+      runner_generation: "runner-model-resolution-ack",
+      running: %{issue_id => running_entry}
+    }
+
+    resolution_info = %{
+      run_id: running_entry.run_id,
+      runner_generation: state.runner_generation,
+      resolved_model: "gpt-live",
+      reasoning_effort: "high",
+      model_catalog_source: "live",
+      model_catalog: %{source: "live"}
+    }
+
+    first_ref = make_ref()
+
+    assert {:noreply, failed_state} =
+             Orchestrator.handle_info(
+               {:worker_model_resolution, issue_id, resolution_info, self(), first_ref},
+               state
+             )
+
+    assert_receive {:worker_model_resolution_ack, ^first_ref, resolution_error}
+
+    assert resolution_error ==
+             {:error, {:ledger_write_failed, :forced_model_resolution_failure}}
+
+    assert is_nil(failed_state.running[issue_id].resolved_model)
+
+    second_ref = make_ref()
+
+    assert {:noreply, acknowledged_state} =
+             Orchestrator.handle_info(
+               {:worker_model_resolution, issue_id, resolution_info, self(), second_ref},
+               failed_state
+             )
+
+    assert_receive {:worker_model_resolution_ack, ^second_ref, :ok}
+    assert acknowledged_state.running[issue_id].resolved_model == "gpt-live"
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(events, &(&1["transition"] == "model_resolved")) == 1
+  end
+
+  test "preparation and claim failures keep durable retry dispatch visible across restart" do
+    {prepare_state, prepare_issue, prepare_path, prepare_root} =
+      pending_dispatch_fixture("prepare-failure")
+
+    outside_path = Path.join(Path.dirname(prepare_root), "outside/#{prepare_issue.identifier}")
+
+    prepare_state = due_dispatch_state(prepare_state, prepare_issue.id)
+
+    prepare_failed =
+      Orchestrator.claim_and_start_issue_for_test(
+        prepare_state,
+        prepare_issue,
+        2,
+        nil,
+        outside_path,
+        prepare_root,
+        nil
+      )
+
+    assert_pending_dispatch_visible(prepare_failed, prepare_issue.id, 2)
+    assert {:ok, prepare_recovery} = RunLedger.reconcile_startup(prepare_path, "runner-after-prepare")
+    assert prepare_recovery.recovered_attempts[prepare_issue.id] == 2
+
+    {claim_state, claim_issue, claim_path, claim_root} = pending_dispatch_fixture("claim-failure")
+    claim_workspace = Path.join(claim_root, claim_issue.identifier)
+
+    claim_failed =
+      claim_state
+      |> due_dispatch_state(claim_issue.id)
+      |> Map.put(:run_ledger_append_fn, fn ledger_path, event ->
+        if event.transition == "run_claimed",
+          do: {:error, :forced_claim_append_failure},
+          else: RunLedger.append(ledger_path, event)
+      end)
+      |> Orchestrator.claim_and_start_issue_for_test(
+        claim_issue,
+        2,
+        nil,
+        claim_workspace,
+        claim_root,
+        nil
+      )
+
+    assert_pending_dispatch_visible(claim_failed, claim_issue.id, 2)
+    assert {:ok, claim_recovery} = RunLedger.reconcile_startup(claim_path, "runner-after-claim")
+    assert claim_recovery.recovered_attempts[claim_issue.id] == 2
+
+    Process.cancel_timer(prepare_failed.retry_attempts[prepare_issue.id].timer_ref)
+    Process.cancel_timer(claim_failed.retry_attempts[claim_issue.id].timer_ref)
+  end
+
+  test "spawn and start append failures retain durable or surfaced claim ownership" do
+    {spawn_state, spawn_issue, spawn_path, spawn_root} = pending_dispatch_fixture("spawn-failure")
+    spawn_workspace = Path.join(spawn_root, spawn_issue.identifier)
+
+    spawn_failed =
+      spawn_state
+      |> due_dispatch_state(spawn_issue.id)
+      |> Map.put(:task_start_fn, fn _task -> {:error, :forced_spawn_failure} end)
+      |> Orchestrator.claim_and_start_issue_for_test(
+        spawn_issue,
+        2,
+        nil,
+        spawn_workspace,
+        spawn_root,
+        nil
+      )
+
+    refute Map.has_key?(spawn_failed.running, spawn_issue.id)
+    assert_pending_dispatch_visible(spawn_failed, spawn_issue.id, 3)
+    assert {:ok, spawn_recovery} = RunLedger.reconcile_startup(spawn_path, "runner-after-spawn")
+    assert spawn_recovery.recovered_attempts[spawn_issue.id] == 3
+
+    {start_state, start_issue, start_path, start_root} = pending_dispatch_fixture("start-failure")
+    start_workspace = Path.join(start_root, start_issue.identifier)
+
+    start_failed =
+      start_state
+      |> due_dispatch_state(start_issue.id)
+      |> Map.put(:task_start_fn, fn _task ->
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end)
+      |> Map.put(:run_ledger_append_fn, fn ledger_path, event ->
+        if event.transition in ["run_started", "run_failed"],
+          do: {:error, :forced_start_transition_failure},
+          else: RunLedger.append(ledger_path, event)
+      end)
+      |> Orchestrator.claim_and_start_issue_for_test(
+        start_issue,
+        2,
+        nil,
+        start_workspace,
+        start_root,
+        nil
+      )
+
+    assert MapSet.member?(start_failed.claimed, start_issue.id)
+    assert %{terminal_pending: %{transition: "run_failed"}} = start_failed.running[start_issue.id]
+    refute Map.has_key?(start_failed.retry_attempts, start_issue.id)
+
+    assert {:reply, start_snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, start_failed)
+
+    assert [%{issue_id: start_issue_id, stage: "terminal_pending"}] = start_snapshot.running
+    assert start_issue_id == start_issue.id
+    assert start_snapshot.retrying == []
+
+    assert {:ok, start_recovery} = RunLedger.reconcile_startup(start_path, "runner-after-start")
+    assert start_recovery.recovered_attempts[start_issue.id] == 3
+
+    Process.cancel_timer(spawn_failed.retry_attempts[spawn_issue.id].timer_ref)
+  end
+
+  test "tracker terminal ledger failure blocks worker stop cleanup and claim release" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-ledger-block-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-terminal-ledger-block"
+    issue_identifier = "MT-TERMINAL-BLOCK"
+    workspace = Path.join(test_root, issue_identifier)
+    blocked_path = blocked_ledger_path()
+    valid_path = ledger_path("tracker-terminal-retry")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress"],
+        tracker_terminal_states: ["Closed"]
+      )
+
+      File.mkdir_p!(workspace)
+      parent = self()
+      shutdown_marker = Path.join(workspace, "worker-shutdown-established")
+
+      agent_pid =
+        spawn(fn ->
+          Process.flag(:trap_exit, true)
+
+          receive do
+            {:EXIT, _from, :shutdown} ->
+              send(parent, {:worker_shutdown_write, File.write(shutdown_marker, "stopped")})
+          end
+        end)
+
+      running_entry = %{
+        pid: agent_pid,
+        ref: nil,
+        run_id: "run-terminal-ledger-block",
+        retry_attempt: 2,
+        identifier: issue_identifier,
+        issue: %Issue{id: issue_id, identifier: issue_identifier, state: "In Progress"},
+        worker_host: nil,
+        workspace_path: workspace,
+        workspace_root: test_root,
+        started_at: DateTime.utc_now()
+      }
+
+      state = %Orchestrator.State{
+        run_ledger_path: blocked_path,
+        runner_generation: "runner-terminal-ledger-block",
+        running: %{issue_id => running_entry},
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+      }
+
+      terminal_issue = %Issue{id: issue_id, identifier: issue_identifier, state: "Closed"}
+      blocked_state = Orchestrator.reconcile_issue_states_for_test([terminal_issue], state)
+
+      assert blocked_state.running[issue_id].terminal_pending.transition == "run_stopped"
+      assert MapSet.member?(blocked_state.claimed, issue_id)
+      assert Process.alive?(agent_pid)
+      assert File.exists?(workspace)
+
+      seed_running_ledger!(valid_path, blocked_state.running[issue_id])
+
+      recovered_state =
+        blocked_state
+        |> Map.put(:run_ledger_path, valid_path)
+        |> Orchestrator.retry_pending_terminal_transitions_for_test()
+
+      assert_receive {:worker_shutdown_write, :ok}
+      refute Map.has_key?(recovered_state.running, issue_id)
+      refute MapSet.member?(recovered_state.claimed, issue_id)
+      refute Process.alive?(agent_pid)
+      refute File.exists?(workspace)
+
+      assert {:ok, [_claim, _started, event, cleanup_event]} = RunLedger.read_events(valid_path)
+      assert event["transition"] == "run_stopped"
+      assert event["terminal_reason"] == "tracker_terminal"
+      assert cleanup_event["transition"] == "workspace_cleanup_completed"
+      assert cleanup_event["workspace_path"] == workspace
     after
       File.rm_rf(test_root)
     end
@@ -951,6 +1892,8 @@ defmodule SymphonyElixir.CoreTest do
       running_entry = %{
         pid: agent_pid,
         ref: nil,
+        run_id: "run-missing",
+        retry_attempt: 0,
         identifier: issue_identifier,
         issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
         started_at: DateTime.utc_now()
@@ -1080,6 +2023,8 @@ defmodule SymphonyElixir.CoreTest do
     running_entry = %{
       pid: self(),
       ref: ref,
+      run_id: "run-resume",
+      retry_attempt: 0,
       identifier: "MT-558",
       issue: %Issue{id: issue_id, identifier: "MT-558", state: "In Progress"},
       started_at: DateTime.utc_now()
@@ -1121,6 +2066,7 @@ defmodule SymphonyElixir.CoreTest do
     running_entry = %{
       pid: self(),
       ref: ref,
+      run_id: "run-crash",
       identifier: "MT-559",
       retry_attempt: 2,
       issue: %Issue{id: issue_id, identifier: "MT-559", state: "In Progress"},
@@ -1139,7 +2085,7 @@ defmodule SymphonyElixir.CoreTest do
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
+    assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent_exit"} =
              state.retry_attempts[issue_id]
 
     assert_scheduled_delay(due_at_ms, scheduled_from_ms, 40_000)
@@ -1162,6 +2108,8 @@ defmodule SymphonyElixir.CoreTest do
     running_entry = %{
       pid: self(),
       ref: ref,
+      run_id: "run-crash-initial",
+      retry_attempt: 0,
       identifier: "MT-560",
       issue: %Issue{id: issue_id, identifier: "MT-560", state: "In Progress"},
       started_at: DateTime.utc_now()
@@ -1179,7 +2127,7 @@ defmodule SymphonyElixir.CoreTest do
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
+    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent_exit"} =
              state.retry_attempts[issue_id]
 
     assert_scheduled_delay(due_at_ms, scheduled_from_ms, 10_000)
@@ -1209,7 +2157,7 @@ defmodule SymphonyElixir.CoreTest do
           retry_token: current_retry_token,
           due_at_ms: System.monotonic_time(:millisecond) + 30_000,
           identifier: "MT-561",
-          error: "agent exited: :boom"
+          error: "agent_exit"
         }
       })
     end)
@@ -1221,7 +2169,7 @@ defmodule SymphonyElixir.CoreTest do
              attempt: 2,
              retry_token: ^current_retry_token,
              identifier: "MT-561",
-             error: "agent exited: :boom"
+             error: "agent_exit"
            } = :sys.get_state(pid).retry_attempts[issue_id]
   end
 
@@ -1294,7 +2242,7 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    assert {:noreply, reconciled_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    reconciled_state = Orchestrator.run_poll_cycle_for_test(state)
     assert reconciled_state.parked[issue_id].wait_id == wait.wait_id
     assert reconciled_state.operator_comment_cursors == %{}
 
@@ -1326,6 +2274,8 @@ defmodule SymphonyElixir.CoreTest do
                parked_at: cursor_at
              })
 
+    seed_parked_ledger!(ledger_path, wait)
+
     comment = %SymphonyElixir.Linear.Comment{
       id: "comment-retry",
       body: "$retry after reconnect",
@@ -1350,19 +2300,378 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    assert {:noreply, resumed_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    resumed_state = Orchestrator.run_poll_cycle_for_test(state)
     refute Map.has_key?(resumed_state.parked, issue_id)
-    assert MapSet.member?(resumed_state.processed_operator_comment_ids, comment.id)
+    assert MapSet.member?(resumed_state.operator_commands.processed_comment_ids, comment.id)
 
-    assert {:noreply, repeated_state} =
-             Orchestrator.handle_info(:run_poll_cycle, resumed_state)
+    repeated_state = Orchestrator.run_poll_cycle_for_test(resumed_state)
 
     if is_reference(repeated_state.tick_timer_ref),
       do: Process.cancel_timer(repeated_state.tick_timer_ref)
 
     assert {:ok, events} = RunLedger.read_events(ledger_path)
-    assert Enum.count(events, &(&1["transition"] == "wait_resumed")) == 1
+    assert Enum.count(events, &(&1["transition"] == "resume_queued")) == 1
     assert Enum.count(events, &(&1["transition"] == "operator_command_applied")) == 1
+  end
+
+  test "applied operator command retries its durable outcome without reapplying the action" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"],
+      poll_interval_ms: 60_000
+    )
+
+    ledger_path = ledger_path("operator-outcome-retry")
+    issue_id = "issue-operator-outcome-retry"
+    cursor_at = ~U[2026-08-03 10:00:00Z]
+    command_at = ~U[2026-08-03 10:00:01Z]
+
+    assert {:ok, wait} =
+             SymphonyElixir.OperatorWait.new("waiting_secret", %{
+               issue_id: issue_id,
+               identifier: "MT-OPERATOR-OUTCOME",
+               run_id: "run-operator-outcome",
+               parked_at: cursor_at
+             })
+
+    seed_parked_ledger!(ledger_path, wait)
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "operator_cursor_initialized",
+               stage: "operator",
+               issue_id: issue_id,
+               comment_created_at: DateTime.to_iso8601(cursor_at),
+               runner_generation: "runner-operator-outcome"
+             })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "dispatch_paused",
+               stage: "operator",
+               runner_generation: "runner-operator-outcome"
+             })
+
+    comment = %SymphonyElixir.Linear.Comment{
+      id: "comment-outcome-retry",
+      body: "$retry",
+      created_at: command_at,
+      author_id: "operator-1"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue_id => [comment]
+    })
+
+    append_fn = fn path, event ->
+      if event.transition == "operator_command_applied",
+        do: {:error, :forced_operator_outcome_failure},
+        else: RunLedger.append(path, event)
+    end
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 60_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: append_fn,
+      runner_generation: "runner-operator-outcome",
+      dispatch_paused: true,
+      parked: %{issue_id => wait},
+      operator_comment_cursors: %{
+        issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    failed_state = Orchestrator.run_poll_cycle_for_test(state)
+
+    if is_reference(failed_state.tick_timer_ref),
+      do: Process.cancel_timer(failed_state.tick_timer_ref)
+
+    refute Map.has_key?(failed_state.parked, issue_id)
+    assert Map.has_key?(failed_state.queued_resumes, issue_id)
+    assert Map.has_key?(failed_state.operator_commands.pending_outcomes, comment.id)
+    refute MapSet.member?(failed_state.operator_commands.processed_comment_ids, comment.id)
+
+    assert %{created_at: ^cursor_at, comment_ids: comment_ids} =
+             failed_state.operator_comment_cursors[issue_id]
+
+    assert MapSet.size(comment_ids) == 0
+
+    assert {:ok, failed_events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(failed_events, &(&1["transition"] == "resume_queued")) == 1
+    refute Enum.any?(failed_events, &(&1["transition"] == "operator_command_applied"))
+
+    assert Enum.any?(failed_events, fn event ->
+             event["transition"] == "resume_queued" and
+               event["comment_id"] == comment.id and
+               event["operator_command"] == "retry"
+           end)
+
+    assert {:ok, recovery} =
+             RunLedger.reconcile_startup(ledger_path, "runner-operator-outcome-check")
+
+    assert recovery.pending_operator_outcomes[comment.id]["operator_command"] == "retry"
+
+    name =
+      {:global, {__MODULE__, :operator_outcome_restart, System.unique_integer([:positive])}}
+
+    assert {:ok, pid} = Orchestrator.start_link(name: name, run_ledger_path: ledger_path)
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    recovered_state = :sys.get_state(pid)
+    assert recovered_state.operator_commands.pending_outcomes == %{}
+
+    assert MapSet.member?(
+             recovered_state.operator_commands.processed_comment_ids,
+             comment.id
+           )
+
+    assert %{created_at: ^command_at, comment_ids: recovered_comment_ids} =
+             recovered_state.operator_comment_cursors[issue_id]
+
+    assert MapSet.member?(recovered_comment_ids, comment.id)
+
+    assert {:ok, recovered_events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(recovered_events, &(&1["transition"] == "resume_queued")) == 1
+    assert Enum.count(recovered_events, &(&1["transition"] == "operator_command_applied")) == 1
+  end
+
+  test "pending reject command is suppressed across polls and later comments" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"],
+      poll_interval_ms: 60_000
+    )
+
+    ledger_path = ledger_path("pending-reject-command")
+    issue_id = "issue-pending-reject-command"
+    cursor_at = ~U[2026-08-03 11:00:00Z]
+    command_at = ~U[2026-08-03 11:00:01Z]
+    later_at = ~U[2026-08-03 11:00:02Z]
+
+    assert {:ok, wait} =
+             SymphonyElixir.OperatorWait.new("waiting_secret", %{
+               issue_id: issue_id,
+               identifier: "MT-PENDING-REJECT",
+               run_id: "run-pending-reject",
+               parked_at: cursor_at
+             })
+
+    seed_parked_ledger!(ledger_path, wait)
+
+    command = %SymphonyElixir.Linear.Comment{
+      id: "comment-pending-reject",
+      body: "$reject",
+      created_at: command_at,
+      author_id: "operator-1"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue_id => [command]})
+
+    assert Config.settings!().tracker.operator_user_ids == ["operator-1"]
+    assert {:ok, [^command]} = Tracker.fetch_comments_since(issue_id, cursor_at)
+
+    append_fn = fn path, event ->
+      if event.transition == "operator_command_applied",
+        do: {:error, :forced_operator_outcome_failure},
+        else: RunLedger.append(path, event)
+    end
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 60_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: append_fn,
+      runner_generation: "runner-pending-reject",
+      dispatch_paused: true,
+      parked: %{issue_id => wait},
+      operator_comment_cursors: %{
+        issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    first_failed = Orchestrator.run_poll_cycle_for_test(state)
+    assert Map.has_key?(first_failed.operator_commands.pending_outcomes, command.id)
+
+    second_failed = Orchestrator.run_poll_cycle_for_test(first_failed)
+
+    later_comment = %SymphonyElixir.Linear.Comment{
+      id: "comment-after-pending-reject",
+      body: "ordinary operator note",
+      created_at: later_at,
+      author_id: "operator-1"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue_id => [command, later_comment]
+    })
+
+    advanced_state = Orchestrator.run_poll_cycle_for_test(second_failed)
+
+    if is_reference(advanced_state.tick_timer_ref),
+      do: Process.cancel_timer(advanced_state.tick_timer_ref)
+
+    assert Map.has_key?(advanced_state.operator_commands.pending_outcomes, command.id)
+    refute MapSet.member?(advanced_state.operator_commands.processed_comment_ids, command.id)
+
+    assert %{created_at: ^later_at, comment_ids: later_comment_ids} =
+             advanced_state.operator_comment_cursors[issue_id]
+
+    assert MapSet.member?(later_comment_ids, later_comment.id)
+
+    assert {:ok, pending_events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(pending_events, &(&1["transition"] == "wait_rejected")) == 1
+    refute Enum.any?(pending_events, &(&1["transition"] == "operator_command_applied"))
+
+    completed_state =
+      advanced_state
+      |> Map.put(:run_ledger_append_fn, &RunLedger.append/2)
+      |> Orchestrator.retry_pending_operator_outcomes_for_test()
+
+    assert completed_state.operator_commands.pending_outcomes == %{}
+
+    assert MapSet.member?(
+             completed_state.operator_commands.processed_comment_ids,
+             command.id
+           )
+
+    assert completed_state.operator_comment_cursors[issue_id].created_at == later_at
+
+    assert {:ok, completed_events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(completed_events, &(&1["transition"] == "wait_rejected")) == 1
+    assert Enum.count(completed_events, &(&1["transition"] == "operator_command_applied")) == 1
+  end
+
+  test "pending stop command cannot be reclassified as rejected" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"],
+      poll_interval_ms: 60_000
+    )
+
+    ledger_path = ledger_path("pending-stop-command")
+    issue_id = "issue-pending-stop-command"
+    cursor_at = ~U[2026-08-03 12:00:00Z]
+    command_at = ~U[2026-08-03 12:00:01Z]
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-PENDING-STOP",
+      title: "Do not reclassify the stop",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    command = %SymphonyElixir.Linear.Comment{
+      id: "comment-pending-stop",
+      body: "$stop",
+      created_at: command_at,
+      author_id: "operator-1"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue_id => [command]})
+
+    assert Config.settings!().tracker.operator_user_ids == ["operator-1"]
+    assert {:ok, [^command]} = Tracker.fetch_comments_since(issue_id, cursor_at)
+
+    assert {:ok, wait} =
+             SymphonyElixir.OperatorWait.new("operator_stopped", %{
+               issue_id: issue_id,
+               identifier: issue.identifier,
+               run_id: "run-pending-stop",
+               attempt: 0,
+               tracker_state: issue.state,
+               terminal_reason: "operator_stop",
+               parked_at: cursor_at
+             })
+
+    seed_running_ledger!(ledger_path, %{
+      run_id: wait.run_id,
+      retry_attempt: wait.attempt,
+      identifier: wait.identifier,
+      issue: issue
+    })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "run_parked",
+               stage: "parked",
+               run_id: wait.run_id,
+               issue_id: wait.issue_id,
+               issue_identifier: wait.identifier,
+               attempt: wait.attempt,
+               wait_id: wait.wait_id,
+               parked_reason: wait.reason,
+               allowed_actions: wait.allowed_actions,
+               tracker_state: wait.tracker_state,
+               terminal_reason: wait.terminal_reason,
+               comment_id: command.id,
+               comment_created_at: DateTime.to_iso8601(command.created_at),
+               operator_command: "stop"
+             })
+
+    append_fn = fn path, event ->
+      if event.transition == "operator_command_applied",
+        do: {:error, :forced_operator_outcome_failure},
+        else: RunLedger.append(path, event)
+    end
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 60_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: append_fn,
+      runner_generation: "runner-pending-stop",
+      dispatch_paused: true,
+      parked: %{issue_id => wait},
+      operator_commands: %Orchestrator.OperatorCommandState{
+        pending_outcomes: %{
+          command.id => %{
+            transition: "operator_command_applied",
+            issue_id: issue_id,
+            comment_id: command.id,
+            comment_created_at: command.created_at,
+            operator_command: "stop"
+          }
+        }
+      },
+      operator_comment_cursors: %{
+        issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    first_failed = Orchestrator.run_poll_cycle_for_test(state)
+    assert Map.has_key?(first_failed.operator_commands.pending_outcomes, command.id)
+
+    second_failed = Orchestrator.run_poll_cycle_for_test(first_failed)
+
+    if is_reference(second_failed.tick_timer_ref),
+      do: Process.cancel_timer(second_failed.tick_timer_ref)
+
+    assert Map.has_key?(second_failed.operator_commands.pending_outcomes, command.id)
+    assert Map.has_key?(second_failed.parked, issue_id)
+
+    assert {:ok, pending_events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(pending_events, &(&1["transition"] == "run_parked")) == 1
+    refute Enum.any?(pending_events, &(&1["transition"] == "operator_command_applied"))
+    refute Enum.any?(pending_events, &(&1["transition"] == "operator_command_rejected"))
+
+    completed_state =
+      second_failed
+      |> Map.put(:run_ledger_append_fn, &RunLedger.append/2)
+      |> Orchestrator.retry_pending_operator_outcomes_for_test()
+
+    assert completed_state.operator_commands.pending_outcomes == %{}
+
+    assert {:ok, completed_events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(completed_events, &(&1["transition"] == "run_parked")) == 1
+    assert Enum.count(completed_events, &(&1["transition"] == "operator_command_applied")) == 1
+    refute Enum.any?(completed_events, &(&1["transition"] == "operator_command_rejected"))
   end
 
   test "first operator cursor does not execute historical comments for recovered waits" do
@@ -1410,7 +2719,7 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    assert {:noreply, reconciled_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    reconciled_state = Orchestrator.run_poll_cycle_for_test(state)
     assert reconciled_state.parked[issue_id].wait_id == wait.wait_id
 
     assert %{created_at: cursor_at, comment_ids: comment_ids} =
@@ -1423,7 +2732,7 @@ defmodule SymphonyElixir.CoreTest do
       do: Process.cancel_timer(reconciled_state.tick_timer_ref)
 
     assert {:ok, events} = RunLedger.read_events(ledger_path)
-    refute Enum.any?(events, &(&1["transition"] == "wait_resumed"))
+    refute Enum.any?(events, &(&1["transition"] == "resume_queued"))
     refute Enum.any?(events, &(&1["transition"] == "operator_command_applied"))
   end
 
@@ -1497,7 +2806,9 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    assert {:noreply, stopped_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    seed_running_ledger!(ledger_path, running_entry)
+
+    stopped_state = Orchestrator.run_poll_cycle_for_test(state)
     refute Map.has_key?(stopped_state.running, issue_id)
 
     assert Map.has_key?(stopped_state.parked, issue_id),
@@ -1562,6 +2873,535 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
+  test "strict workspace affinity never hops to another ssh host" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    state = %Orchestrator.State{
+      running: %{
+        "issue-1" => %{worker_host: "worker-a"}
+      }
+    }
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-b"
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", true) ==
+             :no_worker_capacity
+
+    assert Orchestrator.select_worker_host_for_test(state, "retired-worker", true) ==
+             :affinity_unavailable
+  end
+
+  test "local workspace affinity is validated before after-create hooks" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-workspace-affinity-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    hook_marker = Path.join(test_root, "after-create-ran")
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_after_create: "touch #{hook_marker}"
+    )
+
+    issue = %Issue{id: "issue-affinity", identifier: "MT-AFFINITY", state: "In Progress"}
+    expected_workspace = Path.join(workspace_root, issue.identifier)
+
+    assert {:ok, actual_workspace} =
+             Workspace.create_for_issue(issue, nil, expected_workspace_path: expected_workspace)
+
+    assert {:ok, canonical_expected_workspace} =
+             SymphonyElixir.PathSafety.canonicalize(expected_workspace)
+
+    assert actual_workspace == canonical_expected_workspace
+
+    File.rm_rf!(actual_workspace)
+    File.rm(hook_marker)
+
+    assert {:error, {:workspace_outside_root, _workspace, _root}} =
+             Workspace.create_for_issue(issue, nil,
+               expected_workspace_path: Path.join([test_root, "outside", issue.identifier]),
+               expected_workspace_root: workspace_root,
+               expected_worker_host: nil
+             )
+
+    refute File.exists?(hook_marker)
+  end
+
+  test "persisted local affinity is selected before live-root filesystem mutation" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-local-prepare-root-change-#{System.unique_integer([:positive])}"
+      )
+
+    old_root = Path.join(test_root, "old-root")
+    new_root = Path.join(test_root, "new-root")
+    identifier = "MT-LOCAL-ROOT-CHANGE"
+    old_workspace = Path.join(old_root, identifier)
+    wrong_root_target = Path.join(new_root, identifier)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+    File.mkdir_p!(old_workspace)
+    File.mkdir_p!(new_root)
+    File.write!(Path.join(old_workspace, "preserved-work"), "old")
+    File.write!(wrong_root_target, "wrong-root-file-must-survive")
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: new_root)
+
+    assert {:ok, prepared} =
+             Workspace.prepare_for_issue(identifier, nil,
+               expected_workspace_path: old_workspace,
+               expected_workspace_root: old_root,
+               expected_worker_host: nil
+             )
+
+    assert {:ok, canonical_old_workspace} = SymphonyElixir.PathSafety.canonicalize(old_workspace)
+    assert {:ok, canonical_old_root} = SymphonyElixir.PathSafety.canonicalize(old_root)
+    assert prepared.path == canonical_old_workspace
+    assert prepared.root == canonical_old_root
+    assert File.read!(Path.join(old_workspace, "preserved-work")) == "old"
+    assert File.read!(wrong_root_target) == "wrong-root-file-must-survive"
+  end
+
+  test "persisted remote affinity selects exact root and rejects host mismatch before ssh" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-remote-prepare-root-change-#{System.unique_integer([:positive])}"
+      )
+
+    old_root = Path.join(test_root, "remote-old-root")
+    new_root = Path.join(test_root, "remote-new-root")
+    identifier = "MT-REMOTE-ROOT-CHANGE"
+    old_workspace = Path.join(old_root, identifier)
+    wrong_root_workspace = Path.join(new_root, identifier)
+    wrong_root_sentinel = Path.join(wrong_root_workspace, "must-survive")
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_sentinel = System.get_env("SYMP_TEST_WRONG_ROOT_SENTINEL")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      restore_env("SYMP_TEST_WRONG_ROOT_SENTINEL", previous_sentinel)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(wrong_root_workspace)
+    File.write!(wrong_root_sentinel, "wrong-root-directory-must-survive")
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("SYMP_TEST_WRONG_ROOT_SENTINEL", wrong_root_sentinel)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    case "$*" in
+      *"rm -rf"*"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'UNSAFE_PREFLIGHT' >> "${SYMP_TEST_SSH_TRACE}"
+        rm -f "${SYMP_TEST_WRONG_ROOT_SENTINEL}"
+        exit 76
+        ;;
+      *#{wrong_root_workspace}*"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'PREFLIGHT:#{old_root}:#{wrong_root_workspace}' >> "${SYMP_TEST_SSH_TRACE}"
+        printf '%s\t%s\t%s\n' '__SYMPHONY_AFFINITY__' '#{old_root}' '#{wrong_root_workspace}'
+        exit 0
+        ;;
+      *#{old_workspace}*"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'PREFLIGHT:#{old_root}:#{old_workspace}' >> "${SYMP_TEST_SSH_TRACE}"
+        printf '%s\t%s\t%s\n' '__SYMPHONY_AFFINITY__' '#{old_root}' '#{old_workspace}'
+        exit 0
+        ;;
+      *#{old_workspace}*"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\n' 'MUTATE:#{old_workspace}' >> "${SYMP_TEST_SSH_TRACE}"
+        printf '%s\t%s\t%s\n' '__SYMPHONY_WORKSPACE__' '0' '#{old_workspace}'
+        exit 0
+        ;;
+      *#{wrong_root_workspace}*"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\n' 'WRONG_MUTATE:#{wrong_root_workspace}' >> "${SYMP_TEST_SSH_TRACE}"
+        rm -f "${SYMP_TEST_WRONG_ROOT_SENTINEL}"
+        printf '%s\t%s\t%s\n' '__SYMPHONY_WORKSPACE__' '0' '#{wrong_root_workspace}'
+        exit 0
+        ;;
+      *)
+        exit 75
+        ;;
+    esac
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: new_root)
+
+    assert {:ok, prepared} =
+             Workspace.prepare_for_issue(identifier, "worker-a",
+               expected_workspace_path: old_workspace,
+               expected_workspace_root: old_root,
+               expected_worker_host: "worker-a"
+             )
+
+    assert prepared.path == old_workspace
+    assert prepared.root == old_root
+    assert File.read!(wrong_root_sentinel) == "wrong-root-directory-must-survive"
+    trace = File.read!(trace_file)
+    assert trace =~ old_workspace
+    refute trace =~ wrong_root_workspace
+
+    [preflight_trace, mutation_trace] = String.split(trace, "\n", trim: true)
+    assert preflight_trace == "PREFLIGHT:#{old_root}:#{old_workspace}"
+    assert mutation_trace == "MUTATE:#{old_workspace}"
+
+    File.write!(trace_file, "")
+
+    assert {:error, {:workspace_outside_root, ^wrong_root_workspace, ^old_root}} =
+             Workspace.prepare_for_issue(identifier, "worker-a",
+               expected_workspace_path: wrong_root_workspace,
+               expected_workspace_root: old_root,
+               expected_worker_host: "worker-a"
+             )
+
+    trace = File.read!(trace_file)
+    assert String.trim(trace) == "PREFLIGHT:#{old_root}:#{wrong_root_workspace}"
+    refute trace =~ "MUTATE:"
+    assert File.read!(wrong_root_sentinel) == "wrong-root-directory-must-survive"
+
+    File.write!(trace_file, "")
+
+    assert {:error, {:workspace_host_affinity_mismatch, "worker-a", "worker-b"}} =
+             Workspace.prepare_for_issue(identifier, "worker-b",
+               expected_workspace_path: old_workspace,
+               expected_workspace_root: old_root,
+               expected_worker_host: "worker-a"
+             )
+
+    assert File.read!(trace_file) == ""
+    assert File.read!(wrong_root_sentinel) == "wrong-root-directory-must-survive"
+  end
+
+  test "remote tilde affinity is resolved on its host and reused across retry and restart" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-remote-tilde-affinity-#{System.unique_integer([:positive])}"
+      )
+
+    identifier = "MT-REMOTE-TILDE"
+    local_home = Path.join(test_root, "local-home")
+    remote_home = "/home/remote-user"
+    remote_root = remote_home <> "/.symphony-remote-workspaces"
+    remote_workspace = remote_root <> "/#{identifier}"
+    changed_remote_root = remote_home <> "/changed-workspaces"
+    local_wrong_workspace = Path.join([local_home, ".symphony-remote-workspaces", identifier])
+    local_sentinel = Path.join(local_wrong_workspace, "must-survive")
+    remote_wrong_sentinel = Path.join(test_root, "remote-wrong-root-must-survive")
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    ledger_path = Path.join(test_root, "events.jsonl")
+    previous_home = System.get_env("HOME")
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_sentinel = System.get_env("SYMP_TEST_WRONG_ROOT_SENTINEL")
+
+    on_exit(fn ->
+      restore_env("HOME", previous_home)
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      restore_env("SYMP_TEST_WRONG_ROOT_SENTINEL", previous_sentinel)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(local_wrong_workspace)
+    File.write!(local_sentinel, "local-home-path-must-survive")
+    File.write!(remote_wrong_sentinel, "remote-wrong-root-must-survive")
+    System.put_env("HOME", local_home)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("SYMP_TEST_WRONG_ROOT_SENTINEL", remote_wrong_sentinel)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    case "$*" in
+      *"rm -rf"*"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'UNSAFE_PREFLIGHT' >> "${SYMP_TEST_SSH_TRACE}"
+        rm -f "${SYMP_TEST_WRONG_ROOT_SENTINEL}"
+        exit 76
+        ;;
+      *legacy-missing*"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'PREFLIGHT_FAILED:legacy-missing' >> "${SYMP_TEST_SSH_TRACE}"
+        exit 74
+        ;;
+      *"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'PREFLIGHT:#{remote_root}:#{remote_workspace}' >> "${SYMP_TEST_SSH_TRACE}"
+        printf '%s\t%s\t%s\n' '__SYMPHONY_AFFINITY__' '#{remote_root}' '#{remote_workspace}'
+        exit 0
+        ;;
+      *#{remote_workspace}*"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\n' 'MUTATE:#{remote_workspace}' >> "${SYMP_TEST_SSH_TRACE}"
+        printf '%s\t%s\t%s\n' '__SYMPHONY_WORKSPACE__' '0' '#{remote_workspace}'
+        exit 0
+        ;;
+      *"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\n' 'WRONG_MUTATE' >> "${SYMP_TEST_SSH_TRACE}"
+        rm -f "${SYMP_TEST_WRONG_ROOT_SENTINEL}"
+        exit 75
+        ;;
+      *)
+        exit 75
+        ;;
+    esac
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: "~/.symphony-remote-workspaces",
+      worker_ssh_hosts: ["worker-a", "worker-b"]
+    )
+
+    issue = %Issue{
+      id: "issue-remote-tilde",
+      identifier: identifier,
+      title: "Remote tilde affinity",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    state = %Orchestrator.State{
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: &RunLedger.append/2,
+      runner_generation: "runner-remote-tilde",
+      task_start_fn: fn _task -> {:error, :forced_spawn_failure} end,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    failed =
+      Orchestrator.claim_and_start_issue_for_test(
+        state,
+        issue,
+        1,
+        "worker-a",
+        nil,
+        nil,
+        nil
+      )
+
+    assert {:ok, [claim | _events]} = RunLedger.read_events(ledger_path)
+    assert claim["transition"] == "run_claimed"
+    assert claim["worker_host"] == "worker-a"
+    assert claim["workspace_path"] == remote_workspace
+    assert claim["workspace_root"] == remote_root
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(ledger_path, "runner-remote-tilde-restart")
+    recovered = recovery.recovered_dispatches[issue.id]
+    assert recovered.worker_host == "worker-a"
+    assert recovered.workspace_path == remote_workspace
+    assert recovered.workspace_root == remote_root
+
+    Process.cancel_timer(failed.retry_attempts[issue.id].timer_ref)
+
+    assert {:ok, legacy_retry} =
+             Workspace.prepare_for_issue(identifier, "worker-a",
+               expected_workspace_path: remote_workspace,
+               expected_workspace_root: "~/.symphony-remote-workspaces",
+               expected_worker_host: "worker-a"
+             )
+
+    assert legacy_retry.path == remote_workspace
+    assert legacy_retry.root == remote_root
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: changed_remote_root)
+
+    assert {:ok, restarted} =
+             Workspace.prepare_for_issue(identifier, "worker-a",
+               expected_workspace_path: recovered.workspace_path,
+               expected_workspace_root: recovered.workspace_root,
+               expected_worker_host: "worker-a"
+             )
+
+    assert restarted.path == remote_workspace
+    assert restarted.root == remote_root
+    assert File.read!(local_sentinel) == "local-home-path-must-survive"
+    assert File.read!(remote_wrong_sentinel) == "remote-wrong-root-must-survive"
+
+    trace_lines = trace_file |> File.read!() |> String.split("\n", trim: true)
+    assert length(trace_lines) == 6
+
+    trace_lines
+    |> Enum.chunk_every(2)
+    |> Enum.each(fn [preflight, mutation] ->
+      assert preflight == "PREFLIGHT:#{remote_root}:#{remote_workspace}"
+      assert mutation == "MUTATE:#{remote_workspace}"
+      refute mutation =~ changed_remote_root
+      refute mutation =~ local_home
+    end)
+
+    File.write!(trace_file, "")
+
+    assert {:error, {:workspace_host_affinity_mismatch, "worker-a", "worker-b"}} =
+             Workspace.prepare_for_issue(identifier, "worker-b",
+               expected_workspace_path: recovered.workspace_path,
+               expected_workspace_root: recovered.workspace_root,
+               expected_worker_host: "worker-a"
+             )
+
+    assert File.read!(trace_file) == ""
+
+    assert {:error, {:workspace_affinity_preflight_failed, "worker-a", 74, ""}} =
+             Workspace.prepare_for_issue("legacy-missing", "worker-a",
+               expected_workspace_path: "~/.symphony-remote-workspaces/legacy-missing",
+               expected_workspace_root: "~/.symphony-remote-workspaces",
+               expected_worker_host: "worker-a"
+             )
+
+    trace = File.read!(trace_file)
+    assert String.trim(trace) == "PREFLIGHT_FAILED:legacy-missing"
+    refute trace =~ "MUTATE:"
+    assert File.read!(remote_wrong_sentinel) == "remote-wrong-root-must-survive"
+  end
+
+  test "prepared affinity is acknowledged before workspace hooks or Codex" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-prepared-affinity-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    after_create_marker = Path.join(workspace_root, "MT-PREPARED/after-create.marker")
+    before_run_marker = Path.join(workspace_root, "MT-PREPARED/before-run.marker")
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_after_create: "touch after-create.marker",
+      hook_before_run: "touch before-run.marker",
+      codex_command: "/usr/bin/false"
+    )
+
+    issue = %Issue{
+      id: "issue-prepared-affinity",
+      identifier: "MT-PREPARED",
+      title: "Prepared affinity",
+      state: "In Progress"
+    }
+
+    assert {:ok, prepared} = Workspace.prepare_for_issue(issue, nil)
+    assert {:ok, canonical_root} = SymphonyElixir.PathSafety.canonicalize(workspace_root)
+    assert prepared.path == Path.join(canonical_root, issue.identifier)
+    assert prepared.root == canonical_root
+    refute File.exists?(after_create_marker)
+    refute File.exists?(before_run_marker)
+
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        try do
+          AgentRunner.run(issue, parent,
+            prepared_workspace: prepared,
+            expected_workspace_path: prepared.path,
+            runtime_ack_required: true,
+            run_id: "run-prepared-affinity"
+          )
+        rescue
+          RuntimeError -> :agent_failed_after_hooks
+        end
+      end)
+
+    assert_receive {:worker_runtime_info, issue_id, runtime_info, worker_pid, acknowledgment_ref},
+                   1_000
+
+    assert issue_id == issue.id
+    assert runtime_info.run_id == "run-prepared-affinity"
+    assert runtime_info.workspace_path == prepared.path
+    assert runtime_info.workspace_root == prepared.root
+    refute File.exists?(after_create_marker)
+    refute File.exists?(before_run_marker)
+
+    send(worker_pid, {:worker_runtime_ack, acknowledgment_ref, :ok})
+    assert Task.await(task, 5_000) == :agent_failed_after_hooks
+    assert File.exists?(after_create_marker)
+    assert File.exists?(before_run_marker)
+  end
+
+  test "model resolution acknowledgment blocks the first Codex prompt" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-model-resolution-boundary-#{System.unique_integer([:positive])}"
+      )
+
+    previous_discovery =
+      Application.get_env(:symphony_elixir, :codex_model_discovery_enabled)
+
+    on_exit(fn ->
+      restore_app_env(:codex_model_discovery_enabled, previous_discovery)
+      File.rm_rf(test_root)
+    end)
+
+    Application.put_env(:symphony_elixir, :codex_model_discovery_enabled, true)
+    fake = SymphonyElixir.ScenarioHarness.write_fake_codex!(test_root, :live_ok)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: Path.join(test_root, "workspaces"),
+      codex_command: "#{fake.binary} app-server"
+    )
+
+    issue = %Issue{
+      id: "issue-model-boundary",
+      identifier: "MT-MODEL-BOUNDARY",
+      title: "Block prompt until the model is durable",
+      state: "In Progress"
+    }
+
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        try do
+          AgentRunner.run(issue, parent,
+            runtime_ack_required: true,
+            run_id: "run-model-boundary",
+            runner_generation: "runner-model-boundary"
+          )
+        rescue
+          RuntimeError -> :agent_failed_before_prompt
+        end
+      end)
+
+    assert_receive {:worker_runtime_info, "issue-model-boundary", _runtime_info, worker_pid, runtime_ack_ref},
+                   1_000
+
+    send(worker_pid, {:worker_runtime_ack, runtime_ack_ref, :ok})
+
+    assert_receive {:worker_model_resolution, "issue-model-boundary", resolution_info, ^worker_pid, model_ack_ref},
+                   1_000
+
+    assert resolution_info.resolved_model == "gpt-live"
+    assert resolution_info.runner_generation == "runner-model-boundary"
+
+    trace_before_ack = File.read!(fake.trace)
+    assert trace_before_ack =~ ~s("method":"thread/start")
+    refute trace_before_ack =~ ~s("method":"turn/start")
+
+    send(
+      worker_pid,
+      {:worker_model_resolution_ack, model_ack_ref, {:error, {:ledger_write_failed, :forced_model_resolution_failure}}}
+    )
+
+    assert Task.await(task, 5_000) == :agent_failed_before_prompt
+    refute File.read!(fake.trace) =~ ~s("method":"turn/start")
+  end
+
   defp assert_scheduled_delay(due_at_ms, scheduled_from_ms, expected_delay_ms) do
     scheduled_delay_ms = due_at_ms - scheduled_from_ms
 
@@ -1574,6 +3414,11 @@ defmodule SymphonyElixir.CoreTest do
 
   test "fetch issues by states with empty state set is a no-op" do
     assert {:ok, []} = Client.fetch_issues_by_states([])
+  end
+
+  test "candidate revalidation rejects invalid tracker collections" do
+    assert {:error, :invalid_candidate_collection} =
+             Orchestrator.revalidate_poll_candidates_for_test(%{unexpected: "shape"})
   end
 
   test "prompt builder renders issue and attempt values from workflow template" do
@@ -2063,9 +3908,17 @@ defmodule SymphonyElixir.CoreTest do
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
 
       case "$*" in
+        *worker-a*"__SYMPHONY_AFFINITY__"*)
+          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_AFFINITY__' '/remote/home/.symphony-remote-workspaces' '/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER'
+          exit 0
+          ;;
         *worker-a*"__SYMPHONY_WORKSPACE__"*)
           printf '%s\\n' 'worker-a prepare failed' >&2
           exit 75
+          ;;
+        *worker-b*"__SYMPHONY_AFFINITY__"*)
+          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_AFFINITY__' '/remote/home/.symphony-remote-workspaces' '/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER'
+          exit 0
           ;;
         *worker-b*"__SYMPHONY_WORKSPACE__"*)
           printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER'
@@ -2697,5 +4550,280 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp pending_dispatch_fixture(tag) do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-pending-dispatch-#{tag}-#{System.unique_integer([:positive])}"
+      )
+
+    raw_workspace_root = Path.join(test_root, "workspaces")
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: raw_workspace_root)
+    File.mkdir_p!(raw_workspace_root)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    {:ok, workspace_root} = SymphonyElixir.PathSafety.canonicalize(raw_workspace_root)
+    issue_id = "issue-pending-#{tag}"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-PENDING-#{String.upcase(tag)}",
+      title: "Pending dispatch #{tag}",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    workspace = Path.join(workspace_root, issue.identifier)
+    ledger_path = Path.join(test_root, "events.jsonl")
+    previous_run_id = "run-previous-#{tag}"
+
+    seed_durable_retry_ledger!(
+      ledger_path,
+      previous_run_id,
+      issue,
+      workspace,
+      workspace_root
+    )
+
+    retry_token = make_ref()
+
+    retry = %{
+      attempt: 2,
+      timer_ref: nil,
+      retry_token: retry_token,
+      due_at_ms: nil,
+      identifier: issue.identifier,
+      error: "previous_failure",
+      previous_run_id: previous_run_id,
+      previous_attempt: 1,
+      next_action: "retry",
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: workspace_root,
+      pending_event: nil,
+      status: :scheduled
+    }
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 1_000,
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: &RunLedger.append/2,
+      runner_generation: "runner-pending-dispatch",
+      retry_attempts: %{issue_id => retry},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    {state, issue, ledger_path, workspace_root}
+  end
+
+  defp seed_durable_retry_ledger!(path, run_id, issue, workspace, workspace_root) do
+    base = %{
+      run_id: run_id,
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      attempt: 1,
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: workspace_root
+    }
+
+    assert :ok = RunLedger.append(path, Map.merge(base, %{transition: "run_claimed", stage: "claimed"}))
+    assert :ok = RunLedger.append(path, Map.merge(base, %{transition: "run_started", stage: "running"}))
+
+    assert :ok =
+             RunLedger.append(
+               path,
+               Map.merge(base, %{
+                 transition: "run_failed",
+                 stage: "released",
+                 terminal_reason: "worker_exit",
+                 next_action: "retry",
+                 next_attempt: 2
+               })
+             )
+
+    assert :ok =
+             RunLedger.append(
+               path,
+               Map.merge(base, %{
+                 transition: "retry_scheduled",
+                 stage: "retry_queued",
+                 next_action: "retry",
+                 next_attempt: 2
+               })
+             )
+  end
+
+  defp assert_pending_dispatch_visible(state, issue_id, attempt) do
+    assert MapSet.member?(state.claimed, issue_id)
+
+    assert %{attempt: ^attempt, status: :scheduled, timer_ref: timer_ref} =
+             state.retry_attempts[issue_id]
+
+    assert is_reference(timer_ref)
+
+    assert {:reply, snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, state)
+
+    assert Enum.any?(snapshot.retrying, fn row ->
+             row.issue_id == issue_id and row.attempt == attempt and row.stage == "retry_queued"
+           end)
+  end
+
+  defp due_dispatch_state(state, issue_id) do
+    retry_token = state.retry_attempts[issue_id].retry_token
+
+    assert {:ok, attempt, _metadata, due_state} =
+             Orchestrator.due_retry_attempt_state_for_test(state, issue_id, retry_token)
+
+    assert due_state.retry_attempts[issue_id].attempt == attempt
+    assert due_state.retry_attempts[issue_id].status == :dispatching
+    refute is_reference(due_state.retry_attempts[issue_id].timer_ref)
+    due_state
+  end
+
+  defp terminal_transition_state(issue_id, ref, run_ledger_path, opts) do
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-TERMINAL",
+      state: "In Progress",
+      title: "Terminal persistence test"
+    }
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      run_id: "run-#{issue_id}",
+      retry_attempt: Keyword.fetch!(opts, :retry_attempt),
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: nil,
+      workspace_path: nil,
+      session_id: nil,
+      started_at: DateTime.utc_now(),
+      run_budget_timer_ref: nil
+    }
+
+    %Orchestrator.State{
+      run_ledger_path: run_ledger_path,
+      runner_generation: "runner-terminal-test",
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+  end
+
+  defp parked_reconcile_state(tag, workspace_path, workspace_root, worker_host) do
+    issue_id = "issue-parked-#{tag}"
+
+    wait = %{
+      issue_id: issue_id,
+      run_id: "run-parked-#{tag}",
+      attempt: 2,
+      identifier: "MT-PARKED-#{String.upcase(tag)}",
+      wait_id: "wait-parked-#{tag}",
+      reason: "waiting_owner",
+      allowed_actions: ["approve", "reject"],
+      stage: "parked",
+      tracker_state: "Human Review",
+      terminal_reason: nil,
+      worker_host: worker_host,
+      workspace_path: workspace_path,
+      workspace_root: workspace_root,
+      parked_at: DateTime.utc_now()
+    }
+
+    ledger_path = ledger_path("parked-#{tag}")
+    :ok = seed_parked_ledger!(ledger_path, wait)
+
+    state = %Orchestrator.State{
+      run_ledger_path: ledger_path,
+      runner_generation: "runner-parked-reconcile",
+      parked: %{issue_id => wait},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    {state, wait}
+  end
+
+  defp parked_workspace_root(tag) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-parked-reconcile-#{tag}-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+    root
+  end
+
+  defp install_fake_parked_cleanup_ssh!(tag) do
+    test_root = parked_workspace_root("ssh-#{tag}")
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    remote_root = "/remote/symphony/workspaces"
+    workspace = Path.join(remote_root, "MT-PARKED-#{String.upcase(tag)}")
+
+    File.mkdir_p!(test_root)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    printf 'ARGV:%s\\n' "$*" >> "${SYMP_TEST_SSH_TRACE}"
+    case "$*" in
+      *"__SYMPHONY_AFFINITY__"*)
+        printf '%s\\t%s\\t%s\\n' '__SYMPHONY_AFFINITY__' '#{remote_root}' '#{workspace}'
+        ;;
+    esac
+    exit 0
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+    end)
+
+    {remote_root, workspace, trace_file}
+  end
+
+  defp cleanup_request_failure_append_fn do
+    fn ledger_path, event ->
+      if event.transition == "workspace_cleanup_requested",
+        do: {:error, :forced_cleanup_request_append_failure},
+        else: RunLedger.append(ledger_path, event)
+    end
+  end
+
+  defp blocked_ledger_path do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-blocked-ledger-#{System.unique_integer([:positive])}"
+      )
+
+    blocking_file = Path.join(root, "not-a-directory")
+    File.mkdir_p!(root)
+    File.write!(blocking_file, "blocked")
+    on_exit(fn -> File.rm_rf(root) end)
+    Path.join(blocking_file, "events.jsonl")
+  end
+
+  defp ledger_path(tag) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-#{tag}-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+    Path.join(root, "events.jsonl")
   end
 end

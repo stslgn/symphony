@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{Config, ObservabilitySanitizer, Orchestrator, ParkedProjection, RateLimitTelemetry}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -12,17 +12,26 @@ defmodule SymphonyElixirWeb.Presenter do
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
         parked = Map.get(snapshot, :parked, [])
+        %{rows: parked_rows, metadata: parked_metadata} = ParkedProjection.collection(parked)
+
+        {cleanup_pending_rows, retry_rows} =
+          snapshot.retrying
+          |> Enum.map(&retry_entry_payload/1)
+          |> Enum.split_with(&(&1[:stage] == "cleanup_pending"))
 
         %{
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
-            retrying: length(snapshot.retrying),
+            retrying: length(retry_rows),
+            cleanup_pending: length(cleanup_pending_rows),
             parked: length(parked)
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
-          retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
-          parked: Enum.map(parked, &parked_entry_payload/1),
+          retrying: retry_rows,
+          cleanup_pending: cleanup_pending_rows,
+          parked: parked_rows,
+          parked_meta: parked_metadata,
           control: Map.get(snapshot, :control, %{dispatch_paused: false}),
           capabilities:
             Map.get(snapshot, :capabilities, %{
@@ -31,7 +40,7 @@ defmodule SymphonyElixirWeb.Presenter do
               mcp_elicitation_auto_approve: []
             }),
           codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: RateLimitTelemetry.project(snapshot.rate_limits)
         }
 
       :timeout ->
@@ -53,7 +62,14 @@ defmodule SymphonyElixirWeb.Presenter do
         if is_nil(running) and is_nil(retry) and is_nil(parked) do
           {:error, :issue_not_found}
         else
-          {:ok, issue_payload_body(issue_identifier, running, retry, parked)}
+          {:ok,
+           issue_payload_body(
+             issue_identifier,
+             running,
+             retry,
+             parked,
+             parked && ParkedProjection.row(parked)
+           )}
         end
 
       _ ->
@@ -102,14 +118,14 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry, parked) do
+  defp issue_payload_body(issue_identifier, running, retry, parked, parked_payload) do
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry, parked),
+      issue_id: issue_id_from_entries(running, retry, parked_payload),
       status: issue_status(running, retry, parked),
       workspace: %{
-        path: workspace_path(issue_identifier, running, retry, parked),
-        host: workspace_host(running, retry)
+        path: workspace_path(issue_identifier, running, retry, parked_payload),
+        host: workspace_host(running, retry, parked_payload)
       },
       attempts: %{
         restart_count: restart_count(retry),
@@ -117,12 +133,12 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       running: running && running_issue_payload(running),
       retry: retry && retry_issue_payload(retry),
-      parked: parked && parked_issue_payload(parked),
+      parked: parked_payload,
       logs: %{
         codex_session_logs: []
       },
       recent_events: (running && recent_events_payload(running)) || [],
-      last_error: retry && retry.error,
+      last_error_code: retry && ObservabilitySanitizer.retry_error_code(retry.error),
       tracked: %{}
     }
   end
@@ -135,6 +151,9 @@ defmodule SymphonyElixirWeb.Presenter do
   defp retry_attempt(retry), do: retry.attempt || 0
 
   defp issue_status(_running, _retry, parked) when not is_nil(parked), do: "parked"
+  defp issue_status(nil, %{stage: "resume_queued"}, nil), do: "resume_queued"
+  defp issue_status(nil, %{stage: "recovery_queued"}, nil), do: "recovery_queued"
+  defp issue_status(nil, %{stage: "cleanup_pending"}, nil), do: "cleanup_pending"
   defp issue_status(_running, nil, nil), do: "running"
   defp issue_status(nil, _retry, nil), do: "retrying"
   defp issue_status(_running, _retry, nil), do: "running"
@@ -147,12 +166,10 @@ defmodule SymphonyElixirWeb.Presenter do
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
-      session_title: Map.get(entry, :session_title),
       model: model_payload(entry),
       model_catalog: Map.get(entry, :model_catalog),
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_codex_event,
-      last_message: summarize_message(entry.last_codex_message),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
       tokens: %{
@@ -165,31 +182,17 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp retry_entry_payload(entry) do
-    %{
+    payload = %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
       attempt: entry.attempt,
       due_at: due_at_iso8601(entry.due_in_ms),
-      error: entry.error,
+      error_code: ObservabilitySanitizer.retry_error_code(entry.error),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path)
     }
-  end
 
-  defp parked_entry_payload(entry) do
-    %{
-      issue_id: entry.issue_id,
-      issue_identifier: entry.identifier,
-      wait_id: entry.wait_id,
-      reason: entry.reason,
-      allowed_actions: entry.allowed_actions,
-      tracker_state: entry.tracker_state,
-      run_id: entry.run_id,
-      attempt: entry.attempt,
-      stage: entry.stage,
-      terminal_reason: Map.get(entry, :terminal_reason),
-      parked_at: iso8601(entry.parked_at)
-    }
+    maybe_add_durable_queue_metadata(payload, entry)
   end
 
   defp running_issue_payload(running) do
@@ -197,14 +200,12 @@ defmodule SymphonyElixirWeb.Presenter do
       worker_host: Map.get(running, :worker_host),
       workspace_path: Map.get(running, :workspace_path),
       session_id: running.session_id,
-      session_title: Map.get(running, :session_title),
       model: model_payload(running),
       model_catalog: Map.get(running, :model_catalog),
       turn_count: Map.get(running, :turn_count, 0),
       state: running.state,
       started_at: iso8601(running.started_at),
       last_event: running.last_codex_event,
-      last_message: summarize_message(running.last_codex_message),
       last_event_at: iso8601(running.last_codex_timestamp),
       tokens: %{
         input_tokens: running.codex_input_tokens,
@@ -216,34 +217,41 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp retry_issue_payload(retry) do
-    %{
+    payload = %{
       attempt: retry.attempt,
       due_at: due_at_iso8601(retry.due_in_ms),
-      error: retry.error,
+      error_code: ObservabilitySanitizer.retry_error_code(retry.error),
       worker_host: Map.get(retry, :worker_host),
       workspace_path: Map.get(retry, :workspace_path)
     }
+
+    maybe_add_durable_queue_metadata(payload, retry)
   end
+
+  defp maybe_add_durable_queue_metadata(payload, %{stage: stage} = entry)
+       when stage in ["resume_queued", "recovery_queued"] do
+    Map.merge(payload, %{
+      stage: stage,
+      run_id: Map.get(entry, :run_id),
+      wait_id: Map.get(entry, :wait_id)
+    })
+  end
+
+  defp maybe_add_durable_queue_metadata(payload, %{stage: "cleanup_pending"} = entry) do
+    Map.merge(payload, %{
+      stage: "cleanup_pending",
+      run_id: Map.get(entry, :run_id),
+      due_at: nil
+    })
+  end
+
+  defp maybe_add_durable_queue_metadata(payload, _entry), do: payload
 
   defp model_payload(entry) do
     %{
       resolved: Map.get(entry, :resolved_model),
       reasoning_effort: Map.get(entry, :reasoning_effort),
       catalog_source: Map.get(entry, :model_catalog_source)
-    }
-  end
-
-  defp parked_issue_payload(parked) do
-    %{
-      wait_id: parked.wait_id,
-      reason: parked.reason,
-      allowed_actions: parked.allowed_actions,
-      tracker_state: parked.tracker_state,
-      run_id: parked.run_id,
-      attempt: parked.attempt,
-      stage: parked.stage,
-      terminal_reason: Map.get(parked, :terminal_reason),
-      parked_at: iso8601(parked.parked_at)
     }
   end
 
@@ -254,23 +262,21 @@ defmodule SymphonyElixirWeb.Presenter do
       Path.join(Config.settings!().workspace.root, issue_identifier)
   end
 
-  defp workspace_host(running, retry) do
-    (running && Map.get(running, :worker_host)) || (retry && Map.get(retry, :worker_host))
+  defp workspace_host(running, retry, parked) do
+    (running && Map.get(running, :worker_host)) ||
+      (retry && Map.get(retry, :worker_host)) ||
+      (parked && Map.get(parked, :worker_host))
   end
 
   defp recent_events_payload(running) do
     [
       %{
         at: iso8601(running.last_codex_timestamp),
-        event: running.last_codex_event,
-        message: summarize_message(running.last_codex_message)
+        event: running.last_codex_event
       }
     ]
     |> Enum.reject(&is_nil(&1.at))
   end
-
-  defp summarize_message(nil), do: nil
-  defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)
 
   defp due_at_iso8601(due_in_ms) when is_integer(due_in_ms) do
     DateTime.utc_now()

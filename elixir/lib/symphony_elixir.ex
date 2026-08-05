@@ -25,7 +25,9 @@ defmodule SymphonyElixir.Application do
 
     children = [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
+      {Registry, keys: :unique, name: SymphonyElixir.PollTaskRegistry},
       {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
+      {DynamicSupervisor, strategy: :one_for_one, name: SymphonyElixir.PollGuardSupervisor},
       SymphonyElixir.WorkflowStore,
       SymphonyElixir.Orchestrator,
       SymphonyElixir.HttpServer,

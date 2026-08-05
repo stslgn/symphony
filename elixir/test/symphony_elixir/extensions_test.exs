@@ -5,6 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
+  alias SymphonyElixir.{ParkedProjection, RunLedger}
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -60,6 +61,22 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     def handle_call(:request_refresh, _from, state) do
       {:reply, :unavailable, state}
+    end
+  end
+
+  defmodule BlockingRefreshOrchestrator do
+    use GenServer
+
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      GenServer.start_link(__MODULE__, :ok, name: name)
+    end
+
+    def init(:ok), do: {:ok, :ok}
+
+    def handle_call(:request_refresh, _from, state) do
+      Process.sleep(1_000)
+      {:reply, %{queued: true, requested_at: DateTime.utc_now()}, state}
     end
   end
 
@@ -372,10 +389,16 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     conn = get(build_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
+    refute inspect(state_payload) =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "parked" => 1},
+             "counts" => %{
+               "running" => 1,
+               "retrying" => 1,
+               "cleanup_pending" => 0,
+               "parked" => 1
+             },
              "control" => %{"dispatch_paused" => false},
              "capabilities" => %{
                "dynamic_tools" => ["linear_graphql"],
@@ -390,7 +413,6 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "worker_host" => nil,
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
-                 "session_title" => nil,
                  "model" => %{
                    "resolved" => nil,
                    "reasoning_effort" => nil,
@@ -399,7 +421,6 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "model_catalog" => nil,
                  "turn_count" => 7,
                  "last_event" => "notification",
-                 "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
@@ -421,11 +442,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "issue_identifier" => "MT-RETRY",
                  "attempt" => 2,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
-                 "error" => "boom",
+                 "error_code" => "worker_failure",
                  "worker_host" => nil,
                  "workspace_path" => nil
                }
              ],
+             "cleanup_pending" => [],
              "parked" => [
                %{
                  "issue_id" => "issue-parked",
@@ -438,20 +460,36 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "attempt" => 1,
                  "stage" => "parked",
                  "terminal_reason" => "turn_budget_exhausted",
-                 "parked_at" => state_payload["parked"] |> List.first() |> Map.fetch!("parked_at")
+                 "worker_host" => nil,
+                 "workspace_path" => nil,
+                 "parked_at" => state_payload["parked"] |> List.first() |> Map.fetch!("parked_at"),
+                 "truncated_fields" => []
                }
              ],
+             "parked_meta" => %{
+               "total_count" => 1,
+               "returned_count" => 1,
+               "omitted_count" => 0,
+               "truncated" => false,
+               "row_limit" => 100,
+               "byte_limit" => 65_536,
+               "returned_bytes" => state_payload["parked_meta"]["returned_bytes"]
+             },
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
+             "rate_limits" => %{
+               "limit_id" => "codex",
+               "primary" => %{"remaining" => 11}
+             }
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
     issue_payload = json_response(conn, 200)
+    refute inspect(issue_payload) =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
 
     assert issue_payload == %{
              "issue_identifier" => "MT-HTTP",
@@ -466,7 +504,6 @@ defmodule SymphonyElixir.ExtensionsTest do
                "worker_host" => nil,
                "workspace_path" => nil,
                "session_id" => "thread-http",
-               "session_title" => nil,
                "model" => %{
                  "resolved" => nil,
                  "reasoning_effort" => nil,
@@ -477,7 +514,6 @@ defmodule SymphonyElixir.ExtensionsTest do
                "state" => "In Progress",
                "started_at" => issue_payload["running"]["started_at"],
                "last_event" => "notification",
-               "last_message" => "rendered",
                "last_event_at" => nil,
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
                "budget" => %{
@@ -495,13 +531,16 @@ defmodule SymphonyElixir.ExtensionsTest do
              "parked" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
-             "last_error" => nil,
+             "last_error_code" => nil,
              "tracked" => %{}
            }
 
     conn = get(build_conn(), "/api/v1/MT-RETRY")
 
-    assert %{"status" => "retrying", "retry" => %{"attempt" => 2, "error" => "boom"}} =
+    assert %{
+             "status" => "retrying",
+             "retry" => %{"attempt" => 2, "error_code" => "worker_failure"}
+           } =
              json_response(conn, 200)
 
     conn = get(build_conn(), "/api/v1/MT-PARKED")
@@ -539,6 +578,162 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert json_response(get(build_conn(), "/api/v1/pause"), 200) == %{
              "dispatch_paused" => true
            }
+  end
+
+  test "rate-limit telemetry is allowlisted across every observability surface" do
+    sentinel = "SENSITIVE-RATE-LIMIT-DO-NOT-EXPOSE<script>"
+    issue_id = "issue-rate-limit-boundary"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-RATE",
+      title: "Rate-limit boundary",
+      description: "Exercise rate-limit observability projections",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-RATE"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :RateLimitBoundaryOrchestrator)
+    {:ok, orchestrator_pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator_pid), do: Process.exit(orchestrator_pid, :normal)
+    end)
+
+    await_orchestrator_poll_idle(orchestrator_name)
+    initial_state = :sys.get_state(orchestrator_pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(orchestrator_pid, fn _state ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    raw_rate_limits = %{
+      "limit_id" => "codex",
+      "limit_name" => sentinel,
+      "provider_payload" => sentinel,
+      "primary" => %{
+        "remaining" => 90,
+        "limit" => 1_000_000_000_001,
+        "reset_in_seconds" => 30,
+        "resetAt" => sentinel,
+        "provider_note" => sentinel
+      },
+      "secondary" => %{
+        "usedPercent" => 12.5,
+        "windowDurationMins" => 60,
+        "resetsAt" => 2_000_000_000,
+        "provider_note" => sentinel
+      },
+      "credits" => %{
+        "hasCredits" => true,
+        "unlimited" => false,
+        "balance" => 42.5,
+        "provider_note" => sentinel
+      }
+    }
+
+    send(
+      orchestrator_pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/token_count",
+           "params" => %{
+             "msg" => %{
+               "type" => "event_msg",
+               "payload" => %{
+                 "type" => "token_count",
+                 "provider_payload" => sentinel,
+                 "rate_limits" => raw_rate_limits
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    send(
+      orchestrator_pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "account/rateLimits/updated",
+           "params" => %{
+             "rateLimits" => %{
+               "limit_id" => sentinel,
+               "primary" => %{"remaining" => 1, "provider_note" => sentinel}
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+
+    expected_rate_limits = %{
+      limit_id: "codex",
+      primary: %{remaining: 90, reset_in_seconds: 30},
+      secondary: %{
+        used_percent: 12.5,
+        window_duration_mins: 60,
+        reset_at: 2_000_000_000
+      },
+      credits: %{has_credits: true, unlimited: false, balance: 42.5}
+    }
+
+    assert snapshot.rate_limits == expected_rate_limits
+    refute inspect(snapshot) =~ sentinel
+
+    await_orchestrator_poll_idle(orchestrator_name)
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 1_000)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    terminal =
+      StatusDashboard.format_snapshot_content_for_test({:ok, snapshot}, 0.0, 115)
+
+    assert state_payload["rate_limits"] == %{
+             "limit_id" => "codex",
+             "primary" => %{"remaining" => 90, "reset_in_seconds" => 30},
+             "secondary" => %{
+               "used_percent" => 12.5,
+               "window_duration_mins" => 60,
+               "reset_at" => 2_000_000_000
+             },
+             "credits" => %{"has_credits" => true, "unlimited" => false, "balance" => 42.5}
+           }
+
+    assert html =~ "limit_id: codex"
+    assert terminal =~ "codex"
+
+    for surface <- [Jason.encode!(state_payload), html, terminal] do
+      refute surface =~ sentinel
+    end
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -645,6 +840,129 @@ defmodule SymphonyElixir.ExtensionsTest do
            } = json_response(conn, 200)
 
     assert_receive :refresh_requested
+  end
+
+  test "blocked tracker poll coalesces duplicate webhooks while control paths stay responsive" do
+    webhook_secret = "synthetic-webhook-secret"
+    configure_webhook_secret(webhook_secret)
+    parent = self()
+
+    poll_work_fn = fn request ->
+      send(parent, {:blocked_poll_started, self(), request})
+
+      receive do
+        {:release_blocked_poll, result} -> result
+      end
+    end
+
+    orchestrator_name = Module.concat(__MODULE__, :AsyncPollOrchestrator)
+
+    {:ok, orchestrator_pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        poll_work_fn: poll_work_fn,
+        poll_task_timeout_ms: 2_000
+      )
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator_pid), do: Process.exit(orchestrator_pid, :normal)
+    end)
+
+    assert_receive {:blocked_poll_started, first_poll_pid, first_request}, 500
+
+    assert Enum.any?(Supervisor.which_children(SymphonyElixir.TaskSupervisor), fn
+             {_id, ^first_poll_pid, :worker, _modules} -> true
+             _child -> false
+           end)
+
+    timer_issue_id = "issue-responsive-timer"
+    completion_issue_id = "issue-responsive-completion"
+    completion_ref = make_ref()
+
+    timer_entry = responsive_running_entry(timer_issue_id, "run-responsive-timer")
+
+    completion_entry =
+      responsive_running_entry(completion_issue_id, "run-responsive-completion")
+      |> Map.put(:pid, self())
+      |> Map.put(:ref, completion_ref)
+
+    :sys.replace_state(orchestrator_pid, fn state ->
+      %{
+        state
+        | run_ledger_path: nil,
+          running: %{
+            timer_issue_id => timer_entry,
+            completion_issue_id => completion_entry
+          },
+          claimed: MapSet.new([timer_issue_id, completion_issue_id])
+      }
+    end)
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 250)
+
+    body = linear_webhook_body("Issue", System.system_time(:millisecond), "update")
+    started_ms = System.monotonic_time(:millisecond)
+
+    first_webhook = post_linear_webhook(body, webhook_secret, event: "Issue")
+    second_webhook = post_linear_webhook(body, webhook_secret, event: "Issue")
+
+    assert System.monotonic_time(:millisecond) - started_ms < 250
+    assert %{"accepted" => true, "coalesced" => true} = json_response(first_webhook, 200)
+    assert %{"accepted" => true, "coalesced" => true} = json_response(second_webhook, 200)
+
+    assert %{"dispatch_paused" => true, "changed" => true} =
+             json_response(post(build_conn(), "/api/v1/pause", %{"paused" => true}), 202)
+
+    send(orchestrator_pid, {:run_budget_timeout, timer_issue_id, "run-responsive-timer"})
+    send(orchestrator_pid, {:DOWN, completion_ref, :process, self(), :normal})
+
+    status_started_ms = System.monotonic_time(:millisecond)
+    status_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    assert System.monotonic_time(:millisecond) - status_started_ms < 250
+    assert status_payload["counts"]["parked"] == 1
+    assert status_payload["counts"]["retrying"] == 1
+
+    assert %{polling: %{checking?: true}, parked: [parked], retrying: [retrying]} =
+             Orchestrator.snapshot(orchestrator_name, 250)
+
+    assert parked.issue_id == timer_issue_id
+    assert parked.terminal_reason == "time_budget_exhausted"
+    assert retrying.issue_id == completion_issue_id
+
+    refute_receive {:blocked_poll_started, _pid, _request}, 100
+
+    send(first_poll_pid, {:release_blocked_poll, successful_poll_result(first_request)})
+    assert_receive {:blocked_poll_started, second_poll_pid, second_request}, 500
+    refute first_poll_pid == second_poll_pid
+    refute Process.alive?(first_poll_pid)
+
+    send(second_poll_pid, {:release_blocked_poll, successful_poll_result(second_request)})
+    await_orchestrator_poll_idle(orchestrator_name)
+    refute_receive {:blocked_poll_started, _pid, _request}, 100
+  end
+
+  test "refresh and webhook timeouts return bounded unavailable responses without caller exits" do
+    webhook_secret = "synthetic-webhook-secret"
+    configure_webhook_secret(webhook_secret)
+
+    refresh_name = Module.concat(__MODULE__, :BlockingRefreshApiOrchestrator)
+    start_supervised!({BlockingRefreshOrchestrator, name: refresh_name})
+    start_test_endpoint(orchestrator: refresh_name)
+
+    started_ms = System.monotonic_time(:millisecond)
+
+    assert json_response(post(build_conn(), "/api/v1/refresh", %{}), 503)["error"]["code"] ==
+             "orchestrator_unavailable"
+
+    assert System.monotonic_time(:millisecond) - started_ms < 900
+    Process.sleep(550)
+
+    body = linear_webhook_body("Issue", System.system_time(:millisecond), "update")
+    webhook_started_ms = System.monotonic_time(:millisecond)
+    webhook = post_linear_webhook(body, webhook_secret, event: "Issue")
+
+    assert json_response(webhook, 503)["error"]["code"] == "orchestrator_unavailable"
+    assert System.monotonic_time(:millisecond) - webhook_started_ms < 900
   end
 
   test "Linear webhook rejects invalid authentication and stale timestamps before wake-up" do
@@ -804,7 +1122,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Operations Dashboard"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
-    assert html =~ "rendered"
+    assert html =~ "MT-PARKED"
+    assert html =~ "wait-http"
+    assert html =~ "Parked waits"
+    refute html =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
     assert html =~ "Runtime"
     assert html =~ "Live"
     assert html =~ "Offline"
@@ -825,7 +1146,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           state: "In Progress",
           session_id: "thread-http",
           turn_count: 8,
-          last_codex_event: :notification,
+          last_codex_event: :turn_completed,
           last_codex_message: %{
             event: :notification,
             message: %{
@@ -833,7 +1154,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                 "method" => "codex/event/agent_message_content_delta",
                 "params" => %{
                   "msg" => %{
-                    "content" => "structured update"
+                    "content" => "SENSITIVE-BL10-DO-NOT-EXPOSE"
                   }
                 }
               }
@@ -854,8 +1175,439 @@ defmodule SymphonyElixir.ExtensionsTest do
     StatusDashboard.notify_update()
 
     assert_eventually(fn ->
-      render(view) =~ "agent message content streaming: structured update"
+      rendered = render(view)
+
+      rendered =~ "turn_completed" and
+        not String.contains?(rendered, "SENSITIVE-BL10-DO-NOT-EXPOSE")
     end)
+  end
+
+  test "dashboard liveview keeps parked waits visible without running or retrying work" do
+    orchestrator_name = Module.concat(__MODULE__, :ParkedOnlyDashboardOrchestrator)
+
+    parked_snapshot =
+      static_snapshot()
+      |> Map.put(:running, [])
+      |> Map.put(:retrying, [])
+      |> put_in([:parked, Access.at(0), :worker_host], "worker-a")
+      |> put_in([:parked, Access.at(0), :workspace_path], "/srv/symphony/MT-PARKED")
+
+    {:ok, orchestrator_pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: parked_snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "No active sessions."
+    assert html =~ "Unresolved parked waits are listed separately below."
+    assert html =~ "No issues are currently backing off."
+    assert html =~ ~r/metric-label[^>]*>Parked<\/p>\s*<p class="metric-value numeric">1<\/p>/
+    assert html =~ "MT-PARKED"
+    assert html =~ "wait-http"
+    assert html =~ "waiting_owner"
+    assert html =~ "approve, reject"
+    assert html =~ "run-http"
+    assert html =~ "attempt 1"
+    assert html =~ "turn_budget_exhausted"
+    assert html =~ "worker-a"
+    assert html =~ "/srv/symphony/MT-PARKED"
+
+    refreshed_snapshot =
+      put_in(parked_snapshot.parked, [
+        %{
+          issue_id: "issue-refreshed-parked",
+          identifier: "MT-PARKED-REFRESHED",
+          wait_id: "wait-refreshed",
+          reason: "waiting_infrastructure",
+          allowed_actions: ["retry", "reject"],
+          tracker_state: "Blocked",
+          run_id: "run-refreshed",
+          attempt: 3,
+          stage: "parked",
+          terminal_reason: "worker_start_failed",
+          worker_host: "worker-b",
+          workspace_path: "/srv/symphony/MT-PARKED-REFRESHED",
+          parked_at: DateTime.utc_now()
+        }
+      ])
+
+    :sys.replace_state(orchestrator_pid, fn state ->
+      Keyword.put(state, :snapshot, refreshed_snapshot)
+    end)
+
+    StatusDashboard.notify_update()
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "MT-PARKED-REFRESHED" and rendered =~ "wait-refreshed" and
+        not String.contains?(rendered, "MT-PARKED</span>")
+    end)
+  end
+
+  test "parked API and LiveView share bounded control-safe sorted collection projection" do
+    orchestrator_name = Module.concat(__MODULE__, :BoundedParkedDashboardOrchestrator)
+    long_path = "/srv/" <> String.duplicate("long-segment/", 80)
+
+    regular_waits =
+      for index <- 1..127 do
+        %{
+          issue_id: "issue-#{index}",
+          identifier: "MT-#{String.pad_leading(Integer.to_string(index), 3, "0")}",
+          wait_id: "wait-#{index}",
+          reason: "waiting_owner",
+          allowed_actions: ["approve", "reject"],
+          tracker_state: "Human Review",
+          run_id: "run-#{index}",
+          attempt: index,
+          stage: "parked",
+          terminal_reason: nil,
+          worker_host: "worker-a",
+          workspace_path: "/srv/symphony/MT-#{index}",
+          parked_at: DateTime.utc_now()
+        }
+      end
+
+    adversarial_waits = [
+      %{
+        issue_id: "issue-control",
+        identifier: "AB\nCONTROL",
+        wait_id: "wait-control",
+        reason: "free_form_reason",
+        allowed_actions: ["destroy"],
+        tracker_state: "Human\e]0;title",
+        run_id: "run-control",
+        attempt: -1,
+        stage: "free_form_stage",
+        terminal_reason: "free_form_terminal",
+        worker_host: "worker\tcontrol",
+        workspace_path: <<0xFF>>,
+        parked_at: DateTime.utc_now()
+      },
+      %{
+        issue_id: "issue-bounded",
+        identifier: "AA-BOUNDED",
+        wait_id: "wait-bounded",
+        reason: "waiting_infrastructure",
+        allowed_actions: ["retry", "reject"],
+        tracker_state: "Blocked",
+        run_id: "run-bounded",
+        attempt: 2,
+        stage: "parked",
+        terminal_reason: "time_budget_exhausted",
+        worker_host: "worker-b",
+        workspace_path: long_path,
+        parked_at: DateTime.utc_now()
+      },
+      %{
+        issue_id: "issue-sort-first",
+        identifier: "AA-000",
+        wait_id: "wait-sort-first",
+        reason: "waiting_secret",
+        allowed_actions: ["retry", "reject"],
+        tracker_state: "Blocked",
+        run_id: "run-sort-first",
+        attempt: 1,
+        stage: "parked",
+        terminal_reason: nil,
+        parked_at: DateTime.utc_now()
+      }
+    ]
+
+    snapshot =
+      static_snapshot()
+      |> Map.put(:running, [])
+      |> Map.put(:retrying, [])
+      |> Map.put(:parked, regular_waits ++ adversarial_waits)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    assert state_payload["counts"]["parked"] == 130
+
+    assert state_payload["parked_meta"] == %{
+             "total_count" => 130,
+             "returned_count" => 100,
+             "omitted_count" => 30,
+             "truncated" => true,
+             "row_limit" => 100,
+             "byte_limit" => 65_536,
+             "returned_bytes" => state_payload["parked_meta"]["returned_bytes"]
+           }
+
+    assert state_payload["parked_meta"]["returned_bytes"] ==
+             byte_size(Jason.encode!(state_payload["parked"]))
+
+    assert state_payload["parked_meta"]["returned_bytes"] <= 65_536
+    assert length(state_payload["parked"]) == 100
+    assert hd(state_payload["parked"])["issue_identifier"] == "AA-000"
+
+    control_row = Enum.find(state_payload["parked"], &(&1["wait_id"] == "wait-control"))
+    assert control_row["issue_identifier"] == "AB\\nCONTROL"
+    assert control_row["tracker_state"] == "Human\\u{1B}]0;title"
+    assert control_row["worker_host"] == "worker\\tcontrol"
+    assert control_row["workspace_path"] == "invalid-utf8"
+    assert control_row["reason"] == nil
+    assert control_row["allowed_actions"] == []
+    assert control_row["attempt"] == nil
+    assert control_row["stage"] == nil
+    assert control_row["terminal_reason"] == nil
+
+    bounded_issue = json_response(get(build_conn(), "/api/v1/AA-BOUNDED"), 200)
+    assert byte_size(bounded_issue["parked"]["workspace_path"]) <= 512
+    assert bounded_issue["workspace"]["path"] == bounded_issue["parked"]["workspace_path"]
+    assert "workspace_path" in bounded_issue["parked"]["truncated_fields"]
+    refute bounded_issue["parked"]["workspace_path"] == long_path
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "Showing 100 of 130 parked waits; 30 omitted by the bounded projection."
+    assert html =~ "AA-000"
+    assert html =~ "AB\\nCONTROL"
+    assert html =~ "invalid-utf8"
+    assert html =~ "display truncated"
+    refute html =~ long_path
+    refute html =~ <<0xFF>>
+    refute html =~ "destroy"
+    refute html =~ "free_form_reason"
+  end
+
+  test "parked collection accounts for exact JSON array bytes at and above the limit" do
+    assert %{rows: [], metadata: %{returned_bytes: 2}} = ParkedProjection.collection([])
+
+    exact_prefix = tuned_parked_prefix(65_536, 60)
+    one_over_prefix = tuned_parked_prefix(65_537, 60)
+    old_under_count_prefix = tuned_parked_prefix(65_538, 60)
+    tail = for index <- 61..105, do: boundary_parked_wait(index, "ZZ")
+
+    assert length(exact_prefix ++ tail) > 100
+    assert encoded_projected_bytes(exact_prefix) == 65_536
+    assert encoded_projected_bytes(one_over_prefix) == 65_537
+    assert encoded_projected_bytes(old_under_count_prefix) == 65_538
+
+    exact = ParkedProjection.collection(exact_prefix ++ tail)
+    assert exact.metadata.returned_count == 60
+    assert exact.metadata.omitted_count == 45
+    assert exact.metadata.truncated
+    assert exact.metadata.returned_bytes == 65_536
+    assert exact.metadata.returned_bytes == byte_size(Jason.encode!(exact.rows))
+    assert exact.metadata.returned_bytes <= exact.metadata.byte_limit
+
+    for over_prefix <- [one_over_prefix, old_under_count_prefix] do
+      over = ParkedProjection.collection(over_prefix ++ tail)
+
+      assert over.metadata.returned_count == 59
+      assert over.metadata.omitted_count == 46
+      assert over.metadata.truncated
+      assert over.metadata.returned_bytes == byte_size(Jason.encode!(over.rows))
+      assert over.metadata.returned_bytes <= over.metadata.byte_limit
+    end
+
+    orchestrator_name = Module.concat(__MODULE__, :ExactParkedByteBoundaryOrchestrator)
+
+    snapshot =
+      static_snapshot()
+      |> Map.put(:running, [])
+      |> Map.put(:retrying, [])
+      |> Map.put(:parked, exact_prefix ++ tail)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    api_returned_bytes = byte_size(Jason.encode!(state_payload["parked"]))
+
+    assert state_payload["parked_meta"]["returned_bytes"] == api_returned_bytes
+    assert api_returned_bytes == 65_536
+    assert api_returned_bytes <= state_payload["parked_meta"]["byte_limit"]
+
+    {:ok, view, html} = live(build_conn(), "/")
+    live_payload = :sys.get_state(view.pid).socket.assigns.payload
+    live_returned_bytes = byte_size(Jason.encode!(live_payload.parked))
+
+    assert live_payload.parked_meta == exact.metadata
+    assert live_payload.parked_meta.returned_bytes == live_returned_bytes
+    assert live_returned_bytes == api_returned_bytes
+    assert Jason.decode!(Jason.encode!(live_payload.parked)) == state_payload["parked"]
+    assert html =~ "Showing 60 of 105 parked waits; 45 omitted by the bounded projection."
+  end
+
+  test "cleanup failure remains durably owned and truthful after restart across every surface" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-cleanup-pending-surfaces-#{System.unique_integer([:positive])}"
+      )
+
+    captured_root = Path.join(test_root, "captured-root")
+    workspace = Path.join(test_root, "outside-root/MT-CLEANUP-RESTART")
+    sentinel = Path.join(workspace, "must-survive")
+    ledger_path = Path.join(test_root, "run-ledger.jsonl")
+    issue_id = "issue-cleanup-restart"
+    identifier = "MT-CLEANUP-RESTART"
+    run_id = "run-cleanup-restart"
+
+    base = %{
+      run_id: run_id,
+      issue_id: issue_id,
+      issue_identifier: identifier,
+      attempt: 2,
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: captured_root
+    }
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+    File.mkdir_p!(workspace)
+    File.write!(sentinel, "preserve")
+
+    assert :ok = RunLedger.append(ledger_path, Map.merge(base, %{transition: "run_claimed", stage: "claimed"}))
+    assert :ok = RunLedger.append(ledger_path, Map.merge(base, %{transition: "run_started", stage: "running"}))
+
+    assert :ok =
+             RunLedger.append(
+               ledger_path,
+               Map.merge(base, %{
+                 transition: "run_stopped",
+                 stage: "released",
+                 terminal_reason: "tracker_terminal",
+                 next_action: "none"
+               })
+             )
+
+    assert :ok =
+             RunLedger.append(
+               ledger_path,
+               Map.merge(base, %{
+                 transition: "workspace_cleanup_requested",
+                 stage: "cleanup",
+                 terminal_reason: "tracker_terminal"
+               })
+             )
+
+    assert {:ok, restarted} = Orchestrator.init(run_ledger_path: ledger_path)
+    if is_reference(restarted.tick_timer_ref), do: Process.cancel_timer(restarted.tick_timer_ref)
+
+    assert File.read!(sentinel) == "preserve"
+    assert MapSet.member?(restarted.claimed, issue_id)
+
+    assert %{
+             status: :cleanup_pending,
+             cleanup_error: {:workspace_outside_root, _canonical_workspace, _canonical_root}
+           } = restarted.cleanup_pending[issue_id]
+
+    assert {:reply, raw_snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, restarted)
+
+    assert [cleanup_row] = Enum.filter(raw_snapshot.retrying, &(&1.stage == "cleanup_pending"))
+    assert cleanup_row.error == "workspace_cleanup_failed"
+    assert cleanup_row.due_in_ms == nil
+    assert cleanup_row.workspace_path == workspace
+
+    pending_entry = restarted.cleanup_pending[issue_id] |> Map.delete(:cleanup_error)
+    pending_state = put_in(restarted.cleanup_pending[issue_id], pending_entry)
+
+    missing_state =
+      put_in(
+        restarted.cleanup_pending[issue_id],
+        Map.put(pending_entry, :cleanup_error, :workspace_affinity_missing)
+      )
+
+    assert {:reply, pending_snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, pending_state)
+
+    assert {:reply, missing_snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, missing_state)
+
+    assert Enum.find(pending_snapshot.retrying, &(&1.stage == "cleanup_pending")).error ==
+             "workspace_cleanup_pending"
+
+    assert Enum.find(missing_snapshot.retrying, &(&1.stage == "cleanup_pending")).error ==
+             "workspace_affinity_missing"
+
+    for code <- ~w(workspace_cleanup_pending workspace_cleanup_failed workspace_affinity_missing) do
+      assert SymphonyElixir.ObservabilitySanitizer.retry_error_code(code) == code
+    end
+
+    terminal = StatusDashboard.format_snapshot_content_for_test({:ok, raw_snapshot}, 0.0, 160)
+    assert terminal =~ "Workspace cleanup pending"
+    assert terminal =~ "cleanup_pending"
+    assert terminal =~ "error_code=workspace_cleanup_failed"
+    assert terminal =~ "host=local"
+    assert terminal =~ "path=#{String.slice(workspace, 0, 16)}"
+    refute terminal =~ " in 0.000s"
+
+    orchestrator_name = Module.concat(__MODULE__, :CleanupPendingRestartOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: raw_snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+
+    assert state_payload["counts"] == %{
+             "running" => 0,
+             "retrying" => 0,
+             "cleanup_pending" => 1,
+             "parked" => 0
+           }
+
+    assert state_payload["retrying"] == []
+
+    assert [
+             %{
+               "issue_identifier" => ^identifier,
+               "stage" => "cleanup_pending",
+               "error_code" => "workspace_cleanup_failed",
+               "due_at" => nil,
+               "worker_host" => nil,
+               "workspace_path" => ^workspace
+             }
+           ] = state_payload["cleanup_pending"]
+
+    assert %{
+             "status" => "cleanup_pending",
+             "retry" => %{
+               "stage" => "cleanup_pending",
+               "error_code" => "workspace_cleanup_failed",
+               "due_at" => nil,
+               "workspace_path" => ^workspace
+             },
+             "last_error_code" => "workspace_cleanup_failed"
+           } = json_response(get(build_conn(), "/api/v1/#{identifier}"), 200)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "Workspace cleanup pending"
+    assert html =~ identifier
+    assert html =~ "cleanup_pending"
+    assert html =~ "workspace_cleanup_failed"
+    assert html =~ workspace
+    assert html =~ "No issues are currently backing off."
+    refute html =~ "0.000s"
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(ledger_path, "runner-cleanup-audit")
+    assert recovery.cleanup_pending[issue_id]["workspace_path"] == workspace
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
@@ -903,7 +1655,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "parked" => 1}
+
+    assert response.body["counts"] == %{
+             "running" => 1,
+             "retrying" => 1,
+             "cleanup_pending" => 0,
+             "parked" => 1
+           }
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -953,9 +1711,10 @@ defmodule SymphonyElixir.ExtensionsTest do
           identifier: "MT-HTTP",
           state: "In Progress",
           session_id: "thread-http",
+          session_title: "SENSITIVE-BL10-DO-NOT-EXPOSE",
           turn_count: 7,
           codex_app_server_pid: nil,
-          last_codex_message: "rendered",
+          last_codex_message: "SENSITIVE-BL10-DO-NOT-EXPOSE",
           last_codex_timestamp: nil,
           last_codex_event: :notification,
           codex_input_tokens: 4,
@@ -1005,8 +1764,71 @@ defmodule SymphonyElixir.ExtensionsTest do
         mcp_elicitation_auto_approve: []
       },
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
-      rate_limits: %{"primary" => %{"remaining" => 11}}
+      rate_limits: %{limit_id: "codex", primary: %{remaining: 11}}
     }
+  end
+
+  defp tuned_parked_prefix(target_bytes, count) do
+    waits = for index <- 1..count, do: boundary_parked_wait(index, "AA")
+    padding_bytes = target_bytes - encoded_projected_bytes(waits)
+
+    {waits, remaining_bytes} =
+      Enum.map_reduce(waits, padding_bytes, fn wait, remaining_bytes ->
+        add_boundary_padding(wait, remaining_bytes)
+      end)
+
+    if remaining_bytes != 0 or encoded_projected_bytes(waits) != target_bytes do
+      raise "could not tune parked projection to #{target_bytes} encoded bytes"
+    end
+
+    waits
+  end
+
+  defp boundary_parked_wait(index, sort_prefix) do
+    suffix = String.pad_leading(Integer.to_string(index), 3, "0")
+
+    %{
+      issue_id: "issue-#{suffix}",
+      identifier: "#{sort_prefix}-#{suffix}",
+      wait_id: "wait-#{suffix}",
+      reason: "waiting_owner",
+      tracker_state: "Blocked",
+      run_id: "run-#{suffix}",
+      attempt: 0,
+      stage: "parked",
+      terminal_reason: nil,
+      worker_host: "worker",
+      workspace_path: "/srv/boundary/#{suffix}",
+      parked_at: ~U[2026-08-04 00:00:00Z]
+    }
+  end
+
+  defp add_boundary_padding(wait, remaining_bytes) do
+    [
+      {:workspace_path, 512},
+      {:worker_host, 128},
+      {:tracker_state, 128},
+      {:run_id, 128},
+      {:wait_id, 128},
+      {:issue_id, 128},
+      {:identifier, 96}
+    ]
+    |> Enum.reduce({wait, remaining_bytes}, fn {field, limit}, {wait, remaining_bytes} ->
+      value = Map.fetch!(wait, field)
+      added_bytes = min(remaining_bytes, limit - byte_size(value))
+
+      {
+        Map.put(wait, field, value <> String.duplicate("x", added_bytes)),
+        remaining_bytes - added_bytes
+      }
+    end)
+  end
+
+  defp encoded_projected_bytes(waits) do
+    waits
+    |> Enum.map(&ParkedProjection.row/1)
+    |> Jason.encode!()
+    |> byte_size()
   end
 
   defp wait_for_bound_port do
@@ -1072,6 +1894,76 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp assert_eventually(_fun, 0), do: flunk("condition not met in time")
+
+  defp await_orchestrator_poll_idle(orchestrator_name) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    await_orchestrator_poll_idle(orchestrator_name, deadline)
+  end
+
+  defp await_orchestrator_poll_idle(orchestrator_name, deadline) do
+    snapshot = Orchestrator.snapshot(orchestrator_name, 250)
+
+    case snapshot do
+      %{polling: %{checking?: false, next_poll_in_ms: next_poll_in_ms}}
+      when is_integer(next_poll_in_ms) and next_poll_in_ms > 0 ->
+        :ok
+
+      last_snapshot ->
+        now = System.monotonic_time(:millisecond)
+
+        if now >= deadline do
+          flunk(
+            "orchestrator poll did not become idle within 5000ms; " <>
+              "last polling state: #{inspect(polling_state(last_snapshot))}"
+          )
+        else
+          Process.sleep(min(25, deadline - now))
+          await_orchestrator_poll_idle(orchestrator_name, deadline)
+        end
+    end
+  end
+
+  defp polling_state(%{polling: polling}), do: polling
+  defp polling_state(other), do: other
+
+  defp successful_poll_result(request) do
+    %{
+      request: request,
+      running: {:ok, []},
+      parked: {:ok, []},
+      comments: %{},
+      dispatch: {:ok, []}
+    }
+  end
+
+  defp responsive_running_entry(issue_id, run_id) do
+    agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    on_exit(fn ->
+      if Process.alive?(agent_pid), do: Process.exit(agent_pid, :kill)
+    end)
+
+    %{
+      pid: agent_pid,
+      ref: nil,
+      run_id: run_id,
+      retry_attempt: 1,
+      identifier: String.upcase(issue_id),
+      issue: %Issue{id: issue_id, identifier: String.upcase(issue_id), state: "In Progress"},
+      started_at: DateTime.utc_now(),
+      session_id: nil,
+      worker_host: nil,
+      workspace_path: nil,
+      workspace_root: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_token_telemetry_observed: false,
+      turn_count: 0,
+      run_budget: %{max_turns: 20, max_tokens: nil, max_seconds: 60},
+      run_budget_timer_ref: nil
+    }
+  end
 
   defp ensure_workflow_store_running do
     if Process.whereis(WorkflowStore) do

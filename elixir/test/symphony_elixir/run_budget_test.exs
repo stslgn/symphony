@@ -46,7 +46,9 @@ defmodule SymphonyElixir.RunBudgetTest do
              limit: 250_000,
              used: nil,
              remaining: nil,
-             telemetry_observed: false
+             telemetry_observed: false,
+             telemetry_integrity: "unobserved",
+             integrity_error: nil
            }
 
     assert snapshot.time == %{limit: 7_200, used: 120, remaining: 7_080}
@@ -65,7 +67,9 @@ defmodule SymphonyElixir.RunBudgetTest do
              limit: nil,
              used: nil,
              remaining: nil,
-             telemetry_observed: false
+             telemetry_observed: false,
+             telemetry_integrity: "unobserved",
+             integrity_error: nil
            }
 
     assert snapshot.time == %{limit: nil, used: 0, remaining: nil}
@@ -75,10 +79,61 @@ defmodule SymphonyElixir.RunBudgetTest do
     assert RunBudget.terminal_reasons() == [
              "turn_budget_exhausted",
              "token_budget_exhausted",
+             "token_telemetry_integrity_failed",
              "time_budget_exhausted"
            ]
 
     assert RunBudget.valid_terminal_reason?("token_budget_exhausted")
     refute RunBudget.valid_terminal_reason?("worker_exit")
+  end
+
+  test "fails a configured token budget closed when telemetry integrity is lost" do
+    limits = %{max_turns: 20, max_tokens: 250, max_seconds: nil}
+
+    metrics = %{
+      turns: 1,
+      tokens: 200,
+      token_telemetry_observed: false,
+      token_telemetry_integrity: :failed,
+      token_telemetry_failure: :ambiguous_counter_decrease,
+      seconds: 2
+    }
+
+    assert RunBudget.exhausted_reason(limits, metrics) ==
+             "token_telemetry_integrity_failed"
+
+    assert RunBudget.snapshot(limits, metrics).tokens == %{
+             limit: 250,
+             used: 200,
+             remaining: nil,
+             telemetry_observed: false,
+             telemetry_integrity: "failed",
+             integrity_error: "ambiguous_counter_decrease"
+           }
+
+    assert RunBudget.exhausted_reason(%{limits | max_tokens: nil}, metrics) == nil
+  end
+
+  test "preserves bounded string integrity failures" do
+    snapshot =
+      RunBudget.snapshot(
+        %{max_turns: 20, max_tokens: 250, max_seconds: nil},
+        %{
+          token_telemetry_integrity: :failed,
+          token_telemetry_failure: "missing_usage_event"
+        }
+      )
+
+    assert snapshot.tokens.integrity_error == "missing_usage_event"
+  end
+
+  test "uses a generic integrity failure for untyped details" do
+    snapshot =
+      RunBudget.snapshot(
+        %{max_turns: 20, max_tokens: 250, max_seconds: nil},
+        %{token_telemetry_integrity: :failed, token_telemetry_failure: %{raw: "hidden"}}
+      )
+
+    assert snapshot.tokens.integrity_error == "unknown_integrity_failure"
   end
 end

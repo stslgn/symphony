@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.StatusDashboardSnapshotTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.RateLimitTelemetry
   alias SymphonyElixir.TestSupport.Snapshot
 
   @terminal_columns 115
@@ -138,7 +139,101 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     Snapshot.assert_dashboard_snapshot!("backoff_queue", render_snapshot(snapshot_data, 15.4))
   end
 
-  test "backoff queue row escapes escaped newline sequences" do
+  test "snapshot fixture: parked wait affinity" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         parked: [
+           %{
+             issue_id: "issue-parked",
+             identifier: "MT-454",
+             wait_id: "wait-owner-approval",
+             reason: "waiting_owner",
+             attempt: 3,
+             worker_host: "worker-b",
+             workspace_path: "/srv/symphony/workspaces/MT-454",
+             allowed_actions: ["approve", "reject"]
+           }
+         ],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    rendered = render_snapshot(snapshot_data, 0.0)
+
+    Snapshot.assert_snapshot!(
+      "status_dashboard_snapshots/parked_wait.snapshot.txt",
+      Snapshot.escape_ansi(rendered)
+    )
+  end
+
+  test "parked wait rows escape terminal controls and remain bounded" do
+    parked_wait = %{
+      issue_id: "issue-adversarial",
+      identifier: "\n\r\t\e\a\u009B漢🙂",
+      wait_id: "wait-owner-approval",
+      reason: "waiting_owner\nfor approval",
+      attempt: 3,
+      worker_host: "worker-b\e]0;renamed\a",
+      workspace_path: String.duplicate("路", 1_700),
+      allowed_actions: ["approve", "reject\rnow"]
+    }
+
+    row = StatusDashboard.format_parked_summary_for_test(parked_wait, @terminal_columns)
+
+    refute Enum.any?(String.to_charlist(row), &(&1 in 0..31 or &1 in 127..159))
+    assert parked_row_display_width(row) <= @terminal_columns
+    assert byte_size(row) <= 384
+    assert row =~ "\\n\\r\\t\\e\\x07\\u{009B}"
+
+    narrow_row = StatusDashboard.format_parked_summary_for_test(parked_wait, 12)
+    assert parked_row_display_width(narrow_row) <= 12
+
+    invalid_utf8_row =
+      StatusDashboard.format_parked_summary_for_test(%{parked_wait | identifier: <<0xFF>>}, @terminal_columns)
+
+    assert invalid_utf8_row =~ "invalid-utf8"
+    assert parked_row_display_width(invalid_utf8_row) <= @terminal_columns
+
+    Snapshot.assert_snapshot!(
+      "status_dashboard_snapshots/parked_wait_adversarial.snapshot.txt",
+      row
+    )
+  end
+
+  test "parked wait width remains bounded for Unicode presentation sequences" do
+    cases = [
+      {"watch", "\u231A", "\\u{231A}"},
+      {"hot beverage with variation selector", "\u2615\uFE0F", "\\u{2615}\\u{FE0F}"},
+      {"zero-width joiner emoji", "\u{1F469}\u200D\u{1F4BB}", "\\u{200D}"},
+      {"combining mark", "e\u0301", "e\\u{0301}"}
+    ]
+
+    for {label, value, expected_escape} <- cases do
+      parked_wait = %{
+        identifier: value,
+        wait_id: "wait-#{label}",
+        reason: "waiting_owner",
+        attempt: 1,
+        worker_host: "worker-a",
+        workspace_path: "/remote/workspace",
+        allowed_actions: ["approve"]
+      }
+
+      row_80 = StatusDashboard.format_parked_summary_for_test(parked_wait, 80)
+      row_12 = StatusDashboard.format_parked_summary_for_test(parked_wait, 12)
+
+      assert row_80 =~ expected_escape
+      assert parked_row_display_width(row_80) <= 80
+      assert parked_row_display_width(row_12) <= 12
+      assert byte_size(row_80) <= 384
+      assert byte_size(row_12) <= 384
+    end
+  end
+
+  test "backoff queue row exposes only a categorical error code" do
     snapshot_data =
       {:ok,
        %{
@@ -148,7 +243,7 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
              identifier: "MT-980",
              attempt: 1,
              due_in_ms: 1_500,
-             error: "error with \\nnewline"
+             error: "SENSITIVE-BL10-DO-NOT-EXPOSE"
            })
          ],
          codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
@@ -162,8 +257,8 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
 
     [backoff_line] = backoff_lines
 
-    assert backoff_line =~ "error=error with newline"
-    refute backoff_line =~ "\\n"
+    assert backoff_line =~ "error_code=worker_failure"
+    refute backoff_line =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
   end
 
   test "snapshot fixture: unlimited credits variant" do
@@ -192,6 +287,34 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
        }}
 
     Snapshot.assert_dashboard_snapshot!("credits_unlimited", render_snapshot(snapshot_data, 42.0))
+  end
+
+  test "partial credits shapes normalize and render without raising" do
+    cases = [
+      {%{"balance" => 3.5}, %{balance: 3.5}, "credits 3.50"},
+      {%{"unlimited" => false}, %{unlimited: false}, "credits n/a"}
+    ]
+
+    for {raw_credits, normalized_credits, expected_output} <- cases do
+      rate_limits =
+        RateLimitTelemetry.normalize(%{
+          "limit_id" => "codex",
+          "credits" => raw_credits
+        })
+
+      assert rate_limits == %{limit_id: "codex", credits: normalized_credits}
+
+      snapshot_data =
+        {:ok,
+         %{
+           running: [],
+           retrying: [],
+           codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+           rate_limits: rate_limits
+         }}
+
+      assert render_snapshot(snapshot_data, 0.0) =~ expected_output
+    end
   end
 
   defp render_snapshot(snapshot_data, tps) do
@@ -226,6 +349,16 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
       },
       overrides
     )
+  end
+
+  defp parked_row_display_width(row) do
+    ascii_row = String.replace_prefix(row, "│", "|")
+
+    assert ascii_row
+           |> :binary.bin_to_list()
+           |> Enum.all?(&(&1 in 0x20..0x7E))
+
+    byte_size(ascii_row)
   end
 
   defp turn_started_message do

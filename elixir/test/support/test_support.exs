@@ -22,7 +22,14 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Workspace
 
       import SymphonyElixir.TestSupport,
-        only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+        only: [
+          seed_parked_ledger!: 2,
+          seed_running_ledger!: 2,
+          write_workflow_file!: 1,
+          write_workflow_file!: 2,
+          restore_env: 2,
+          stop_default_http_server: 0
+        ]
 
       setup do
         workflow_root =
@@ -92,10 +99,72 @@ defmodule SymphonyElixir.TestSupport do
     end
   end
 
+  def seed_running_ledger!(path, running_entry) when is_binary(path) and is_map(running_entry) do
+    issue = Map.fetch!(running_entry, :issue)
+
+    base = %{
+      run_id: Map.fetch!(running_entry, :run_id),
+      issue_id: Map.fetch!(issue, :id),
+      issue_identifier: Map.get(running_entry, :identifier) || Map.fetch!(issue, :identifier),
+      attempt: Map.get(running_entry, :retry_attempt, 0),
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      workspace_root: Map.get(running_entry, :workspace_root)
+    }
+
+    :ok =
+      SymphonyElixir.RunLedger.append(
+        path,
+        Map.merge(base, %{transition: "run_claimed", stage: "claimed"})
+      )
+
+    :ok =
+      SymphonyElixir.RunLedger.append(
+        path,
+        Map.merge(base, %{transition: "run_started", stage: "running"})
+      )
+
+    :ok
+  end
+
+  def seed_parked_ledger!(path, wait) when is_binary(path) and is_map(wait) do
+    running_entry = %{
+      run_id: Map.fetch!(wait, :run_id),
+      retry_attempt: Map.get(wait, :attempt, 0),
+      identifier: Map.fetch!(wait, :identifier),
+      issue: %{
+        id: Map.fetch!(wait, :issue_id),
+        identifier: Map.fetch!(wait, :identifier)
+      },
+      worker_host: Map.get(wait, :worker_host),
+      workspace_path: Map.get(wait, :workspace_path),
+      workspace_root: Map.get(wait, :workspace_root)
+    }
+
+    :ok = seed_running_ledger!(path, running_entry)
+
+    SymphonyElixir.RunLedger.append(path, %{
+      transition: "run_parked",
+      stage: "parked",
+      run_id: wait.run_id,
+      issue_id: wait.issue_id,
+      issue_identifier: wait.identifier,
+      attempt: wait.attempt,
+      wait_id: wait.wait_id,
+      parked_reason: wait.reason,
+      allowed_actions: wait.allowed_actions,
+      terminal_reason: Map.get(wait, :terminal_reason),
+      worker_host: Map.get(wait, :worker_host),
+      workspace_path: Map.get(wait, :workspace_path),
+      workspace_root: Map.get(wait, :workspace_root)
+    })
+  end
+
   defp workflow_content(overrides) do
     config =
       Keyword.merge(
         [
+          workflow_runtime_prompt_mode: "full_prompt_compat",
           tracker_kind: "linear",
           tracker_endpoint: "https://api.linear.app/graphql",
           tracker_api_token: "token",
@@ -120,6 +189,7 @@ defmodule SymphonyElixir.TestSupport do
           codex_thread_sandbox: "workspace-write",
           codex_turn_sandbox_policy: nil,
           codex_dynamic_tool_allowlist: ["linear_graphql"],
+          codex_required_dynamic_tools: [],
           codex_mcp_tool_auto_approve_allowlist: [],
           codex_mcp_elicitation_auto_approve_allowlist: [],
           codex_turn_timeout_ms: 3_600_000,
@@ -140,6 +210,7 @@ defmodule SymphonyElixir.TestSupport do
         overrides
       )
 
+    workflow_runtime_prompt_mode = Keyword.get(config, :workflow_runtime_prompt_mode)
     tracker_kind = Keyword.get(config, :tracker_kind)
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
@@ -164,6 +235,7 @@ defmodule SymphonyElixir.TestSupport do
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
     codex_turn_sandbox_policy = Keyword.get(config, :codex_turn_sandbox_policy)
     codex_dynamic_tool_allowlist = Keyword.get(config, :codex_dynamic_tool_allowlist)
+    codex_required_dynamic_tools = Keyword.get(config, :codex_required_dynamic_tools)
 
     codex_mcp_tool_auto_approve_allowlist =
       Keyword.get(config, :codex_mcp_tool_auto_approve_allowlist)
@@ -189,6 +261,8 @@ defmodule SymphonyElixir.TestSupport do
     sections =
       [
         "---",
+        "workflow:",
+        "  runtime_prompt_mode: #{yaml_value(workflow_runtime_prompt_mode)}",
         "tracker:",
         "  kind: #{yaml_value(tracker_kind)}",
         "  endpoint: #{yaml_value(tracker_endpoint)}",
@@ -217,6 +291,7 @@ defmodule SymphonyElixir.TestSupport do
         "  thread_sandbox: #{yaml_value(codex_thread_sandbox)}",
         "  turn_sandbox_policy: #{yaml_value(codex_turn_sandbox_policy)}",
         "  dynamic_tool_allowlist: #{yaml_value(codex_dynamic_tool_allowlist)}",
+        "  required_dynamic_tools: #{yaml_value(codex_required_dynamic_tools)}",
         "  mcp_tool_auto_approve_allowlist: #{yaml_value(codex_mcp_tool_auto_approve_allowlist)}",
         "  mcp_elicitation_auto_approve_allowlist: #{yaml_value(codex_mcp_elicitation_auto_approve_allowlist)}",
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",

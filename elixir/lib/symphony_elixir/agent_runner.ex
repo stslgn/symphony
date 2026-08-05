@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, ObservabilitySanitizer, PromptBuilder, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -21,28 +21,35 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, reason} ->
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        error_code = ObservabilitySanitizer.error_code(reason, "agent_run_failed")
+        Logger.error("Agent run failed for #{issue_context(issue)} error_code=#{error_code}")
+        raise RuntimeError, "Agent run failed for #{issue_context(issue)} error_code=#{error_code}"
     end
   end
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, opts)
-
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
-          end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+    with {:ok, prepared} <- prepared_workspace(issue, worker_host, opts),
+         :ok <- send_worker_runtime_info(codex_update_recipient, issue, worker_host, prepared, opts) do
+      try do
+        with :ok <- Workspace.run_after_create_hook(prepared.path, issue, prepared.created?, worker_host),
+             :ok <- Workspace.run_before_run_hook(prepared.path, issue, worker_host) do
+          run_codex_turns(prepared.path, issue, codex_update_recipient, opts, worker_host)
         end
+      after
+        Workspace.run_after_run_hook(prepared.path, issue, worker_host)
+      end
+    end
+  end
 
-      {:error, reason} ->
-        {:error, reason}
+  defp prepared_workspace(issue, worker_host, opts) do
+    case Keyword.get(opts, :prepared_workspace) do
+      nil ->
+        Workspace.prepare_for_issue(issue, worker_host, expected_workspace_path: Keyword.get(opts, :expected_workspace_path))
+
+      prepared ->
+        Workspace.validate_prepared_workspace(prepared, worker_host)
     end
   end
 
@@ -65,26 +72,36 @@ defmodule SymphonyElixir.AgentRunner do
          recipient,
          %Issue{id: issue_id} = issue,
          worker_host,
-         workspace,
+         prepared,
          opts
        )
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
-    send(
-      recipient,
-      {:worker_runtime_info, issue_id,
-       %{
-         worker_host: worker_host,
-         workspace_path: workspace,
-         run_id: Keyword.get(opts, :run_id),
-         runner_generation: Keyword.get(opts, :runner_generation),
-         session_title: AppServer.session_title(issue)
-       }}
-    )
+       when is_binary(issue_id) and is_pid(recipient) and is_map(prepared) do
+    runtime_info = %{
+      worker_host: worker_host,
+      workspace_path: prepared.path,
+      workspace_root: prepared.root,
+      run_id: Keyword.get(opts, :run_id),
+      runner_generation: Keyword.get(opts, :runner_generation),
+      session_title: AppServer.session_title(issue)
+    }
 
-    :ok
+    if Keyword.get(opts, :runtime_ack_required, false) do
+      acknowledgment_ref = make_ref()
+      send(recipient, {:worker_runtime_info, issue_id, runtime_info, self(), acknowledgment_ref})
+
+      receive do
+        {:worker_runtime_ack, ^acknowledgment_ref, :ok} -> :ok
+        {:worker_runtime_ack, ^acknowledgment_ref, {:error, reason}} -> {:error, reason}
+      after
+        Config.settings!().codex.read_timeout_ms -> {:error, :worker_runtime_ack_timeout}
+      end
+    else
+      send(recipient, {:worker_runtime_info, issue_id, runtime_info})
+      :ok
+    end
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _opts), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _prepared, _opts), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
@@ -96,12 +113,51 @@ defmodule SymphonyElixir.AgentRunner do
              session_title: AppServer.session_title(issue)
            ) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        with :ok <- send_worker_model_resolution(codex_update_recipient, issue, session, opts) do
+          do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        end
       after
         AppServer.stop_session(session)
       end
     end
   end
+
+  defp send_worker_model_resolution(
+         recipient,
+         %Issue{id: issue_id},
+         session,
+         opts
+       )
+       when is_binary(issue_id) and is_pid(recipient) and is_map(session) do
+    if Keyword.get(opts, :runtime_ack_required, false) do
+      acknowledgment_ref = make_ref()
+
+      resolution_info = %{
+        run_id: Keyword.get(opts, :run_id),
+        runner_generation: Keyword.get(opts, :runner_generation),
+        resolved_model: session.resolved_model,
+        reasoning_effort: session.reasoning_effort,
+        model_catalog_source: get_in(session, [:metadata, :model_catalog_source]),
+        model_catalog: get_in(session, [:metadata, :model_catalog])
+      }
+
+      send(
+        recipient,
+        {:worker_model_resolution, issue_id, resolution_info, self(), acknowledgment_ref}
+      )
+
+      receive do
+        {:worker_model_resolution_ack, ^acknowledgment_ref, :ok} -> :ok
+        {:worker_model_resolution_ack, ^acknowledgment_ref, {:error, reason}} -> {:error, reason}
+      after
+        Config.settings!().codex.read_timeout_ms -> {:error, :worker_model_resolution_ack_timeout}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp send_worker_model_resolution(_recipient, _issue, _session, _opts), do: :ok
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)

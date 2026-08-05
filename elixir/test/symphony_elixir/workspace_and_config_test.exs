@@ -958,6 +958,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   test "config supports per-state max concurrent agent overrides" do
     workflow = """
     ---
+    workflow:
+      runtime_prompt_mode: full_prompt_compat
     agent:
       max_concurrent_agents: 10
       max_concurrent_agents_by_state:
@@ -1263,6 +1265,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       trace_file = Path.join(test_root, "ssh.trace")
       fake_ssh = Path.join(test_root, "ssh")
       workspace_root = "~/.symphony-remote-workspaces"
+      canonical_workspace_root = "/remote/home/.symphony-remote-workspaces"
       workspace_path = "/remote/home/.symphony-remote-workspaces/MT-SSH-WS"
 
       File.mkdir_p!(test_root)
@@ -1275,6 +1278,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
 
       case "$*" in
+        *"__SYMPHONY_AFFINITY__"*)
+          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_AFFINITY__' '#{canonical_workspace_root}' '#{workspace_path}'
+          ;;
         *"__SYMPHONY_WORKSPACE__"*)
           printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{workspace_path}'
           ;;
@@ -1302,6 +1308,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       trace = File.read!(trace_file)
       assert trace =~ "-p 2200 worker-01 bash -lc"
+      assert trace =~ "__SYMPHONY_AFFINITY__"
       assert trace =~ "__SYMPHONY_WORKSPACE__"
       assert trace =~ "~/.symphony-remote-workspaces/MT-SSH-WS"
       assert trace =~ "${workspace#~/}"
@@ -1313,5 +1320,182 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "mixed remote affinity keeps each absolute field immutable before prepare and exact cleanup" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-mixed-remote-affinity-#{System.unique_integer([:positive])}"
+      )
+
+    worker_host = "worker-mixed"
+    local_home = Path.join(test_root, "local-home")
+    remote_home = "/home/remote-user"
+    remote_root = remote_home <> "/durable-workspaces"
+    absolute_path = remote_root <> "/MT-MIXED-PATH"
+    tilde_root = "~/durable-workspaces"
+    tilde_path = "~/durable-workspaces/MT-MIXED-ROOT"
+    absolute_root = remote_root
+    resolved_tilde_path = remote_root <> "/MT-MIXED-ROOT"
+    drifted_path = remote_root <> "/MT-MIXED-PATH-DRIFTED"
+    drifted_root = remote_home <> "/drifted-workspaces"
+    drifted_tilde_path = drifted_root <> "/MT-MIXED-ROOT"
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    remote_wrong_target_sentinel = Path.join(test_root, "remote-wrong-target-must-survive")
+
+    local_wrong_target_sentinel =
+      Path.join([local_home, "durable-workspaces", "MT-MIXED-ROOT", "must-survive"])
+
+    tracked_env = [
+      "HOME",
+      "PATH",
+      "SYMP_TEST_SSH_TRACE",
+      "SYMP_TEST_RESOLVED_ROOT",
+      "SYMP_TEST_RESOLVED_PATH",
+      "SYMP_TEST_FAIL_IF_MUTATED",
+      "SYMP_TEST_WRONG_TARGET_SENTINEL"
+    ]
+
+    previous_env = Map.new(tracked_env, &{&1, System.get_env(&1)})
+
+    on_exit(fn ->
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(Path.dirname(local_wrong_target_sentinel))
+    File.write!(local_wrong_target_sentinel, "local-home-target-must-survive")
+    File.write!(remote_wrong_target_sentinel, "remote-target-must-survive")
+    System.put_env("HOME", local_home)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("SYMP_TEST_WRONG_TARGET_SENTINEL", remote_wrong_target_sentinel)
+    System.put_env("PATH", test_root <> ":" <> (previous_env["PATH"] || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    trace_file="${SYMP_TEST_SSH_TRACE}"
+
+    record_mutation() {
+      if [ "${SYMP_TEST_FAIL_IF_MUTATED:-0}" = 1 ]; then
+        rm -f "${SYMP_TEST_WRONG_TARGET_SENTINEL}"
+      fi
+    }
+
+    case "$*" in
+      *"rm -rf"*"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'UNSAFE_PREFLIGHT' >> "$trace_file"
+        record_mutation
+        exit 76
+        ;;
+      *"__SYMPHONY_AFFINITY__"*)
+        printf '%s\n' 'PREFLIGHT' >> "$trace_file"
+        printf '%s\t%s\t%s\n' '__SYMPHONY_AFFINITY__' "${SYMP_TEST_RESOLVED_ROOT}" "${SYMP_TEST_RESOLVED_PATH}"
+        ;;
+      *"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\n' 'MUTATE' >> "$trace_file"
+        record_mutation
+        printf '%s\t%s\t%s\n' '__SYMPHONY_WORKSPACE__' '0' "${SYMP_TEST_RESOLVED_PATH}"
+        ;;
+      *b4-2-before-remove*)
+        printf '%s\n' 'HOOK' >> "$trace_file"
+        record_mutation
+        ;;
+      *"rm -rf"*)
+        printf '%s\n' 'CLEANUP' >> "$trace_file"
+        record_mutation
+        ;;
+      *)
+        printf '%s\n' 'UNCLASSIFIED' >> "$trace_file"
+        exit 75
+        ;;
+    esac
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: tilde_root,
+      worker_ssh_hosts: [worker_host],
+      hook_before_remove: "echo b4-2-before-remove"
+    )
+
+    set_remote_target = fn root, path ->
+      System.put_env("SYMP_TEST_RESOLVED_ROOT", root)
+      System.put_env("SYMP_TEST_RESOLVED_PATH", path)
+    end
+
+    reset_trace = fn -> File.write!(trace_file, "") end
+
+    trace_lines = fn ->
+      trace_file
+      |> File.read!()
+      |> String.split("\n", trim: true)
+    end
+
+    prepare = fn identifier, path, root ->
+      Workspace.prepare_for_issue(identifier, worker_host,
+        expected_workspace_path: path,
+        expected_workspace_root: root,
+        expected_worker_host: worker_host
+      )
+    end
+
+    System.put_env("SYMP_TEST_FAIL_IF_MUTATED", "0")
+
+    set_remote_target.(remote_root, absolute_path)
+
+    assert {:ok, %{path: ^absolute_path, root: ^remote_root}} =
+             prepare.("MT-MIXED-PATH", absolute_path, tilde_root)
+
+    assert trace_lines.() == ["PREFLIGHT", "MUTATE"]
+    reset_trace.()
+
+    assert {:ok, []} = Workspace.remove_exact(absolute_path, tilde_root, worker_host)
+    assert trace_lines.() == ["PREFLIGHT", "HOOK", "CLEANUP"]
+    reset_trace.()
+
+    set_remote_target.(remote_root, resolved_tilde_path)
+
+    assert {:ok, %{path: ^resolved_tilde_path, root: ^absolute_root}} =
+             prepare.("MT-MIXED-ROOT", tilde_path, absolute_root)
+
+    assert trace_lines.() == ["PREFLIGHT", "MUTATE"]
+    reset_trace.()
+
+    assert {:ok, []} = Workspace.remove_exact(tilde_path, absolute_root, worker_host)
+    assert trace_lines.() == ["PREFLIGHT", "HOOK", "CLEANUP"]
+    reset_trace.()
+
+    System.put_env("SYMP_TEST_FAIL_IF_MUTATED", "1")
+    set_remote_target.(remote_root, drifted_path)
+
+    path_drift =
+      {:workspace_affinity_mismatch, absolute_path, tilde_root, drifted_path, remote_root, worker_host}
+
+    assert {:error, ^path_drift} = prepare.("MT-MIXED-PATH", absolute_path, tilde_root)
+    assert trace_lines.() == ["PREFLIGHT"]
+    reset_trace.()
+
+    assert {:error, ^path_drift, ""} = Workspace.remove_exact(absolute_path, tilde_root, worker_host)
+    assert trace_lines.() == ["PREFLIGHT"]
+    reset_trace.()
+
+    set_remote_target.(drifted_root, drifted_tilde_path)
+
+    root_drift =
+      {:workspace_affinity_mismatch, tilde_path, absolute_root, drifted_tilde_path, drifted_root, worker_host}
+
+    assert {:error, ^root_drift} = prepare.("MT-MIXED-ROOT", tilde_path, absolute_root)
+    assert trace_lines.() == ["PREFLIGHT"]
+    reset_trace.()
+
+    assert {:error, ^root_drift, ""} = Workspace.remove_exact(tilde_path, absolute_root, worker_host)
+    assert trace_lines.() == ["PREFLIGHT"]
+
+    assert local_home != remote_home
+    assert File.read!(local_wrong_target_sentinel) == "local-home-target-must-survive"
+    assert File.read!(remote_wrong_target_sentinel) == "remote-target-must-survive"
   end
 end

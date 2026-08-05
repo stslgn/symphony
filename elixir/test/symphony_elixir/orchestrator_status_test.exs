@@ -61,6 +61,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       started_at: started_at
     }
 
+    seed_running_ledger!(initial_state.run_ledger_path, running_entry)
+
     state_with_issue =
       initial_state
       |> Map.put(:running, %{issue_id => running_entry})
@@ -95,7 +97,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {:codex_worker_update, issue_id,
        %{
          event: :notification,
-         payload: %{method: "some-event"},
+         payload: %{
+           method: "item/commandExecution/requestApproval",
+           params: %{parsedCmd: "SENSITIVE-BL10-DO-NOT-EXPOSE"}
+         },
          timestamp: now
        }}
     )
@@ -113,9 +118,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert snapshot_entry.last_codex_message == %{
              event: :notification,
-             message: %{method: "some-event"},
+             message: %{method: "item/commandExecution/requestApproval"},
              timestamp: now
            }
+
+    refute inspect(snapshot_entry) =~ "SENSITIVE-BL10-DO-NOT-EXPOSE"
 
     assert {:ok, events} = RunLedger.read_events(initial_state.run_ledger_path)
 
@@ -561,7 +568,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     )
 
     snapshot = GenServer.call(pid, :snapshot)
-    assert snapshot.rate_limits == rate_limits
+
+    assert snapshot.rate_limits == %{
+             limit_id: "codex",
+             primary: %{remaining: 90, limit: 100},
+             credits: %{has_credits: false, unlimited: false}
+           }
   end
 
   test "orchestrator token accounting prefers total_token_usage over last_token_usage in token_count payloads" do
@@ -726,6 +738,246 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_total_tokens == 14
   end
 
+  test "canonical token accounting derives monotonic totals and resolves contradictions" do
+    {state, issue_id, run_id} = token_accounting_state("canonical")
+
+    state = apply_token_usage(state, issue_id, run_id, %{"input_tokens" => 8, "output_tokens" => 3})
+    assert_token_usage(state, issue_id, 8, 3, 11, true)
+
+    duplicate = apply_token_usage(state, issue_id, run_id, %{"input_tokens" => 8, "output_tokens" => 3})
+    assert_token_usage(duplicate, issue_id, 8, 3, 11, true)
+    assert duplicate.codex_totals.total_tokens == 11
+
+    increased =
+      apply_token_usage(duplicate, issue_id, run_id, %{
+        "input_tokens" => 10,
+        "output_tokens" => 5
+      })
+
+    assert_token_usage(increased, issue_id, 10, 5, 15, true)
+
+    mismatched =
+      apply_token_usage(increased, issue_id, run_id, %{
+        "input_tokens" => 20,
+        "output_tokens" => 5,
+        "total_tokens" => 12
+      })
+
+    assert_token_usage(mismatched, issue_id, 20, 5, 25, true)
+
+    explicit_high =
+      apply_token_usage(mismatched, issue_id, run_id, %{
+        "input_tokens" => 25,
+        "output_tokens" => 5,
+        "total_tokens" => 40
+      })
+
+    assert_token_usage(explicit_high, issue_id, 25, 5, 40, true)
+  end
+
+  test "proven counter resets create epochs and accumulate post-reset growth" do
+    {state, issue_id, run_id} = token_accounting_state("epochs")
+
+    state = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 100})
+    state = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 0})
+    state = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 60})
+    state = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 0})
+    state = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 80})
+
+    assert_token_usage(state, issue_id, 0, 0, 240, true)
+
+    assert %{
+             integrity: :valid,
+             failure: nil,
+             total: %{last_raw: 80, lifetime: 240, epoch: 2}
+           } = state.running[issue_id].codex_token_accounting
+  end
+
+  test "reset growth crosses the configured budget using accumulated lifetime" do
+    {state, issue_id, run_id} = token_accounting_state("reset-budget", max_tokens: 250)
+
+    state =
+      apply_token_usage(state, issue_id, run_id, %{
+        "input_tokens" => 150,
+        "output_tokens" => 50
+      })
+
+    state =
+      apply_token_usage(state, issue_id, run_id, %{
+        "input_tokens" => 0,
+        "output_tokens" => 0
+      })
+
+    parked =
+      apply_token_usage(state, issue_id, run_id, %{
+        "input_tokens" => 150,
+        "output_tokens" => 50
+      })
+
+    refute Map.has_key?(parked.running, issue_id)
+    assert parked.codex_totals.total_tokens == 400
+
+    assert %{
+             reason: "run_budget_exhausted",
+             terminal_reason: "token_budget_exhausted"
+           } = parked.parked[issue_id]
+  end
+
+  test "ambiguous, malformed, and overflowing counters fail configured budgets closed" do
+    invalid_updates = [
+      {"ambiguous", %{"total_tokens" => 150}, :ambiguous_counter_decrease},
+      {"malformed", %{"total_tokens" => "200-trailing"}, :malformed_counter},
+      {"overflow", %{"input_tokens" => 9_223_372_036_854_775_807, "output_tokens" => 1}, :malformed_counter}
+    ]
+
+    for {tag, invalid_usage, expected_failure} <- invalid_updates do
+      {unbounded, unbounded_issue_id, unbounded_run_id} = token_accounting_state("#{tag}-status")
+
+      unbounded =
+        apply_token_usage(unbounded, unbounded_issue_id, unbounded_run_id, %{
+          "total_tokens" => 200
+        })
+
+      failed =
+        apply_token_usage(unbounded, unbounded_issue_id, unbounded_run_id, invalid_usage)
+
+      assert failed.running[unbounded_issue_id].codex_token_telemetry_integrity == :failed
+      assert failed.running[unbounded_issue_id].codex_token_telemetry_failure == expected_failure
+      assert failed.running[unbounded_issue_id].codex_token_telemetry_observed == false
+
+      {state, issue_id, run_id} = token_accounting_state(tag, max_tokens: 250)
+      valid = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 200})
+      parked = apply_token_usage(valid, issue_id, run_id, invalid_usage)
+
+      refute Map.has_key?(parked.running, issue_id)
+      assert parked.codex_totals.total_tokens == 200
+
+      assert %{
+               reason: "run_budget_exhausted",
+               terminal_reason: "token_telemetry_integrity_failed"
+             } = parked.parked[issue_id]
+    end
+  end
+
+  test "epoch lifetime overflow fails with a bounded integrity status" do
+    {state, issue_id, run_id} = token_accounting_state("lifetime-overflow")
+
+    state =
+      apply_token_usage(state, issue_id, run_id, %{
+        "total_tokens" => 9_223_372_036_854_775_807
+      })
+
+    state = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 0})
+    failed = apply_token_usage(state, issue_id, run_id, %{"total_tokens" => 1})
+    entry = failed.running[issue_id]
+
+    assert entry.codex_total_tokens == 9_223_372_036_854_775_807
+    assert entry.codex_token_telemetry_integrity == :failed
+    assert entry.codex_token_telemetry_failure == :counter_overflow
+    assert entry.codex_token_telemetry_observed == false
+
+    assert {:reply, snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, failed)
+
+    assert [row] = snapshot.running
+    assert row.budget.tokens.used == 9_223_372_036_854_775_807
+    assert row.budget.tokens.remaining == nil
+    assert row.budget.tokens.telemetry_integrity == "failed"
+    assert row.budget.tokens.integrity_error == "counter_overflow"
+  end
+
+  test "integrity failure stays visible without a token limit and unrelated usage stays unobserved" do
+    {state, issue_id, run_id} = token_accounting_state("integrity-status")
+
+    unrelated = apply_token_usage(state, issue_id, run_id, %{"cached_tokens" => 999})
+    assert_token_usage(unrelated, issue_id, 0, 0, 0, false)
+
+    valid = apply_token_usage(unrelated, issue_id, run_id, %{"total_tokens" => 200})
+    duplicate = apply_token_usage(valid, issue_id, run_id, %{"total_tokens" => 200})
+    malformed = apply_token_usage(duplicate, issue_id, run_id, %{"total_tokens" => "bad"})
+    ignored_after_failure = apply_token_usage(malformed, issue_id, run_id, %{"total_tokens" => 220})
+
+    entry = ignored_after_failure.running[issue_id]
+    assert entry.codex_total_tokens == 200
+    assert entry.codex_token_telemetry_observed == false
+    assert entry.codex_token_telemetry_integrity == :failed
+    assert entry.codex_token_telemetry_failure == :malformed_counter
+
+    assert {:reply, snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, ignored_after_failure)
+
+    assert [row] = snapshot.running
+
+    assert row.budget.tokens == %{
+             limit: nil,
+             used: 200,
+             remaining: nil,
+             telemetry_observed: false,
+             telemetry_integrity: "failed",
+             integrity_error: "malformed_counter"
+           }
+  end
+
+  test "one-sided token telemetry stays unenforceable and attempts keep independent high-water marks" do
+    {first_state, issue_id, first_run_id} = token_accounting_state("attempt-isolation")
+
+    one_sided =
+      apply_token_usage(first_state, issue_id, first_run_id, %{"input_tokens" => 40})
+
+    assert_token_usage(one_sided, issue_id, 40, 0, 0, false)
+
+    first_attempt =
+      apply_token_usage(one_sided, issue_id, first_run_id, %{
+        "input_tokens" => 40,
+        "output_tokens" => 10
+      })
+
+    assert_token_usage(first_attempt, issue_id, 40, 10, 50, true)
+
+    second_run_id = "run-attempt-isolation-2"
+    second_entry = token_running_entry(issue_id, second_run_id, max_tokens: nil)
+
+    second_state = %{
+      first_attempt
+      | running: %{issue_id => second_entry},
+        claimed: MapSet.new([issue_id])
+    }
+
+    stale =
+      apply_token_usage(second_state, issue_id, first_run_id, %{
+        "input_tokens" => 90,
+        "output_tokens" => 10
+      })
+
+    assert_token_usage(stale, issue_id, 0, 0, 0, false)
+
+    current =
+      apply_token_usage(stale, issue_id, second_run_id, %{
+        "input_tokens" => 4,
+        "output_tokens" => 6
+      })
+
+    assert_token_usage(current, issue_id, 4, 6, 10, true)
+    assert current.codex_totals.total_tokens == 60
+  end
+
+  test "derived canonical totals enforce exact and coarse token-budget crossings" do
+    for {tag, usage} <- [
+          {"exact", %{"input_tokens" => 80, "output_tokens" => 20}},
+          {"overshoot", %{"input_tokens" => 130, "output_tokens" => 70}}
+        ] do
+      {state, issue_id, run_id} = token_accounting_state(tag, max_tokens: 100)
+      parked = apply_token_usage(state, issue_id, run_id, usage)
+
+      refute Map.has_key?(parked.running, issue_id)
+
+      assert %{
+               reason: "run_budget_exhausted",
+               terminal_reason: "token_budget_exhausted"
+             } = parked.parked[issue_id]
+    end
+  end
+
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
     issue_id = "issue-last-token-ignored"
 
@@ -824,7 +1076,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       timer_ref: nil,
       due_at_ms: System.monotonic_time(:millisecond) + 5_000,
       identifier: "MT-500",
-      error: "agent exited: :boom"
+      error: "agent_exit"
     }
 
     initial_state = :sys.get_state(pid)
@@ -840,11 +1092,211 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                attempt: 2,
                due_in_ms: due_in_ms,
                identifier: "MT-500",
-               error: "agent exited: :boom"
+               error: "agent_exit"
              }
            ] = snapshot.retrying
 
     assert due_in_ms > 0
+  end
+
+  test "orchestrator restart exposes a durable queued resume in status" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"]
+    )
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-queued-resume-status-#{System.unique_integer([:positive])}"
+      )
+
+    ledger_path = Path.join(root, "run-ledger.jsonl")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    for transition_stage <- [{"run_claimed", "claimed"}, {"run_started", "running"}] do
+      {transition, stage} = transition_stage
+
+      assert :ok =
+               RunLedger.append(ledger_path, %{
+                 transition: transition,
+                 stage: stage,
+                 run_id: "run-status-resume-source",
+                 issue_id: "issue-status-resume",
+                 issue_identifier: "MT-RESUME-STATUS",
+                 attempt: 3,
+                 worker_host: "worker-a",
+                 workspace_path: "/srv/symphony/MT-RESUME-STATUS"
+               })
+    end
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "run_parked",
+               stage: "parked",
+               run_id: "run-status-resume-source",
+               issue_id: "issue-status-resume",
+               issue_identifier: "MT-RESUME-STATUS",
+               attempt: 3,
+               wait_id: "wait-status-resume",
+               parked_reason: "waiting_infrastructure",
+               allowed_actions: ["retry", "reject"],
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-RESUME-STATUS"
+             })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "resume_queued",
+               stage: "resume_queued",
+               run_id: "run-status-resume-source",
+               issue_id: "issue-status-resume",
+               issue_identifier: "MT-RESUME-STATUS",
+               attempt: 4,
+               wait_id: "wait-status-resume",
+               parked_reason: "waiting_infrastructure",
+               allowed_actions: ["retry", "reject"],
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-RESUME-STATUS"
+             })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "dispatch_paused",
+               stage: "operator",
+               runner_generation: "runner-before-restart"
+             })
+
+    orchestrator_name = Module.concat(__MODULE__, :QueuedResumeRestartOrchestrator)
+
+    assert {:ok, pid} =
+             Orchestrator.start_link(name: orchestrator_name, run_ledger_path: ledger_path)
+
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    snapshot = GenServer.call(pid, :snapshot)
+
+    assert snapshot.control.dispatch_paused
+    assert snapshot.parked == []
+
+    assert [
+             %{
+               issue_id: "issue-status-resume",
+               identifier: "MT-RESUME-STATUS",
+               run_id: "run-status-resume-source",
+               wait_id: "wait-status-resume",
+               attempt: 4,
+               stage: "resume_queued",
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-RESUME-STATUS",
+               due_in_ms: 0
+             }
+           ] = snapshot.retrying
+
+    rendered =
+      StatusDashboard.format_snapshot_content_for_test(
+        {:ok,
+         %{
+           running: snapshot.running,
+           retrying: snapshot.retrying,
+           codex_totals: snapshot.codex_totals,
+           control: snapshot.control
+         }},
+        0.0
+      )
+
+    assert rendered =~ "MT-RESUME-STATUS"
+    assert rendered =~ "attempt=4"
+    assert rendered =~ "resume queued"
+  end
+
+  test "orchestrator restart keeps stale remote recovery affinity visible and durable" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"]
+    )
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-recovery-affinity-status-#{System.unique_integer([:positive])}"
+      )
+
+    ledger_path = Path.join(root, "run-ledger.jsonl")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "run_claimed",
+               stage: "claimed",
+               run_id: "run-stale-affinity",
+               issue_id: "issue-stale-affinity",
+               issue_identifier: "MT-STALE-AFFINITY",
+               attempt: 2,
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-STALE-AFFINITY"
+             })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "run_started",
+               stage: "running",
+               run_id: "run-stale-affinity",
+               issue_id: "issue-stale-affinity",
+               issue_identifier: "MT-STALE-AFFINITY",
+               attempt: 2,
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-STALE-AFFINITY"
+             })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "run_runtime_ready",
+               stage: "running",
+               run_id: "run-stale-affinity",
+               issue_id: "issue-stale-affinity",
+               issue_identifier: "MT-STALE-AFFINITY",
+               attempt: 2,
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-STALE-AFFINITY"
+             })
+
+    assert :ok =
+             RunLedger.append(ledger_path, %{
+               transition: "dispatch_paused",
+               stage: "operator",
+               runner_generation: "runner-stale-affinity"
+             })
+
+    orchestrator_name = Module.concat(__MODULE__, :RecoveryAffinityOrchestrator)
+
+    assert {:ok, pid} =
+             Orchestrator.start_link(name: orchestrator_name, run_ledger_path: ledger_path)
+
+    snapshot = GenServer.call(pid, :snapshot)
+
+    assert [
+             %{
+               issue_id: "issue-stale-affinity",
+               identifier: "MT-STALE-AFFINITY",
+               run_id: "run-stale-affinity",
+               attempt: 3,
+               stage: "recovery_queued",
+               worker_host: "worker-a",
+               workspace_path: "/srv/symphony/MT-STALE-AFFINITY",
+               error: nil
+             }
+           ] = snapshot.retrying
+
+    GenServer.stop(pid)
+
+    second_name = Module.concat(__MODULE__, :SecondRecoveryAffinityOrchestrator)
+
+    assert {:ok, second_pid} =
+             Orchestrator.start_link(name: second_name, run_ledger_path: ledger_path)
+
+    on_exit(fn -> if Process.alive?(second_pid), do: Process.exit(second_pid, :normal) end)
+
+    assert [%{worker_host: "worker-a", workspace_path: "/srv/symphony/MT-STALE-AFFINITY"}] =
+             GenServer.call(second_pid, :snapshot).retrying
   end
 
   test "orchestrator snapshot includes poll countdown and checking status" do
@@ -993,6 +1445,253 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert next_poll_in_ms <= 50
   end
 
+  test "supervised poll task crash recovers through bounded backoff" do
+    parent = self()
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    poll_work_fn = fn request ->
+      attempt = Agent.get_and_update(counter, fn count -> {count + 1, count + 1} end)
+      send(parent, {:crash_recovery_poll_started, attempt, System.monotonic_time(:millisecond)})
+
+      if attempt == 1 do
+        raise "synthetic tracker crash"
+      else
+        successful_poll_result(request)
+      end
+    end
+
+    orchestrator_name = Module.concat(__MODULE__, :CrashRecoveryPollOrchestrator)
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        poll_work_fn: poll_work_fn,
+        poll_task_timeout_ms: 1_000
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    assert_receive {:crash_recovery_poll_started, 1, first_started_ms}, 500
+    assert_receive {:crash_recovery_poll_started, 2, second_started_ms}, 1_000
+    assert second_started_ms - first_started_ms >= 200
+    assert second_started_ms - first_started_ms < 900
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(
+               pid,
+               &match?(%{polling: %{checking?: false}}, &1),
+               500
+             )
+
+    state = :sys.get_state(pid)
+    assert state.poll_generation == 2
+    assert state.poll_failure_count == 0
+    assert state.poll_task == nil
+  end
+
+  test "owner kill releases its poll worker before restarted admission" do
+    parent = self()
+
+    {:ok, probe} =
+      Agent.start_link(fn ->
+        %{attempt: 0, worker_pids: [], max_live_workers: 0}
+      end)
+
+    poll_work_fn = fn request ->
+      worker_pid = self()
+
+      await_supervisor_admission = fn await_supervisor_admission, attempts_left ->
+        task_children = Task.Supervisor.children(SymphonyElixir.TaskSupervisor)
+
+        if worker_pid in task_children or attempts_left == 0 do
+          task_children
+        else
+          Process.sleep(1)
+          await_supervisor_admission.(await_supervisor_admission, attempts_left - 1)
+        end
+      end
+
+      task_children = await_supervisor_admission.(await_supervisor_admission, 50)
+
+      {attempt, supervised_count, prior_supervised_workers} =
+        Agent.get_and_update(probe, fn probe_state ->
+          attempt = probe_state.attempt + 1
+          worker_pids = [worker_pid | probe_state.worker_pids]
+
+          supervised_workers =
+            Enum.filter(task_children, &(&1 in worker_pids))
+
+          prior_supervised_workers = Enum.reject(supervised_workers, &(&1 == worker_pid))
+          supervised_count = length(supervised_workers)
+
+          result = {attempt, supervised_count, prior_supervised_workers}
+
+          {result,
+           %{
+             attempt: attempt,
+             worker_pids: worker_pids,
+             max_live_workers: max(probe_state.max_live_workers, supervised_count)
+           }}
+        end)
+
+      send(
+        parent,
+        {:owner_bound_poll_started, attempt, worker_pid, request, supervised_count, prior_supervised_workers}
+      )
+
+      receive do
+        {:release_owner_bound_poll, result} -> result
+      end
+    end
+
+    orchestrator_name = Module.concat(__MODULE__, :OwnerBoundPollOrchestrator)
+
+    {:ok, supervisor_pid} =
+      Supervisor.start_link(
+        [
+          {Orchestrator, name: orchestrator_name, poll_work_fn: poll_work_fn, poll_task_timeout_ms: 5_000}
+        ],
+        strategy: :one_for_one
+      )
+
+    Process.unlink(supervisor_pid)
+
+    on_exit(fn ->
+      if Process.alive?(supervisor_pid), do: Supervisor.stop(supervisor_pid)
+    end)
+
+    first_owner_pid = Process.whereis(orchestrator_name)
+    first_owner_ref = Process.monitor(first_owner_pid)
+
+    assert_receive {:owner_bound_poll_started, 1, first_worker_pid, _first_request, 1, []}, 500
+    first_poll_task = :sys.get_state(first_owner_pid).poll_task
+    first_guard_ref = Process.monitor(first_poll_task.guard_pid)
+    first_worker_ref = Process.monitor(first_worker_pid)
+
+    Process.exit(first_owner_pid, :kill)
+    assert_receive {:DOWN, ^first_owner_ref, :process, ^first_owner_pid, :killed}, 500
+
+    assert_receive {
+                     :owner_bound_poll_started,
+                     2,
+                     second_worker_pid,
+                     second_request,
+                     second_supervised_count,
+                     prior_supervised_workers
+                   },
+                   2_000
+
+    assert second_supervised_count == 1,
+           inspect(%{
+             first_guard_alive: Process.alive?(first_poll_task.guard_pid),
+             first_worker_alive: Process.alive?(first_worker_pid),
+             prior_supervised_workers: prior_supervised_workers,
+             registry:
+               Registry.lookup(
+                 SymphonyElixir.PollTaskRegistry,
+                 {:orchestrator_poll, orchestrator_name}
+               )
+           })
+
+    assert prior_supervised_workers == []
+
+    assert_receive {:DOWN, ^first_guard_ref, :process, _guard_pid, _reason}, 500
+    assert_receive {:DOWN, ^first_worker_ref, :process, ^first_worker_pid, _reason}, 500
+
+    refute Process.alive?(first_worker_pid)
+    assert Process.alive?(second_worker_pid)
+
+    second_owner_pid = Process.whereis(orchestrator_name)
+    refute second_owner_pid == first_owner_pid
+    assert Process.alive?(second_owner_pid)
+
+    second_poll_task = :sys.get_state(second_owner_pid).poll_task
+    assert second_poll_task.pid == second_worker_pid
+
+    assert Registry.lookup(
+             SymphonyElixir.PollTaskRegistry,
+             {:orchestrator_poll, orchestrator_name}
+           ) == [{second_poll_task.guard_pid, nil}]
+
+    task_children = Task.Supervisor.children(SymphonyElixir.TaskSupervisor)
+    assert second_worker_pid in task_children
+    refute first_worker_pid in task_children
+
+    assert %{attempt: 2, max_live_workers: 1} = Agent.get(probe, & &1)
+
+    send(
+      second_worker_pid,
+      {:release_owner_bound_poll, successful_poll_result(second_request)}
+    )
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(
+               second_owner_pid,
+               &match?(%{polling: %{checking?: false}}, &1),
+               500
+             )
+  end
+
+  test "timed-out poll ignores stale results and starts one bounded recovery task" do
+    parent = self()
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    poll_work_fn = fn request ->
+      attempt = Agent.get_and_update(counter, fn count -> {count + 1, count + 1} end)
+      send(parent, {:timeout_recovery_poll_started, attempt, self(), request})
+
+      receive do
+        {:release_timeout_recovery_poll, result} -> result
+      end
+    end
+
+    orchestrator_name = Module.concat(__MODULE__, :TimeoutRecoveryPollOrchestrator)
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        poll_work_fn: poll_work_fn,
+        poll_task_timeout_ms: 500
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    assert_receive {:timeout_recovery_poll_started, 1, first_poll_pid, first_request}, 500
+    first_task = :sys.get_state(pid).poll_task
+    assert first_task.pid == first_poll_pid
+
+    assert_receive {:timeout_recovery_poll_started, 2, second_poll_pid, second_request}, 1_500
+    refute Process.alive?(first_poll_pid)
+
+    send(
+      pid,
+      {:poll_guard_result, first_task.guard_pid, first_task.generation, Map.put(successful_poll_result(first_request), :dispatch, {:ok, [:stale]})}
+    )
+
+    Process.sleep(25)
+    current_task = :sys.get_state(pid).poll_task
+    assert current_task.pid == second_poll_pid
+    assert current_task.generation == 2
+
+    send(second_poll_pid, {
+      :release_timeout_recovery_poll,
+      successful_poll_result(second_request)
+    })
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(
+               pid,
+               &match?(%{polling: %{checking?: false}}, &1),
+               500
+             )
+
+    refute_receive {:timeout_recovery_poll_started, 3, _pid, _request}, 100
+  end
+
   test "orchestrator restarts stalled workers with retry backoff" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -1022,6 +1721,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     running_entry = %{
       pid: worker_pid,
       ref: make_ref(),
+      run_id: "run-stall",
+      retry_attempt: 0,
       identifier: "MT-STALL",
       issue: %Issue{id: issue_id, identifier: "MT-STALL", state: "In Progress"},
       session_id: "thread-stall-turn-stall",
@@ -1048,7 +1749,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              attempt: 1,
              due_at_ms: due_at_ms,
              identifier: "MT-STALL",
-             error: "stalled for " <> _
+             error: "worker_stalled"
            } = state.retry_attempts[issue_id]
 
     assert is_integer(due_at_ms)
@@ -1181,7 +1882,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
-    assert plain =~ ~r/No active agents\r?\n│\s*\r?\n├─ Backoff queue/
+    assert plain =~ ~r/No active agents\r?\n│\s*\r?\n├─ Retry \/ resume queue/
   end
 
   test "status dashboard adds a spacer line before backoff queue when agents are active" do
@@ -1220,7 +1921,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
-    assert plain =~ ~r/MT-777.*\r?\n│\s*\r?\n├─ Backoff queue/s
+    assert plain =~ ~r/MT-777.*\r?\n│\s*\r?\n├─ Retry \/ resume queue/s
   end
 
   test "status dashboard renders an unstyled closing corner when the retry queue is empty" do
@@ -1412,7 +2113,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute plain =~ " notification "
   end
 
-  test "status dashboard strips ANSI and control bytes from last codex message" do
+  test "status dashboard fails closed for raw last codex message content" do
     payload =
       "cmd: " <>
         <<27>> <>
@@ -1436,7 +2137,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     plain = Regex.replace(~r/\e\[[0-9;]*m/, row, "")
 
-    assert plain =~ "cmd: RED after line"
+    assert plain =~ "codex event"
+    refute plain =~ "RED"
     refute plain =~ <<27>>
     refute plain =~ <<0>>
   end
@@ -1501,10 +2203,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {"item/reasoning/textDelta", %{"params" => %{"textDelta" => "reason"}}, "reasoning text streaming"},
       {"item/commandExecution/outputDelta", %{"params" => %{"outputDelta" => "ok"}}, "command output streaming"},
       {"item/fileChange/outputDelta", %{"params" => %{"outputDelta" => "changed"}}, "file change output streaming"},
-      {"item/commandExecution/requestApproval", %{"params" => %{"parsedCmd" => "git status"}}, "command approval requested (git status)"},
+      {"item/commandExecution/requestApproval", %{"params" => %{"parsedCmd" => "git status"}}, "command approval requested"},
       {"item/fileChange/requestApproval", %{"params" => %{"fileChangeCount" => 2}}, "file change approval requested (2 files)"},
       {"item/tool/call", %{"params" => %{"tool" => "linear_graphql"}}, "dynamic tool call requested (linear_graphql)"},
-      {"item/tool/requestUserInput", %{"params" => %{"question" => "Continue?"}}, "tool requires user input: Continue?"}
+      {"item/tool/requestUserInput", %{"params" => %{"question" => "Continue?"}}, "tool requires user input"}
     ]
 
     Enum.each(event_cases, fn {method, payload, expected_fragment} ->
@@ -1582,7 +2284,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     message = %{
       event: :terminal_protocol_error,
       message: %{
-        reason: {:terminal_protocol_error, :invalid_markup, "invalid markup in final assistant message"}
+        reason: {:terminal_protocol_error, :invalid_markup}
       }
     }
 
@@ -1595,16 +2297,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     message = %{
       event: :app_server_error,
       message: %{
-        reason: {:app_server_error, "conversation unavailable"}
+        reason: {:app_server_error, "turn_error"}
       }
     }
 
     humanized = StatusDashboard.humanize_codex_message(message)
     assert humanized =~ "codex app-server error"
-    assert humanized =~ "conversation unavailable"
+    assert humanized =~ "turn_error"
   end
 
-  test "status dashboard uses shell command line as exec command status text" do
+  test "status dashboard omits shell command text from exec status" do
     message = %{
       event: :notification,
       message: %{
@@ -1613,7 +2315,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       }
     }
 
-    assert StatusDashboard.humanize_codex_message(message) == "git status --short"
+    assert StatusDashboard.humanize_codex_message(message) == "command started"
+    refute StatusDashboard.humanize_codex_message(message) =~ "git status --short"
   end
 
   test "status dashboard formats auto-approval updates from codex" do
@@ -1650,14 +2353,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert humanized =~ "auto-answered"
   end
 
-  test "status dashboard enriches wrapper reasoning and message streaming events with payload context" do
+  test "status dashboard keeps reasoning, message, command, and error content categorical" do
     reasoning_message = %{
       event: :notification,
       message: %{
         "method" => "codex/event/agent_reasoning",
         "params" => %{
           "msg" => %{
-            "payload" => %{"summaryText" => "compare retry paths for Linear polling"}
+            "payload" => %{"summaryText" => "SENSITIVE-BL10-DO-NOT-EXPOSE"}
           }
         }
       }
@@ -1669,7 +2372,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         "method" => "codex/event/agent_message_delta",
         "params" => %{
           "msg" => %{
-            "payload" => %{"delta" => "writing workpad reconciliation update"}
+            "payload" => %{"delta" => "SENSITIVE-BL10-DO-NOT-EXPOSE"}
           }
         }
       }
@@ -1683,11 +2386,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       }
     }
 
-    assert StatusDashboard.humanize_codex_message(reasoning_message) =~
-             "reasoning update: compare retry paths for Linear polling"
+    assert StatusDashboard.humanize_codex_message(reasoning_message) == "reasoning update"
+    assert StatusDashboard.humanize_codex_message(message_delta) == "agent message streaming"
 
-    assert StatusDashboard.humanize_codex_message(message_delta) =~
-             "agent message streaming: writing workpad reconciliation update"
+    refute StatusDashboard.humanize_codex_message(reasoning_message) =~
+             "SENSITIVE-BL10-DO-NOT-EXPOSE"
+
+    refute StatusDashboard.humanize_codex_message(message_delta) =~
+             "SENSITIVE-BL10-DO-NOT-EXPOSE"
 
     assert StatusDashboard.humanize_codex_message(fallback_reasoning) == "reasoning update"
   end
@@ -1750,5 +2456,113 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {next_tokens, [{timestamp, next_tokens} | acc]}
     end)
     |> elem(1)
+  end
+
+  defp token_accounting_state(tag, opts \\ []) do
+    issue_id = "issue-token-#{tag}"
+    run_id = "run-token-#{tag}"
+    running_entry = token_running_entry(issue_id, run_id, opts)
+
+    state = %Orchestrator.State{
+      runner_generation: "runner-token-accounting",
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    {state, issue_id, run_id}
+  end
+
+  defp token_running_entry(issue_id, run_id, opts) do
+    agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    on_exit(fn ->
+      if Process.alive?(agent_pid), do: Process.exit(agent_pid, :kill)
+    end)
+
+    %{
+      pid: agent_pid,
+      ref: nil,
+      run_id: run_id,
+      retry_attempt: 1,
+      identifier: String.upcase(issue_id),
+      issue: %Issue{id: issue_id, identifier: String.upcase(issue_id), state: "In Progress"},
+      started_at: DateTime.utc_now(),
+      session_id: nil,
+      session_title: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_token_accounting: %{
+        integrity: :unobserved,
+        failure: nil,
+        input: %{last_raw: nil, lifetime: 0, epoch: 0},
+        output: %{last_raw: nil, lifetime: 0, epoch: 0},
+        total: %{last_raw: nil, lifetime: 0, epoch: 0}
+      },
+      codex_token_telemetry_observed: false,
+      codex_token_telemetry_integrity: :unobserved,
+      codex_token_telemetry_failure: nil,
+      codex_token_telemetry_epoch: 0,
+      turn_count: 0,
+      run_budget: %{max_turns: 20, max_tokens: Keyword.get(opts, :max_tokens), max_seconds: nil},
+      run_budget_timer_ref: nil,
+      worker_host: nil,
+      workspace_path: nil,
+      workspace_root: nil
+    }
+  end
+
+  defp apply_token_usage(state, issue_id, run_id, usage) do
+    update = %{
+      event: :notification,
+      timestamp: DateTime.utc_now(),
+      run_id: run_id,
+      payload: %{
+        "method" => "thread/tokenUsage/updated",
+        "params" => %{"tokenUsage" => %{"total" => usage}}
+      }
+    }
+
+    assert {:noreply, updated_state} =
+             Orchestrator.handle_info({:codex_worker_update, issue_id, update}, state)
+
+    updated_state
+  end
+
+  defp assert_token_usage(state, issue_id, input, output, total, telemetry_observed?) do
+    entry = state.running[issue_id]
+    assert entry.codex_input_tokens == input
+    assert entry.codex_output_tokens == output
+    assert entry.codex_total_tokens == total
+
+    assert {:reply, snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, state)
+
+    [row] = snapshot.running
+    assert row.budget.tokens.telemetry_observed == telemetry_observed?
+    assert row.budget.tokens.used == if(telemetry_observed?, do: total)
+
+    assert row.budget.tokens.telemetry_integrity ==
+             if(telemetry_observed?, do: "valid", else: "unobserved")
+
+    assert row.budget.tokens.integrity_error == nil
+  end
+
+  defp successful_poll_result(request) do
+    %{
+      request: request,
+      running: {:ok, []},
+      parked: {:ok, []},
+      comments: %{},
+      dispatch: {:ok, []}
+    }
   end
 end

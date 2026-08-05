@@ -42,7 +42,8 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
       poll_interval_ms: 60_000,
       max_concurrent_agents: 1,
       max_turns: 1,
-      codex_command: "#{fake.binary} app-server"
+      codex_command: "#{fake.binary} app-server",
+      prompt: "Attempt={{ run.attempt }} Run={{ run.id }}"
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
@@ -80,6 +81,7 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
       assert [wait] = snapshot.parked
       assert wait.reason == "run_budget_exhausted"
       assert wait.terminal_reason == "turn_budget_exhausted"
+      first_run_id = wait.run_id
 
       events = ScenarioHarness.events(harness)
       assert count_transition(events, "run_claimed") == 1
@@ -99,6 +101,35 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
       assert trace =~ ~s("method":"turn/start")
       refute trace =~ ~s("method":"config/read")
 
+      assert {:ok, %{resumed: true}} =
+               Orchestrator.resolve_wait(harness.name, issue.id, wait.wait_id, "retry")
+
+      resumed_snapshot =
+        ScenarioHarness.await_snapshot(harness, fn snapshot ->
+          case snapshot.parked do
+            [%{run_id: run_id, attempt: 1}] when run_id != first_run_id -> true
+            _other -> false
+          end
+        end)
+
+      assert [%{run_id: resumed_run_id, attempt: 1}] = resumed_snapshot.parked
+      refute resumed_run_id == first_run_id
+
+      resumed_events = ScenarioHarness.events(harness)
+      assert count_transition(resumed_events, "run_claimed") == 2
+
+      assert Enum.any?(resumed_events, fn event ->
+               event["transition"] == "resume_queued" and event["attempt"] == 1
+             end)
+
+      assert Enum.any?(resumed_events, fn event ->
+               event["transition"] == "run_started" and
+                 event["run_id"] == resumed_run_id and event["attempt"] == 1
+             end)
+
+      resumed_trace = File.read!(fake.trace)
+      assert resumed_trace =~ "Attempt=1 Run=#{resumed_run_id}"
+
       assert :ok = ScenarioHarness.assert_consistent!(harness)
     after
       ScenarioHarness.stop(harness)
@@ -117,7 +148,8 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
       assert [wait] = snapshot.parked
       assert wait.reason == "run_budget_exhausted"
       assert wait.terminal_reason == "turn_budget_exhausted"
-      assert count_transition(ScenarioHarness.events(restarted), "run_claimed") == 1
+      assert wait.attempt == 1
+      assert count_transition(ScenarioHarness.events(restarted), "run_claimed") == 2
       assert :ok = ScenarioHarness.assert_consistent!(restarted)
     after
       ScenarioHarness.stop(restarted)
@@ -236,22 +268,100 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
     refute unavailable_trace =~ ~s("method":"config/read")
   end
 
-  test "capability preflight rejects unknown tools before app-server launch" do
+  test "capability preflight blocks claims, tasks, and app-server launch when a required tool is missing" do
     root = scenario_root("capability-preflight")
     on_exit(fn -> File.rm_rf(root) end)
 
+    ledger_path = Path.join(root, "run-ledger.jsonl")
+    workspace = Path.join(root, "workspaces/SCN-CAP")
     fake = ScenarioHarness.write_fake_codex!(root, :live_ok)
+    required_issue = issue("issue-capability-preflight", "SCN-CAP")
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       workspace_root: Path.join(root, "workspaces"),
       codex_command: "#{fake.binary} app-server",
-      codex_dynamic_tool_allowlist: ["unknown_tool"]
+      codex_dynamic_tool_allowlist: [],
+      codex_required_dynamic_tools: ["linear_graphql"]
     )
 
-    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
-    assert message =~ "codex.dynamic_tool_allowlist"
+    File.mkdir_p!(workspace)
+
+    assert {:error, {:missing_required_dynamic_tools, ["linear_graphql"]}} =
+             AppServer.start_session(workspace)
+
     refute File.exists?(fake.trace)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [required_issue])
+    task_children_before = MapSet.new(Task.Supervisor.children(SymphonyElixir.TaskSupervisor))
+    harness = ScenarioHarness.start!(Module.concat(__MODULE__, :CapabilityRunner), ledger_path)
+
+    try do
+      snapshot = ScenarioHarness.await_poll_idle(harness)
+      assert snapshot.running == []
+      assert snapshot.retrying == []
+      assert count_transition(ScenarioHarness.events(harness), "run_claimed") == 0
+      assert MapSet.new(Task.Supervisor.children(SymphonyElixir.TaskSupervisor)) == task_children_before
+      refute File.exists?(fake.trace)
+    after
+      ScenarioHarness.stop(harness)
+    end
+  end
+
+  test "consistency check rejects duplicate issue ids inside retrying" do
+    root = scenario_root("duplicate-retrying")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: Path.join(root, "workspaces"),
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    harness =
+      ScenarioHarness.start!(
+        Module.concat(__MODULE__, :DuplicateRetryRunner),
+        Path.join(root, "run-ledger.jsonl")
+      )
+
+    try do
+      ScenarioHarness.await_poll_idle(harness)
+      issue_id = "issue-duplicate-retrying"
+
+      :sys.replace_state(harness.pid, fn state ->
+        %{
+          state
+          | retry_attempts: %{
+              issue_id => %{
+                attempt: 2,
+                status: :durability_pending,
+                due_at_ms: nil,
+                identifier: "SCN-DUP",
+                previous_run_id: "run-duplicate-retry"
+              }
+            },
+            queued_resumes: %{
+              issue_id => %{
+                issue_id: issue_id,
+                identifier: "SCN-DUP",
+                run_id: "run-duplicate-resume",
+                wait_id: "wait-duplicate-resume",
+                attempt: 2,
+                stage: "resume_queued",
+                queued_at: DateTime.utc_now()
+              }
+            }
+        }
+      end)
+
+      assert_raise ExUnit.AssertionError, ~r/duplicate issue ids in retrying/, fn ->
+        ScenarioHarness.assert_consistent!(harness)
+      end
+    after
+      ScenarioHarness.stop(harness)
+    end
   end
 
   defp scenario_root(name) do

@@ -25,6 +25,7 @@ defmodule SymphonyElixir.Config do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           dynamic_tool_allowlist: [String.t()],
+          required_dynamic_tools: [String.t()],
           mcp_tool_auto_approve_allowlist: [String.t()],
           mcp_elicitation_auto_approve_allowlist: [String.t()]
         }
@@ -101,6 +102,24 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec validate_runtime_capabilities() ::
+          :ok | {:error, {:missing_required_dynamic_tools, [String.t()]}} | {:error, term()}
+  def validate_runtime_capabilities do
+    with {:ok, settings} <- settings() do
+      effective_tools = MapSet.new(settings.codex.dynamic_tool_allowlist)
+
+      missing_tools =
+        settings.codex.required_dynamic_tools
+        |> Enum.reject(&MapSet.member?(effective_tools, &1))
+        |> Enum.sort()
+
+      case missing_tools do
+        [] -> :ok
+        tools -> {:error, {:missing_required_dynamic_tools, tools}}
+      end
+    end
+  end
+
   @spec codex_runtime_settings(Path.t() | nil, keyword()) ::
           {:ok, codex_runtime_settings()} | {:error, term()}
   def codex_runtime_settings(workspace \\ nil, opts \\ []) do
@@ -113,6 +132,7 @@ defmodule SymphonyElixir.Config do
            thread_sandbox: settings.codex.thread_sandbox,
            turn_sandbox_policy: turn_sandbox_policy,
            dynamic_tool_allowlist: settings.codex.dynamic_tool_allowlist,
+           required_dynamic_tools: settings.codex.required_dynamic_tools,
            mcp_tool_auto_approve_allowlist: settings.codex.mcp_tool_auto_approve_allowlist,
            mcp_elicitation_auto_approve_allowlist: settings.codex.mcp_elicitation_auto_approve_allowlist
          }}

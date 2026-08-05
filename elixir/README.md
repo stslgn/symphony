@@ -87,21 +87,35 @@ attempt, stage, workspace, terminal-reason, operator-command outcome/cursor,
 dispatch-control, and resolved model fields. It never stores prompts, agent
 output, credentials, catalog response details, or comment bodies. At startup,
 Symphony closes unfinished attempts from the
-previous runner generation before the first poll, restores unresolved waits and
-dispatch pause, and resumes each operator comment cursor. An eligible issue is
-then redispatched with an incremented attempt and a new run id.
+previous runner generation before the first poll, restores unresolved waits,
+durable queued resumes, and dispatch pause, and resumes each operator comment
+cursor. An eligible issue is then redispatched with an incremented attempt and
+a new run id. Interrupted attempts keep a durable recovery entry containing the
+original worker host and canonical workspace path until the next claim.
+
+Persisted operator waits reject invalid UTF-8, Unicode controls, empty values,
+and oversized fields before append and recovery. Wait/issue/run ids are capped
+at 128 bytes, issue identifiers at 96, tracker state at 128, worker host at 255,
+and exact workspace path/root affinity at 4096 bytes. Exact affinity is never
+truncated before resume or cleanup.
 
 Human Review and Human Clarification transitions are recorded as durable
 `waiting_owner` operator waits; Deploy Ready is recorded as
 `waiting_live_approval`. The same typed wait model supports secret,
 infrastructure, review-cap, authentication, and explicit `operator_stopped`
 pauses. Parked issues have no retry timer, are excluded from automatic pickup,
-and are restored from the ledger after restart. Resuming a wait does not bypass
-the normal exact Linear state eligibility check.
+and are restored from the ledger after restart. Resuming a wait creates a
+durable `resume_queued` entry that remains visible with its next attempt while
+dispatch is paused or blocked; the next durable claim consumes it. Resume does
+not bypass the normal exact Linear state eligibility check. Resume and restart
+recovery use the persisted host exclusively and validate the prepared canonical
+workspace path before hooks or Codex start. Missing, retired, or busy affinity
+blocks dispatch visibly instead of falling back to another SSH worker.
 
 Run-budget stops use the same durable model with reason
 `run_budget_exhausted` and exact terminal reason `turn_budget_exhausted`,
-`token_budget_exhausted`, or `time_budget_exhausted`.
+`token_budget_exhausted`, `token_telemetry_integrity_failed`, or
+`time_budget_exhausted`.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt. If the Markdown body contains `## Symphony Runtime Prompt`, Symphony renders
@@ -160,17 +174,26 @@ Notes:
 - `agent.max_turns` is a hard attempt limit on back-to-back Codex turns. If the final allowed turn
   completes while the issue is still active, Symphony parks the run instead of scheduling an
   automatic continuation. Default: `20`.
-- `agent.max_run_tokens` optionally caps cumulative Codex tokens observed during one attempt.
+- `agent.max_run_tokens` optionally caps cumulative Codex tokens observed during one attempt. An
+  explicit cumulative total is accepted; when it is absent, Symphony derives a checked total only
+  when both cumulative input and output counters are present. One-sided or malformed telemetry does
+  not claim enforceable usage. Exact zero resets start a new telemetry epoch whose later growth is
+  added to the prior bounded lifetime. Duplicate values add nothing; malformed counters, checked
+  overflow, and ambiguous non-zero decreases permanently fail the attempt's telemetry integrity.
+  With a configured token limit, that integrity failure creates a typed durable park instead of
+  admitting more work with unknown usage.
 - `agent.max_run_seconds` optionally caps wall-clock seconds for one attempt and can stop an
   in-flight turn.
 - Reaching any run budget preserves the workspace and creates a durable
   `run_budget_exhausted` wait. Only an explicit `retry` or `reject` resolves it.
-- If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
-  identifier, title, and body.
+- In explicit `full_prompt_compat` mode, a blank Markdown body uses a default
+  prompt template. Managed mode rejects a blank body because the required
+  runtime heading is absent.
 - Prompt templates may read immutable run metadata from `run.id`, `run.attempt`,
   `run.stage`, and `run.runner_generation`.
-- Use `## Symphony Runtime Prompt` when `WORKFLOW.md` also contains operator-only instructions, so
-  pickup/watch-loop guidance does not get sent to the worker as task instructions.
+- Managed workflows must use an exact `## Symphony Runtime Prompt` line so
+  pickup/watch-loop guidance does not get sent to the worker as task
+  instructions.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
@@ -189,6 +212,8 @@ Notes:
   launched shell.
 
 ```yaml
+workflow:
+  runtime_prompt_mode: managed
 tracker:
   api_key: $LINEAR_API_KEY
   webhook_secret: $LINEAR_WEBHOOK_SECRET
@@ -201,19 +226,30 @@ codex:
   command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
   dynamic_tool_allowlist:
     - linear_graphql
+  required_dynamic_tools:
+    - linear_graphql
   mcp_tool_auto_approve_allowlist: []
   mcp_elicitation_auto_approve_allowlist: []
 ```
 
 - All capability allowlists default to empty. Symphony advertises and executes
   only client-side dynamic tools in `dynamic_tool_allowlist`.
+- `required_dynamic_tools` declares worker obligations. Missing entries in the
+  effective dynamic-tool allowlist block dispatch before `run_claimed`; the
+  same preflight runs before the Codex process starts.
 - MCP auto-approval is independent of `approval_policy`: tool approvals require
   an exact `server/tool` entry and elicitation approvals require an exact server
-  entry. Missing or malformed identities are denied or declined.
+  entry. Tool approval is correlated to a prior structured `mcpToolCall`
+  lifecycle event by thread, turn, and item id; display prose is never an
+  authorization input. Missing or malformed identities are denied or declined.
 - These MCP checks cover Symphony-mediated non-interactive approval responses;
   MCP servers configured directly in Codex and host/network isolation remain
   separate boundaries.
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
+- Managed workflows require an exact `## Symphony Runtime Prompt` heading and
+  send only the final such section to workers. A missing heading fails closed.
+  Full-body prompt fallback exists only as the explicit
+  `workflow.runtime_prompt_mode: full_prompt_compat` compatibility mode.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
@@ -229,10 +265,18 @@ server directly.
 
 The endpoint verifies the HMAC-SHA256 signature over the exact raw body, delivery UUID, event
 identity, and a 60-second timestamp window. A valid Issue or Comment-create event only queues the
-normal serialized poll/reconcile cycle. Symphony then re-fetches Linear and uses existing running,
-claimed, parked, concurrency, command-cursor, and dispatch-revalidation guards. Duplicate or
-out-of-order deliveries therefore do not directly create transitions, and fixed polling remains the
-fallback for lost webhook delivery.
+normal poll/reconcile cycle. Tracker reads run in one supervised, monitored task while the
+orchestrator remains responsive to status, budgets, worker messages, and operator controls. Wake-ups
+during that task coalesce behind one dirty latch and cause exactly one follow-up poll. Task
+references/generations reject stale results; crash and timeout recovery use bounded backoff. The
+poll worker is owned by a supervised registry-backed guard. If the orchestrator dies abnormally,
+the guard terminates that worker and retains exclusive poll admission until termination is confirmed,
+so a restarted owner cannot overlap an orphaned tracker request. The webhook wake-up call also has a
+bounded timeout and returns an unavailable response without crashing the request process. Symphony
+re-fetches Linear and uses existing running, claimed, parked,
+concurrency, command-cursor, and dispatch-revalidation guards. Duplicate or out-of-order deliveries
+therefore do not directly create transitions, and fixed polling remains the fallback for lost
+webhook delivery.
 
 ### Operator commands and global pause
 
@@ -269,12 +313,26 @@ The observability UI now runs on a minimal Phoenix stack:
 
 - LiveView for the dashboard at `/`
 - JSON API for operational debugging under `/api/v1/*`
-- `/api/v1/state` exposes separate `running`, `retrying`, and `parked` lists;
-  parked rows include the stable wait id, typed reason, allowed actions, and
-  issue/run identity.
+- `/api/v1/state` exposes separate `running`, `retrying`, `cleanup_pending`, and
+  `parked` lists;
+  `retrying` also includes durable `resume_queued` and `recovery_queued` rows
+  with their next attempt and host/path affinity,
+  while `cleanup_pending` retains its durable claim, has no retry deadline, and
+  exposes captured host/path affinity plus only `workspace_cleanup_pending`,
+  `workspace_cleanup_failed`, or `workspace_affinity_missing`,
+  and parked rows include the stable wait id, typed reason, allowed actions,
+  issue/run identity, worker host, and canonical workspace path. JSON and
+  LiveView share one control-safe, stably sorted parked projection with
+  per-field display bounds, a 100-row/65536-byte collection cap, and exact
+  total/returned/omitted truncation metadata; the internal cleanup path remains
+  exact and separate.
 - The state payload and terminal header expose `control.dispatch_paused`.
 - The same state payload exposes the effective capability allowlist names, but
   never credentials, tool arguments, prompts, or response bodies.
+- Coding-agent status is categorical: event/method names, bounded identifiers,
+  counts, and sanitized error codes. Runtime state, logs, JSON, and LiveView do
+  not retain or render provider payloads, agent/reasoning deltas, command
+  arguments, session titles, or free-form provider errors.
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 

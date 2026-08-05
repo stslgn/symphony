@@ -228,6 +228,7 @@ Fields (logical):
 - `issue_id`
 - `issue_identifier`
 - `attempt` (integer or null, `null` for first run, `>=1` for retries/continuation)
+- `worker_host` (string for SSH execution, null for local execution)
 - `workspace_path`
 - `started_at`
 - `status`
@@ -245,13 +246,13 @@ Fields:
 - `codex_app_server_pid` (string or null)
 - `last_codex_event` (string/enum or null)
 - `last_codex_timestamp` (timestamp or null)
-- `last_codex_message` (summarized payload)
+- `last_codex_message` (categorical event metadata only; never a raw provider payload)
 - `codex_input_tokens` (integer)
 - `codex_output_tokens` (integer)
 - `codex_total_tokens` (integer)
-- `last_reported_input_tokens` (integer)
-- `last_reported_output_tokens` (integer)
-- `last_reported_total_tokens` (integer)
+- `token_accounting` (object)
+  - Per input/output/total component: last raw cumulative value, bounded
+    accumulated lifetime, and reset epoch for the current attempt.
 - `turn_count` (integer)
   - Number of coding-agent turns started within the current worker lifetime.
 - `run_budget` (object)
@@ -260,6 +261,10 @@ Fields:
 - `token_telemetry_observed` (boolean)
   - When false, status MUST expose token usage and remaining allowance as
     unknown rather than verified zero.
+- `token_telemetry_integrity` (`unobserved`, `valid`, or `failed`)
+  - Integrity failure is attempt-scoped and permanent. Status exposes the
+    bounded accumulated value as a lower bound with no remaining allowance.
+- `token_telemetry_failure` (bounded categorical value or null)
 
 #### 4.1.7 Retry Entry
 
@@ -273,6 +278,7 @@ Fields:
 - `due_at_ms` (monotonic clock timestamp)
 - `timer_handle` (runtime-specific timer reference)
 - `error` (string or null)
+- `worker_host` and `workspace_path` (preserved affinity when the retry continues an existing workspace)
 
 #### 4.1.8 Orchestrator Runtime State
 
@@ -286,6 +292,8 @@ Fields:
 - `parked` (map `issue_id -> OperatorWait`)
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
+- `queued_resumes` (map `issue_id ->` durable queued-resume entry, consumed by the next claim)
+- `recovered_dispatches` (map `issue_id ->` durable restart-recovery attempt plus workspace affinity)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
@@ -306,6 +314,17 @@ Fields:
 - `allowed_actions` (bounded list derived from the reason)
 - `issue_id`, `identifier`, `run_id`, and `attempt`
 - `stage`, `tracker_state`, `terminal_reason`, and `parked_at`
+- `worker_host`, canonical `workspace_path`, and captured `workspace_root` for safe resume or cleanup
+  on the same execution host
+
+Every persisted text field MUST be valid UTF-8, non-empty when present, free of Unicode control
+codepoints, and bounded by encoded byte length. The limits are: `wait_id`, `issue_id`, and `run_id`
+128 bytes each; `identifier` 96 bytes; `tracker_state` 128 bytes; `worker_host` 255 bytes; and exact
+`workspace_path` and `workspace_root` 4096 bytes each. Typed reason/action/stage/terminal fields MUST
+come from their defined allowlists. Invalid or oversized waits MUST be rejected before ledger append
+and during recovery. Exact host/path/root affinity within those limits MUST remain byte-for-byte
+unchanged for resume and destructive cleanup; display projections MUST NOT replace or truncate the
+internal cleanup target.
 
 Operator waits MUST NOT contain prompts, agent output, secrets, private data, or tracker comments.
 
@@ -476,6 +495,9 @@ Fields:
   - Limits cumulative Codex tokens observed during one run attempt.
   - Missing token telemetry MUST be represented as unobserved, not as a
     verified zero.
+  - Malformed cumulative counters, checked-arithmetic overflow, or an
+    ambiguous non-zero decrease MUST fail a configured token budget closed as
+    `token_telemetry_integrity_failed`.
   - Invalid non-null values fail configuration validation.
 - `max_run_seconds` (positive integer or null)
   - Default: `null` (disabled).
@@ -515,8 +537,16 @@ fields locally if they want stricter startup checks.
 - `dynamic_tool_allowlist` (list of exact registered client-side tool names)
   - Default: empty list.
   - Unknown tool names MUST fail workflow validation.
+- `required_dynamic_tools` (list of exact registered client-side tool names)
+  - Default: empty list for compatibility workflows.
+  - Every entry MUST also exist in the effective `dynamic_tool_allowlist` before
+    a run is claimed and before Codex is launched. Missing entries block the run
+    with the bounded `missing_required_dynamic_tools` reason.
 - `mcp_tool_auto_approve_allowlist` (list of exact `server/tool` identities)
   - Default: empty list.
+  - Authorization MUST use structured `mcpToolCall` lifecycle identity correlated
+    by thread, turn, and item id. Human-readable approval text MUST NOT authorize
+    a call; missing or mismatched structured identity is denied.
 - `mcp_elicitation_auto_approve_allowlist` (list of exact MCP server names)
   - Default: empty list.
 - `turn_timeout_ms` (integer)
@@ -529,10 +559,13 @@ fields locally if they want stricter startup checks.
 
 ### 5.4 Prompt Template Contract
 
-The Markdown body of `WORKFLOW.md` is the per-issue prompt template unless the
-implementation documents an explicit runtime prompt section marker. The Elixir
-implementation uses `## Symphony Runtime Prompt` as that marker; when present,
-only that section through EOF is rendered for the worker.
+The Elixir implementation uses the exact `## Symphony Runtime Prompt` line as
+the worker boundary. In `workflow.runtime_prompt_mode: managed`, the heading is
+required and only the last exact heading through EOF is rendered for the
+worker; a missing heading is a workflow parse error. The legacy full-body
+fallback is available only through the explicit
+`workflow.runtime_prompt_mode: full_prompt_compat` setting and MUST NOT be used
+by managed deployments.
 
 Rendering requirements:
 
@@ -550,8 +583,10 @@ Template input variables:
 
 Fallback prompt behavior:
 
-- If the workflow prompt body is empty, the runtime MAY use a minimal default prompt
-  (`You are working on an issue from Linear.`).
+- Only explicit `full_prompt_compat` mode MAY use a minimal default prompt when
+  the workflow body is empty (`You are working on an issue from Linear.`).
+- Managed mode MUST reject an empty body because the exact runtime heading is
+  absent.
 - Workflow file read/parse failures are configuration/validation errors and SHOULD NOT silently fall
   back to a prompt.
 
@@ -561,6 +596,7 @@ Error classes:
 
 - `missing_workflow_file`
 - `workflow_parse_error`
+- `missing_runtime_prompt_heading` (managed prompt mode)
 - `workflow_front_matter_not_a_map`
 - `template_parse_error` (during prompt rendering)
 - `template_render_error` (unknown variable/filter, invalid interpolation)
@@ -672,6 +708,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
 - `codex.dynamic_tool_allowlist`: list of registered names, default `[]`
+- `codex.required_dynamic_tools`: required registered names, default `[]`
 - `codex.mcp_tool_auto_approve_allowlist`: list of `server/tool` identities, default `[]`
 - `codex.mcp_elicitation_auto_approve_allowlist`: list of server names, default `[]`
 - `codex.turn_timeout_ms`: integer, default `3600000`
@@ -706,7 +743,14 @@ claim state.
    - A durable typed operator wait exists in `parked`.
    - The issue cannot be dispatched until the wait is explicitly resumed.
 
-6. `Released`
+6. `CleanupPending`
+   - A terminal workspace cleanup is durably owned and the issue remains claimed.
+   - It has no retry deadline and cannot be dispatched while cleanup is pending.
+   - Operator projections expose only stage `cleanup_pending` plus one of
+     `workspace_cleanup_pending`, `workspace_cleanup_failed`, or
+     `workspace_affinity_missing`, with the captured host/path affinity.
+
+7. `Released`
    - Claim removed because issue is terminal, non-active, missing, or retry path completed without
      re-dispatch.
 
@@ -800,9 +844,16 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - Startup reconciliation marks every unfinished run from the previous runner generation as
   `interrupted_by_restart` before scheduling the first poll.
 - Startup reconciliation restores unresolved operator waits before dispatch.
+- Startup reconciliation restores durable queued resumes, including their next attempt.
+- Startup reconciliation restores the worker host and canonical workspace path for interrupted runs
+  and queued resumes. A recovered dispatch MUST target that host exclusively; it MUST remain blocked
+  and visible when the host or path affinity is missing or unavailable rather than hopping hosts.
 - Startup reconciliation restores global dispatch pause and per-issue operator comment cursors.
+- Startup reconciliation restores pending terminal workspace cleanup ownership and keeps each issue
+  claimed until exact cleanup plus its durable completion event succeed.
 - A parked issue is excluded from automatic retry and pickup even when its tracker state is active.
-- Resuming a wait removes only the runner-side park; normal exact-state eligibility still applies.
+- Resuming a wait atomically replaces the runner-side park with a durable `resume_queued` entry;
+  normal exact-state eligibility still applies, and the next durable claim consumes the queue entry.
 - A redispatched issue continues with an incremented attempt and a new run id.
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 
@@ -814,6 +865,17 @@ At startup, the service validates config, performs startup cleanup, schedules an
 then repeats every `polling.interval_ms`.
 
 The effective poll interval SHOULD be updated when workflow config changes are re-applied.
+
+Tracker reads for a poll (running/parked state, operator comments, candidate fetch, and dispatch
+revalidation) MUST execute in a supervised, monitored task rather than in the orchestrator
+GenServer. At most one poll task may be in flight. The GenServer MUST remain responsive to status,
+budget timers, worker lifecycle messages, and operator controls while tracker I/O is blocked.
+Wake-ups received during an in-flight poll set one dirty latch; completion schedules exactly one
+follow-up poll. Poll results are accepted only for the current task reference and generation. Task
+crash or timeout schedules a bounded retry backoff, and stale/late results cannot overwrite live
+state. Poll admission MUST also be exclusive across orchestrator incarnations. A supervised owner
+guard holds that lease until its tracker worker is confirmed dead; abnormal orchestrator death
+therefore terminates the old worker before a restarted orchestrator can admit another poll.
 
 Tick sequence:
 
@@ -1004,7 +1066,9 @@ Algorithm summary:
 3. Ensure the workspace path exists as a directory.
 4. Mark `created_now=true` only if the directory was created during this call; otherwise
    `created_now=false`.
-5. If `created_now=true`, run `after_create` hook if configured.
+5. When resuming or recovering an existing attempt, verify the prepared canonical path equals the
+   persisted expected workspace path.
+6. If `created_now=true`, run `after_create` hook if configured.
 
 Notes:
 
@@ -1060,6 +1124,8 @@ Invariant 1: Run the coding agent only in the per-issue workspace path.
 
 - Before launching the coding-agent subprocess, validate:
   - `cwd == workspace_path`
+- For resume/restart recovery, validate the prepared path against the persisted path before any
+  workspace hook or coding-agent process starts.
 
 Invariant 2: Workspace path MUST stay inside workspace root.
 
@@ -1459,8 +1525,9 @@ Message formatting requirements:
 
 - Use stable `key=value` phrasing.
 - Include action outcome (`completed`, `failed`, `retrying`, etc.).
-- Include concise failure reason when present.
-- Avoid logging large raw payloads unless necessary.
+- Include a stable, sanitized failure code when present.
+- Never log provider payloads, agent/reasoning text, prompts, command arguments, response bodies, or
+  free-form error messages.
 
 ### 13.2 Logging Outputs and Sinks
 
@@ -1483,10 +1550,15 @@ SHOULD return:
 - each running row SHOULD include the resolved model, reasoning effort, and model-catalog source when
   available; any exposed catalog MUST follow the credential-safe bounded contract in Section 10.2
 - `retrying` (list of retry queue rows)
+- `cleanup_pending` (list of durably owned terminal workspace cleanups; no retry deadline)
 - `parked` (list of typed operator waits)
+  - Operator surfaces SHOULD share one control-safe, stably sorted projection with per-field byte
+    limits, a row cap, an encoded-row byte cap, and exact total/returned/omitted metadata.
 - `control`
   - `dispatch_paused` (boolean)
 - `capabilities` (effective allowlist names only; no credentials, arguments, prompts, or results)
+- latest coding-agent event metadata MAY include categorical event/method names, bounded identifiers,
+  counts, and sanitized error codes only; raw payloads MUST NOT be retained in snapshot state
 - `codex_totals`
   - `input_tokens`
   - `output_tokens`
@@ -1507,6 +1579,10 @@ implementation-defined.
 If present, it SHOULD draw from orchestrator state/metrics only and MUST NOT be REQUIRED for
 correctness.
 
+Human-readable status MUST NOT render agent/reasoning deltas, command arguments, prompts, response
+bodies, session titles derived from issue text, or free-form provider errors. It MAY render categorical
+event names, bounded identifiers, counts, and sanitized error codes.
+
 ### 13.5 Session Metrics and Token Accounting
 
 Token accounting rules:
@@ -1516,9 +1592,21 @@ Token accounting rules:
   - `thread/tokenUsage/updated` payloads
   - `total_token_usage` within token-count wrapper events
 - Ignore delta-style payloads such as `last_token_usage` for dashboard/API totals.
-- Extract input/output/total token counts leniently from common field names within the selected
-  payload.
-- For absolute totals, track deltas relative to last reported totals to avoid double-counting.
+- Extract non-negative, bounded input/output/total token counts from common field names within the
+  selected payload. Reject malformed values and checked-sum overflow.
+- Canonicalize exactly one cumulative total per attempt. Use the explicit total when it is the only
+  enforceable total; when both cumulative input and output are present, derive their checked sum.
+  If explicit and derived totals disagree, use the larger bounded value so the budget fails closed.
+- Treat token telemetry as enforceably observed only when that canonical cumulative total exists.
+  A one-sided input or output counter remains visible but MUST NOT claim verified total usage.
+- Track the last raw cumulative counter and bounded accumulated lifetime per
+  attempt and component. A positive-to-zero transition proves a new telemetry
+  epoch; later growth MUST be added to the lifetime retained from prior epochs.
+  Duplicate values add nothing. A non-zero decrease is ambiguous and MUST
+  permanently fail telemetry integrity rather than silently discard usage.
+- A recognized but malformed counter or checked lifetime overflow MUST also
+  permanently fail telemetry integrity. Missing cumulative counters on an
+  unrelated update remain unobserved and are not an integrity failure.
 - Do not treat generic `usage` maps as cumulative totals unless the event type defines them that
   way.
 - Accumulate aggregate totals in orchestrator state.
@@ -1557,6 +1645,13 @@ If implemented:
 - The implementation MAY serve server-rendered HTML or a client-side application for the dashboard.
 - The dashboard/API MUST be observability/control surfaces only and MUST NOT become REQUIRED for
   orchestrator correctness.
+- Dashboard and API projections MUST expose categorical event names, bounded identifiers, counts,
+  and sanitized error codes only. They MUST NOT expose raw coding-agent payloads, prompts,
+  reasoning/message deltas, command arguments, response bodies, or free-form provider errors.
+- Parked-wait projections MUST be shared by the dashboard and JSON API, stably sorted, and bounded
+  independently from the exact internal cleanup affinity. The state count MUST report the exact
+  number of unresolved waits even when the returned list is truncated, and explicit metadata MUST
+  report the row/byte limits plus returned and omitted counts.
 
 Extension config:
 
@@ -1605,6 +1700,7 @@ Minimum endpoints:
       "counts": {
         "running": 2,
         "retrying": 1,
+        "cleanup_pending": 1,
         "parked": 1
       },
       "running": [
@@ -1629,7 +1725,9 @@ Minimum endpoints:
               "limit": 250000,
               "used": 2000,
               "remaining": 248000,
-              "telemetry_observed": true
+              "telemetry_observed": true,
+              "telemetry_integrity": "valid",
+              "integrity_error": null
             },
             "time": {"limit": 7200, "used": 287, "remaining": 6913}
           }
@@ -1642,6 +1740,19 @@ Minimum endpoints:
           "attempt": 3,
           "due_at": "2026-02-24T20:16:00Z",
           "error": "no available orchestrator slots"
+        }
+      ],
+      "cleanup_pending": [
+        {
+          "issue_id": "cleanup123",
+          "issue_identifier": "MT-648",
+          "run_id": "run_cleanup",
+          "attempt": 2,
+          "stage": "cleanup_pending",
+          "due_at": null,
+          "error_code": "workspace_cleanup_failed",
+          "worker_host": "worker-a",
+          "workspace_path": "/srv/symphony/workspaces/MT-648"
         }
       ],
       "parked": [
@@ -1659,6 +1770,15 @@ Minimum endpoints:
           "parked_at": "2026-02-24T20:15:00Z"
         }
       ],
+      "parked_meta": {
+        "total_count": 1,
+        "returned_count": 1,
+        "omitted_count": 0,
+        "truncated": false,
+        "row_limit": 100,
+        "byte_limit": 65536,
+        "returned_bytes": 356
+      },
       "codex_totals": {
         "input_tokens": 5000,
         "output_tokens": 2400,
@@ -1739,6 +1859,8 @@ Minimum endpoints:
 - `POST /api/v1/refresh`
   - Queues an immediate tracker poll + reconciliation cycle (best-effort trigger; implementations
     MAY coalesce repeated requests).
+  - Uses an explicit bounded orchestrator-call timeout. Timeout, exit, or unavailable orchestrator
+    returns a bounded `503` response and MUST NOT crash the HTTP caller.
   - Suggested request body: empty body or `{}`.
   - Suggested response (`202 Accepted`) shape:
 
@@ -1759,6 +1881,8 @@ Minimum endpoints:
     `webhookTimestamp` within 60 seconds of local time.
   - A verified `Issue` or `Comment`-create delivery queues or coalesces the same poll/reconcile
     cycle as `/refresh` and responds `200 OK` without echoing the request body.
+  - If the bounded wake-up call times out or exits, responds `503` without crashing the webhook
+    process. Authentication and payload handling remain fail-closed.
   - Other verified delivery types/actions are acknowledged with `200 OK` and ignored.
   - Missing configuration returns `503`; missing, malformed, stale, or invalid authentication fails
     closed and MUST NOT wake the orchestrator.
@@ -1844,9 +1968,12 @@ agent sessions do not survive process restart.
 After restart:
 
 - No retry timers are restored from prior process memory; an interrupted active issue is eligible
-  for one new attempt after normal tracker reconciliation.
+  for one new attempt after normal tracker reconciliation. Its durable recovery entry retains the
+  previous worker host and canonical workspace path across repeated runner restarts until claimed.
 - No running sessions are assumed recoverable.
 - Unresolved parked waits are restored and remain ineligible for automatic pickup.
+- Resumed waits and interrupted attempts redispatch only on their persisted worker host and path;
+  missing or unavailable affinity remains status-visible and blocks dispatch.
 - Service recovers by:
   - startup terminal workspace cleanup
   - fresh polling of active issues

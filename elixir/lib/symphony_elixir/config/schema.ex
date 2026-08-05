@@ -37,6 +37,25 @@ defmodule SymphonyElixir.Config.Schema do
     def dump(_value), do: :error
   end
 
+  defmodule WorkflowContract do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+
+    embedded_schema do
+      field(:runtime_prompt_mode, :string, default: "managed")
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:runtime_prompt_mode], empty_values: [])
+      |> validate_inclusion(:runtime_prompt_mode, ["managed", "full_prompt_compat"])
+    end
+  end
+
   defmodule Tracker do
     @moduledoc false
     use Ecto.Schema
@@ -205,6 +224,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
       field(:dynamic_tool_allowlist, {:array, :string}, default: [])
+      field(:required_dynamic_tools, {:array, :string}, default: [])
       field(:mcp_tool_auto_approve_allowlist, {:array, :string}, default: [])
       field(:mcp_elicitation_auto_approve_allowlist, {:array, :string}, default: [])
       field(:turn_timeout_ms, :integer, default: 3_600_000)
@@ -223,6 +243,7 @@ defmodule SymphonyElixir.Config.Schema do
           :thread_sandbox,
           :turn_sandbox_policy,
           :dynamic_tool_allowlist,
+          :required_dynamic_tools,
           :mcp_tool_auto_approve_allowlist,
           :mcp_elicitation_auto_approve_allowlist,
           :turn_timeout_ms,
@@ -233,12 +254,14 @@ defmodule SymphonyElixir.Config.Schema do
       )
       |> validate_required([:command])
       |> update_change(:dynamic_tool_allowlist, &normalize_allowlist/1)
+      |> update_change(:required_dynamic_tools, &normalize_allowlist/1)
       |> update_change(
         :mcp_tool_auto_approve_allowlist,
         &normalize_mcp_tool_allowlist/1
       )
       |> update_change(:mcp_elicitation_auto_approve_allowlist, &normalize_allowlist/1)
       |> validate_subset(:dynamic_tool_allowlist, @supported_dynamic_tools)
+      |> validate_subset(:required_dynamic_tools, @supported_dynamic_tools)
       |> validate_change(
         :mcp_tool_auto_approve_allowlist,
         &validate_mcp_tool_allowlist/2
@@ -350,6 +373,7 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   embedded_schema do
+    embeds_one(:workflow, WorkflowContract, on_replace: :update, defaults_to_struct: true)
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
@@ -442,6 +466,7 @@ defmodule SymphonyElixir.Config.Schema do
   defp changeset(attrs) do
     %__MODULE__{}
     |> cast(attrs, [])
+    |> cast_embed(:workflow, with: &WorkflowContract.changeset/2)
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
