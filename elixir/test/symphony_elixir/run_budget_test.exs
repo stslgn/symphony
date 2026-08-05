@@ -113,4 +113,27 @@ defmodule SymphonyElixir.RunBudgetTest do
 
     assert RunBudget.exhausted_reason(%{limits | max_tokens: nil}, metrics) == nil
   end
+
+  test "preserves bounded string integrity failures" do
+    snapshot =
+      RunBudget.snapshot(
+        %{max_turns: 20, max_tokens: 250, max_seconds: nil},
+        %{
+          token_telemetry_integrity: :failed,
+          token_telemetry_failure: "missing_usage_event"
+        }
+      )
+
+    assert snapshot.tokens.integrity_error == "missing_usage_event"
+  end
+
+  test "uses a generic integrity failure for untyped details" do
+    snapshot =
+      RunBudget.snapshot(
+        %{max_turns: 20, max_tokens: 250, max_seconds: nil},
+        %{token_telemetry_integrity: :failed, token_telemetry_failure: %{raw: "hidden"}}
+      )
+
+    assert snapshot.tokens.integrity_error == "unknown_integrity_failure"
+  end
 end

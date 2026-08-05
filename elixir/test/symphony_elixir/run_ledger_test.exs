@@ -846,6 +846,337 @@ defmodule SymphonyElixir.RunLedgerTest do
              RunLedger.reconcile_startup(path, "runner-new", append_fn: append_fn)
   end
 
+  test "handles empty and unterminated ledgers and surfaces exclusive create errors" do
+    empty_path = ledger_path()
+    File.mkdir_p!(Path.dirname(empty_path))
+    File.write!(empty_path, "")
+    assert {:ok, []} = RunLedger.read_events(empty_path)
+
+    unterminated_path = ledger_path()
+
+    assert :ok =
+             RunLedger.append(unterminated_path, %{
+               transition: "runner_started",
+               stage: "startup",
+               runner_generation: "runner-1"
+             })
+
+    File.write!(unterminated_path, String.trim_trailing(File.read!(unterminated_path), "\n"))
+    assert {:ok, [%{"transition" => "runner_started"}]} = RunLedger.read_events(unterminated_path)
+
+    too_long_path =
+      Path.join(Path.dirname(ledger_path()), String.duplicate("a", 256))
+
+    assert {:error, :enametoolong} =
+             RunLedger.append(too_long_path, %{
+               transition: "runner_started",
+               stage: "startup",
+               runner_generation: "runner-1"
+             })
+  end
+
+  test "rejects missing required attempts, invalid cursor timestamps, and schema drift" do
+    required_attempt_path = ledger_path()
+    assert :ok = append_claim!(required_attempt_path, "run-1", "issue-1", "DUD-1", 1)
+    [claim] = valid_records(required_attempt_path)
+    rewrite_records!(required_attempt_path, [Map.delete(claim, "attempt")])
+
+    assert {:error, {:invalid_ledger_record, 1, {:invalid_field, "attempt"}}} =
+             RunLedger.read_events(required_attempt_path)
+
+    required_next_attempt_path = ledger_path()
+
+    assert :ok =
+             RunLedger.append(required_next_attempt_path, %{
+               transition: "retry_scheduled",
+               stage: "retry_queued",
+               run_id: "run-1",
+               issue_id: "issue-1",
+               issue_identifier: "DUD-1",
+               attempt: 1,
+               next_attempt: 2
+             })
+
+    [retry] = valid_records(required_next_attempt_path)
+    rewrite_records!(required_next_attempt_path, [Map.delete(retry, "next_attempt")])
+
+    assert {:error, {:invalid_ledger_record, 1, {:invalid_field, "next_attempt"}}} =
+             RunLedger.read_events(required_next_attempt_path)
+
+    timestamp_path = ledger_path()
+
+    assert :ok =
+             RunLedger.append(timestamp_path, %{
+               transition: "operator_cursor_initialized",
+               stage: "operator",
+               issue_id: "issue-1",
+               comment_created_at: "2026-08-05T12:30:00Z",
+               runner_generation: "runner-1"
+             })
+
+    [cursor] = valid_records(timestamp_path)
+    rewrite_records!(timestamp_path, [%{cursor | "comment_created_at" => "not-a-time"}])
+
+    assert {:error, {:invalid_ledger_record, 1, {:invalid_field, "comment_created_at"}}} =
+             RunLedger.read_events(timestamp_path)
+
+    schema_path = ledger_path()
+
+    assert :ok =
+             RunLedger.append(schema_path, %{
+               transition: "runner_started",
+               stage: "startup",
+               runner_generation: "runner-1"
+             })
+
+    [runner] = valid_records(schema_path)
+    rewrite_records!(schema_path, [%{runner | "schema_version" => 2}])
+
+    assert {:error, {:invalid_ledger_record, 1, :unsupported_schema_version}} =
+             RunLedger.read_events(schema_path)
+  end
+
+  test "rejects untyped optional strings during semantic validation" do
+    path = ledger_path()
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "runner_started",
+               stage: "startup",
+               runner_generation: "runner-1"
+             })
+
+    [event] = valid_records(path)
+    rewrite_records!(path, [%{event | "runner_generation" => 123}])
+
+    assert {:error, {:invalid_ledger_record, 1, {:invalid_field, "runner_generation"}}} =
+             RunLedger.read_events(path)
+  end
+
+  test "enforces affinity and terminal retry predecessors" do
+    affinity_path = ledger_path()
+
+    assert :ok =
+             append_claim!(affinity_path, "run-affinity", "issue-affinity", "DUD-AFFINITY", 1, worker_host: "worker-a")
+
+    assert :ok =
+             RunLedger.append(affinity_path, %{
+               transition: "run_started",
+               stage: "running",
+               run_id: "run-affinity",
+               issue_id: "issue-affinity",
+               issue_identifier: "DUD-AFFINITY",
+               attempt: 1,
+               worker_host: "worker-b"
+             })
+
+    assert_sequence_error(affinity_path, 2, "run_started", :run_affinity_mismatch)
+
+    nonterminal_path = ledger_path()
+    assert :ok = append_claim!(nonterminal_path, "run-live", "issue-live", "DUD-LIVE", 1)
+    assert :ok = append_started!(nonterminal_path, "run-live", "issue-live", "DUD-LIVE", 1)
+    assert :ok = append_retry!(nonterminal_path, "run-live", "issue-live", "DUD-LIVE", 1, 2)
+    assert_sequence_error(nonterminal_path, 3, "retry_scheduled", :illegal_predecessor)
+
+    parked_path = ledger_path()
+    append_parked_run!(parked_path, "run-parked", "issue-parked")
+
+    assert :ok =
+             append_retry!(
+               parked_path,
+               "run-parked",
+               "issue-parked",
+               "DUD-SEMANTIC-MIDDLE",
+               1,
+               2
+             )
+
+    assert_sequence_error(parked_path, 4, "retry_scheduled", :parked_run_cannot_retry)
+  end
+
+  test "enforces increasing attempts and exact terminal retry intent" do
+    nonincreasing_path = ledger_path()
+    assert :ok = append_claim!(nonincreasing_path, "run-1", "issue-1", "DUD-1", 1)
+    assert :ok = append_started!(nonincreasing_path, "run-1", "issue-1", "DUD-1", 1)
+    assert :ok = append_retry_terminal!(nonincreasing_path, "run-1", "issue-1", "DUD-1", 1, 1)
+    assert :ok = append_retry!(nonincreasing_path, "run-1", "issue-1", "DUD-1", 1, 1)
+    assert_sequence_error(nonincreasing_path, 4, "retry_scheduled", :retry_attempt_not_increasing)
+
+    missing_intent_path = ledger_path()
+    append_complete_run!(missing_intent_path, "run-complete", "issue-complete")
+
+    assert :ok =
+             append_retry!(
+               missing_intent_path,
+               "run-complete",
+               "issue-complete",
+               "DUD-SEMANTIC-TAIL",
+               1,
+               2,
+               "continuation"
+             )
+
+    assert_sequence_error(missing_intent_path, 4, "retry_scheduled", :missing_terminal_retry_intent)
+
+    interrupted_path = ledger_path()
+    assert :ok = append_claim!(interrupted_path, "run-stale", "issue-stale", "DUD-STALE", 1)
+    assert :ok = append_started!(interrupted_path, "run-stale", "issue-stale", "DUD-STALE", 1)
+
+    assert :ok =
+             RunLedger.append(interrupted_path, %{
+               transition: "run_interrupted",
+               stage: "released",
+               run_id: "run-stale",
+               issue_id: "issue-stale",
+               issue_identifier: "DUD-STALE",
+               attempt: 1,
+               terminal_reason: "runner_restarted"
+             })
+
+    assert {:ok, [_claim, _started, _interrupted]} = RunLedger.read_events(interrupted_path)
+  end
+
+  test "requires cleanup intent and accepts only idempotent cleanup duplicates" do
+    missing_intent_path = ledger_path()
+    append_complete_run!(missing_intent_path, "run-complete", "issue-complete")
+
+    assert :ok =
+             append_cleanup_requested!(
+               missing_intent_path,
+               "run-complete",
+               "issue-complete",
+               "DUD-SEMANTIC-TAIL",
+               1
+             )
+
+    assert_sequence_error(
+      missing_intent_path,
+      4,
+      "workspace_cleanup_requested",
+      :missing_cleanup_intent
+    )
+
+    cleanup_path = ledger_path()
+    append_cleanup_run!(cleanup_path)
+    cleanup_requested = cleanup_requested_event()
+    cleanup_completed = cleanup_completed_event()
+
+    assert :ok = RunLedger.append(cleanup_path, cleanup_requested)
+    assert :ok = RunLedger.append(cleanup_path, cleanup_requested)
+    assert :ok = RunLedger.append(cleanup_path, cleanup_completed)
+    assert :ok = RunLedger.append(cleanup_path, cleanup_completed)
+    assert {:ok, _events} = RunLedger.read_events(cleanup_path)
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(cleanup_path, "runner-new")
+    assert recovery.cleanup_pending == %{}
+  end
+
+  test "rejects missing waits and claimed dispatch affinity mismatches" do
+    missing_wait_path = ledger_path()
+
+    assert :ok =
+             RunLedger.append(missing_wait_path, %{
+               transition: "wait_rejected",
+               stage: "parked",
+               run_id: "run-missing",
+               issue_id: "issue-missing",
+               issue_identifier: "DUD-MISSING",
+               attempt: 1,
+               wait_id: "wait-missing",
+               parked_reason: "waiting_owner",
+               allowed_actions: ["approve", "reject"]
+             })
+
+    assert_sequence_error(missing_wait_path, 1, "wait_rejected", :missing_parked_wait)
+
+    dispatch_path = ledger_path()
+
+    assert :ok =
+             append_claim!(dispatch_path, "run-old", "issue-dispatch", "DUD-DISPATCH", 1, worker_host: "worker-a")
+
+    assert :ok = append_started!(dispatch_path, "run-old", "issue-dispatch", "DUD-DISPATCH", 1)
+
+    assert :ok =
+             RunLedger.append(dispatch_path, %{
+               transition: "run_failed",
+               stage: "released",
+               run_id: "run-old",
+               issue_id: "issue-dispatch",
+               issue_identifier: "DUD-DISPATCH",
+               attempt: 1,
+               terminal_reason: "worker_exit",
+               next_action: "retry",
+               next_attempt: 2,
+               worker_host: "worker-a"
+             })
+
+    assert :ok =
+             append_claim!(dispatch_path, "run-new", "issue-dispatch", "DUD-DISPATCH", 2, worker_host: "worker-b")
+
+    assert_sequence_error(dispatch_path, 4, "run_claimed", :dispatch_identity_mismatch)
+  end
+
+  test "rejects sequences that could create competing recovery entries" do
+    duplicate_resume_path = ledger_path()
+    append_parked_run!(duplicate_resume_path, "run-parked", "issue-parked")
+
+    resume_event = %{
+      transition: "wait_resumed",
+      stage: "resume_queued",
+      run_id: "run-parked",
+      issue_id: "issue-parked",
+      issue_identifier: "DUD-SEMANTIC-MIDDLE",
+      attempt: 2,
+      wait_id: "wait-semantic-middle",
+      parked_reason: "waiting_owner",
+      allowed_actions: ["approve", "reject"]
+    }
+
+    assert :ok = RunLedger.append(duplicate_resume_path, resume_event)
+    assert :ok = RunLedger.append(duplicate_resume_path, %{resume_event | transition: "resume_queued"})
+    assert_sequence_error(duplicate_resume_path, 5, "resume_queued", :missing_parked_wait)
+
+    duplicate_terminal_path = ledger_path()
+
+    assert :ok =
+             append_claim!(
+               duplicate_terminal_path,
+               "run-stale",
+               "issue-stale",
+               "DUD-STALE",
+               1
+             )
+
+    assert :ok =
+             append_started!(
+               duplicate_terminal_path,
+               "run-stale",
+               "issue-stale",
+               "DUD-STALE",
+               1
+             )
+
+    interrupted_event = %{
+      transition: "run_interrupted",
+      stage: "released",
+      run_id: "run-stale",
+      issue_id: "issue-stale",
+      issue_identifier: "DUD-STALE",
+      attempt: 1,
+      terminal_reason: "runner_restarted"
+    }
+
+    assert :ok = RunLedger.append(duplicate_terminal_path, interrupted_event)
+    assert :ok = RunLedger.append(duplicate_terminal_path, interrupted_event)
+    assert_sequence_error(duplicate_terminal_path, 4, "run_interrupted", :illegal_predecessor)
+
+    parallel_run_path = ledger_path()
+    assert :ok = append_claim!(parallel_run_path, "run-1", "issue-shared", "DUD-SHARED", 1)
+    assert :ok = append_started!(parallel_run_path, "run-1", "issue-shared", "DUD-SHARED", 1)
+    assert :ok = append_claim!(parallel_run_path, "run-2", "issue-shared", "DUD-SHARED", 2)
+    assert_sequence_error(parallel_run_path, 3, "run_claimed", :issue_already_active)
+  end
+
   defp ledger_path do
     Path.join(
       System.tmp_dir!(),
@@ -970,5 +1301,89 @@ defmodule SymphonyElixir.RunLedgerTest do
       issue_identifier: issue_identifier,
       attempt: attempt
     })
+  end
+
+  defp append_retry!(path, run_id, issue_id, issue_identifier, attempt, next_attempt, action \\ "retry") do
+    RunLedger.append(path, %{
+      transition: "retry_scheduled",
+      stage: "retry_queued",
+      run_id: run_id,
+      issue_id: issue_id,
+      issue_identifier: issue_identifier,
+      attempt: attempt,
+      next_action: action,
+      next_attempt: next_attempt
+    })
+  end
+
+  defp append_cleanup_run!(path) do
+    assert :ok =
+             append_claim!(path, "run-cleanup", "issue-cleanup", "DUD-CLEANUP", 1,
+               worker_host: "worker-a",
+               workspace_path: "/tmp/DUD-CLEANUP",
+               workspace_root: "/tmp"
+             )
+
+    assert :ok = append_started!(path, "run-cleanup", "issue-cleanup", "DUD-CLEANUP", 1)
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_stopped",
+               stage: "released",
+               run_id: "run-cleanup",
+               issue_id: "issue-cleanup",
+               issue_identifier: "DUD-CLEANUP",
+               attempt: 1,
+               terminal_reason: "tracker_terminal",
+               worker_host: "worker-a",
+               workspace_path: "/tmp/DUD-CLEANUP",
+               workspace_root: "/tmp"
+             })
+  end
+
+  defp append_cleanup_requested!(path, run_id, issue_id, issue_identifier, attempt) do
+    RunLedger.append(path, %{
+      transition: "workspace_cleanup_requested",
+      stage: "cleanup",
+      run_id: run_id,
+      issue_id: issue_id,
+      issue_identifier: issue_identifier,
+      attempt: attempt,
+      terminal_reason: "tracker_terminal"
+    })
+  end
+
+  defp cleanup_requested_event do
+    %{
+      transition: "workspace_cleanup_requested",
+      stage: "cleanup",
+      run_id: "run-cleanup",
+      issue_id: "issue-cleanup",
+      issue_identifier: "DUD-CLEANUP",
+      attempt: 1,
+      terminal_reason: "tracker_terminal",
+      worker_host: "worker-a",
+      workspace_path: "/tmp/DUD-CLEANUP",
+      workspace_root: "/tmp"
+    }
+  end
+
+  defp cleanup_completed_event do
+    %{
+      transition: "workspace_cleanup_completed",
+      stage: "cleanup",
+      run_id: "run-cleanup",
+      issue_id: "issue-cleanup",
+      issue_identifier: "DUD-CLEANUP",
+      attempt: 1,
+      worker_host: "worker-a",
+      workspace_path: "/tmp/DUD-CLEANUP",
+      workspace_root: "/tmp"
+    }
+  end
+
+  defp assert_sequence_error(path, line, transition, reason) do
+    assert {:error, {:invalid_ledger_record, ^line, {:invalid_transition_sequence, ^transition, ^reason}}} =
+             RunLedger.read_events(path)
   end
 end

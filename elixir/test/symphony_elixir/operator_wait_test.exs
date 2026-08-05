@@ -140,4 +140,50 @@ defmodule SymphonyElixir.OperatorWaitTest do
     assert {:error, {:invalid_wait_field, "allowed_actions"}} =
              OperatorWait.from_ledger_event(%{event | "allowed_actions" => ["retry"]})
   end
+
+  test "rejects invalid persisted containers and field value types" do
+    assert {:error, {:invalid_wait_field, "event"}} = OperatorWait.from_ledger_event(:invalid)
+    assert {:error, {:invalid_wait_field, "event"}} = OperatorWait.validate_persisted_fields(:invalid)
+
+    assert {:error, {:invalid_wait_field, "issue_id"}} =
+             OperatorWait.validate_persisted_fields(%{
+               wait_id: "wait-1",
+               issue_id: 123,
+               identifier: "DUD-1",
+               run_id: "run-1"
+             })
+  end
+
+  test "rejects invalid ledger attempts and reasons" do
+    event = valid_ledger_event()
+
+    assert {:error, {:invalid_wait_field, "attempt"}} =
+             OperatorWait.from_ledger_event(%{event | "attempt" => -1})
+
+    assert {:error, :invalid_wait_reason} =
+             OperatorWait.from_ledger_event(%{
+               event
+               | "parked_reason" => "unknown",
+                 "allowed_actions" => []
+             })
+  end
+
+  test "rejects non-binary ledger timestamps" do
+    assert {:error, {:invalid_wait_field, "occurred_at"}} =
+             OperatorWait.from_ledger_event(%{valid_ledger_event() | "occurred_at" => nil})
+  end
+
+  defp valid_ledger_event do
+    %{
+      "parked_reason" => "waiting_owner",
+      "wait_id" => "wait-1",
+      "issue_id" => "issue-1",
+      "issue_identifier" => "DUD-1",
+      "run_id" => "run-1",
+      "attempt" => 1,
+      "stage" => "parked",
+      "allowed_actions" => ["approve", "reject"],
+      "occurred_at" => "2026-08-05T12:30:00Z"
+    }
+  end
 end
