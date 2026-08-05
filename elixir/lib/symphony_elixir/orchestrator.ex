@@ -565,7 +565,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp revalidate_poll_candidates(issues) when is_list(issues) do
+  defp revalidate_poll_candidates(issues) do
     issue_ids =
       Enum.flat_map(issues, fn
         %Issue{id: issue_id} when is_binary(issue_id) -> [issue_id]
@@ -574,8 +574,6 @@ defmodule SymphonyElixir.Orchestrator do
 
     fetch_issue_states(issue_ids)
   end
-
-  defp revalidate_poll_candidates(_issues), do: {:error, :invalid_candidate_collection}
 
   defp apply_poll_result(%State{} = state, %{request: request} = result) when is_map(request) do
     state
@@ -3684,7 +3682,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
+  defp record_session_completion_totals(state, running_entry) do
     runtime_seconds = running_seconds(running_entry.started_at, DateTime.utc_now())
 
     codex_totals =
@@ -3700,8 +3698,6 @@ defmodule SymphonyElixir.Orchestrator do
 
     %{state | codex_totals: codex_totals}
   end
-
-  defp record_session_completion_totals(state, _running_entry), do: state
 
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
@@ -4130,15 +4126,10 @@ defmodule SymphonyElixir.Orchestrator do
     Enum.find_value(fields, fn field -> map_integer_value(payload, field) end)
   end
 
-  defp payload_get(payload, field), do: map_integer_value(payload, field)
-
   defp map_integer_value(payload, field) do
-    if is_map(payload) do
-      value = Map.get(payload, field)
-      integer_like(value)
-    else
-      nil
-    end
+    payload
+    |> Map.get(field)
+    |> integer_like()
   end
 
   defp run_budget_snapshot(running_entry, now) do
