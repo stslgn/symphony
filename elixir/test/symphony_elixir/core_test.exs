@@ -600,6 +600,63 @@ defmodule SymphonyElixir.CoreTest do
            end)
   end
 
+  test "human clarification stays parked when legacy config also marks it terminal" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-human-clarification-overlap-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-human-clarification-overlap"
+    identifier = "DUD-152"
+    workspace = Path.join(test_root, identifier)
+    sentinel = Path.join(workspace, "uncommitted-migration.sql")
+    ledger_path = ledger_path("human-clarification-overlap")
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+    File.mkdir_p!(workspace)
+    File.write!(sentinel, "create table preserved_work();\n")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: test_root,
+      tracker_terminal_states: ["Closed", "Human Clarification"]
+    )
+
+    agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(agent_pid), do: Process.exit(agent_pid, :kill) end)
+
+    running_entry = %{
+      pid: agent_pid,
+      ref: nil,
+      run_id: "run-human-clarification-overlap",
+      retry_attempt: 1,
+      identifier: identifier,
+      issue: %Issue{id: issue_id, state: "Agent Running", identifier: identifier},
+      workspace_path: workspace,
+      workspace_root: test_root,
+      worker_host: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    state = %Orchestrator.State{
+      run_ledger_path: ledger_path,
+      runner_generation: "runner-human-clarification-overlap",
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    seed_running_ledger!(ledger_path, running_entry)
+
+    issue = %Issue{id: issue_id, identifier: identifier, state: "Human Clarification"}
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    assert updated_state.parked[issue_id].reason == "waiting_owner"
+    refute Map.has_key?(updated_state.cleanup_pending, issue_id)
+    assert File.read!(sentinel) == "create table preserved_work();\n"
+  end
+
   test "parked issues are excluded from dispatch even when Linear is active" do
     issue = %Issue{
       id: "issue-parked-active",
@@ -955,8 +1012,7 @@ defmodule SymphonyElixir.CoreTest do
   test "terminal parked issue releases durably and removes its local recorded workspace" do
     root = parked_workspace_root("local-terminal")
     workspace = Path.join(root, "MT-PARKED-LOCAL-TERMINAL")
-    File.mkdir_p!(workspace)
-    File.write!(Path.join(workspace, "remove-me"), "old")
+    install_durable_local_workspace!(workspace, %{"remove-me" => "old"})
 
     {state, wait} = parked_reconcile_state("local-terminal", workspace, root, nil)
 
@@ -973,6 +1029,34 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, events} = RunLedger.read_events(state.run_ledger_path)
     assert Enum.any?(events, &(&1["transition"] == "wait_released" and &1["release_reason"] == "tracker_terminal"))
     assert Enum.any?(events, &(&1["transition"] == "workspace_cleanup_completed"))
+  end
+
+  test "restored human clarification wait survives a legacy terminal-state overlap" do
+    root = parked_workspace_root("human-clarification-overlap")
+    workspace = Path.join(root, "DUD-152")
+    sentinel = Path.join(workspace, "uncommitted-plan.md")
+    File.mkdir_p!(workspace)
+    File.write!(sentinel, "preserve after restart\n")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: root,
+      tracker_terminal_states: ["Closed", "Human Clarification"]
+    )
+
+    {state, wait} = parked_reconcile_state("human-clarification-overlap", workspace, root, nil)
+
+    reconciled =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{id: wait.issue_id, identifier: wait.identifier, state: "Human Clarification"},
+        state
+      )
+
+    assert reconciled.parked[wait.issue_id].wait_id == wait.wait_id
+    refute Map.has_key?(reconciled.cleanup_pending, wait.issue_id)
+    assert File.read!(sentinel) == "preserve after restart\n"
+
+    assert {:ok, events} = RunLedger.read_events(state.run_ledger_path)
+    refute Enum.any?(events, &String.starts_with?(&1["transition"], "workspace_cleanup_"))
   end
 
   test "unrouted parked issue releases durably but preserves its local workspace" do
@@ -1054,8 +1138,7 @@ defmodule SymphonyElixir.CoreTest do
   test "parked terminal release recovers local cleanup when request append crashes" do
     root = parked_workspace_root("local-release-recovery")
     workspace = Path.join(root, "MT-PARKED-LOCAL-RELEASE-RECOVERY")
-    File.mkdir_p!(workspace)
-    File.write!(Path.join(workspace, "remove-after-restart"), "old")
+    install_durable_local_workspace!(workspace, %{"remove-after-restart" => "old"})
 
     {state, wait} = parked_reconcile_state("local-release-recovery", workspace, root, nil)
     state = %{state | run_ledger_append_fn: cleanup_request_failure_append_fn()}
@@ -1250,7 +1333,7 @@ defmodule SymphonyElixir.CoreTest do
     )
   end
 
-  test "terminal issue state stops running agent and cleans workspace" do
+  test "terminal issue state stops the agent but preserves a non-durable workspace" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1317,9 +1400,20 @@ defmodule SymphonyElixir.CoreTest do
 
       assert_receive {:worker_shutdown_write, :ok}
       refute Map.has_key?(updated_state.running, issue_id)
-      refute MapSet.member?(updated_state.claimed, issue_id)
+      assert MapSet.member?(updated_state.claimed, issue_id)
       refute Process.alive?(agent_pid)
-      refute File.exists?(workspace)
+      assert File.read!(shutdown_marker) == "stopped"
+
+      assert updated_state.cleanup_pending[issue_id].cleanup_error ==
+               :workspace_preservation_required
+
+      assert {:reply, snapshot, snapshotted_state} =
+               Orchestrator.handle_call(:snapshot, {self(), make_ref()}, updated_state)
+
+      assert snapshotted_state.cleanup_pending == updated_state.cleanup_pending
+
+      assert Enum.find(snapshot.retrying, &(&1.issue_id == issue_id)).error ==
+               "workspace_preservation_required"
     after
       File.rm_rf(test_root)
     end
@@ -1341,9 +1435,8 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-root-change"
 
     on_exit(fn -> File.rm_rf(test_root) end)
-    File.mkdir_p!(old_workspace)
+    install_durable_local_workspace!(old_workspace, %{"remove-me" => "old"})
     File.mkdir_p!(new_workspace)
-    File.write!(Path.join(old_workspace, "remove-me"), "old")
     File.write!(new_sentinel, "new")
 
     write_workflow_file!(Workflow.workflow_file_path(),
@@ -1774,9 +1867,9 @@ defmodule SymphonyElixir.CoreTest do
         tracker_terminal_states: ["Closed"]
       )
 
-      File.mkdir_p!(workspace)
+      install_durable_local_workspace!(workspace)
       parent = self()
-      shutdown_marker = Path.join(workspace, "worker-shutdown-established")
+      shutdown_marker = Path.join(test_root, "worker-shutdown-established")
 
       agent_pid =
         spawn(fn ->
@@ -4777,6 +4870,9 @@ defmodule SymphonyElixir.CoreTest do
     #!/bin/sh
     printf 'ARGV:%s\\n' "$*" >> "${SYMP_TEST_SSH_TRACE}"
     case "$*" in
+      *"__SYMPHONY_DURABILITY__"*)
+        printf '%s\\n' '__SYMPHONY_DURABILITY__'
+        ;;
       *"__SYMPHONY_AFFINITY__"*)
         printf '%s\\t%s\\t%s\\n' '__SYMPHONY_AFFINITY__' '#{remote_root}' '#{workspace}'
         ;;
@@ -4792,6 +4888,29 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     {remote_root, workspace, trace_file}
+  end
+
+  defp install_durable_local_workspace!(workspace, files \\ %{"tracked.txt" => "durable\n"}) do
+    source = workspace <> "-remote-#{System.unique_integer([:positive])}"
+
+    File.mkdir_p!(source)
+
+    Enum.each(files, fn {relative_path, contents} ->
+      path = Path.join(source, relative_path)
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, contents)
+    end)
+
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "."])
+    System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+    File.mkdir_p!(Path.dirname(workspace))
+    System.cmd("git", ["clone", source, workspace])
+
+    on_exit(fn -> File.rm_rf(source) end)
+    workspace
   end
 
   defp cleanup_request_failure_append_fn do

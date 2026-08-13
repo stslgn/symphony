@@ -1423,6 +1423,7 @@ defmodule SymphonyElixir.Orchestrator do
     Config.settings!().tracker.terminal_states
     |> Enum.map(&normalize_issue_state/1)
     |> Enum.filter(&(&1 != ""))
+    |> Enum.reject(&(OperatorWait.reason_for_tracker_state(&1) != nil))
     |> MapSet.new()
   end
 
@@ -2164,7 +2165,11 @@ defmodule SymphonyElixir.Orchestrator do
     with true <- valid_expected_workspace_path?(entry.workspace_path),
          true <- valid_expected_workspace_path?(entry.workspace_root),
          {:ok, _removed} <-
-           Workspace.remove_exact(entry.workspace_path, entry.workspace_root, entry.worker_host),
+           Workspace.remove_exact_if_durable(
+             entry.workspace_path,
+             entry.workspace_root,
+             entry.worker_host
+           ),
          :ok <- append_workspace_cleanup_completed(state, entry) do
       %{
         state
@@ -3951,6 +3956,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_pending_error(%{cleanup_error: :workspace_affinity_missing}),
     do: "workspace_affinity_missing"
+
+  defp cleanup_pending_error(%{cleanup_error: :workspace_preservation_required}),
+    do: "workspace_preservation_required"
 
   defp cleanup_pending_error(%{cleanup_error: _reason}), do: "workspace_cleanup_failed"
   defp cleanup_pending_error(_cleanup), do: "workspace_cleanup_pending"

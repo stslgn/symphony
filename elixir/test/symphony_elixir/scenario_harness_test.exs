@@ -222,6 +222,104 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
     end
   end
 
+  test "budget park followed by human clarification preserves dirty workspace across restart" do
+    root = scenario_root("budget-human-clarification")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    workspace_root = Path.join(root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-152")
+    sentinel = Path.join(workspace, "uncommitted-migration.sql")
+    ledger_path = Path.join(root, "run-ledger.jsonl")
+    running_issue = %{issue("issue-scenario-preservation", "DUD-152") | state: "Agent Running"}
+    clarification_issue = %{running_issue | state: "Human Clarification"}
+
+    File.mkdir_p!(workspace)
+    File.write!(sentinel, "create table preserved_work();\n")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Agent Ready", "Agent Running"],
+      tracker_terminal_states: ["Done", "Human Clarification"],
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000,
+      max_run_tokens: 150_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    harness = ScenarioHarness.start!(Module.concat(__MODULE__, :PreservationRunner), ledger_path)
+
+    try do
+      ScenarioHarness.await_poll_idle(harness)
+
+      assert {:ok, %{dispatch_paused: true}} =
+               Orchestrator.set_dispatch_paused(harness.name, true)
+
+      ScenarioHarness.seed_running!(harness, running_issue,
+        run_id: "run-preservation",
+        max_tokens: 150_000,
+        workspace_path: workspace
+      )
+
+      assert :ok =
+               ScenarioHarness.report_tokens(
+                 harness,
+                 running_issue,
+                 "run-preservation",
+                 171_836,
+                 1_472
+               )
+
+      parked =
+        ScenarioHarness.await_snapshot(harness, fn snapshot ->
+          length(snapshot.parked) == 1
+        end)
+
+      assert [%{reason: "run_budget_exhausted"}] = parked.parked
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [clarification_issue])
+      assert %{queued: true} = Orchestrator.request_refresh(harness.name)
+
+      clarified =
+        ScenarioHarness.await_snapshot(harness, fn snapshot ->
+          case snapshot.parked do
+            [%{tracker_state: "Human Clarification"}] -> true
+            _other -> false
+          end
+        end)
+
+      assert clarified.running == []
+      assert clarified.retrying == []
+      assert [%{reason: "run_budget_exhausted"}] = clarified.parked
+      assert File.read!(sentinel) == "create table preserved_work();\n"
+      refute Enum.any?(ScenarioHarness.events(harness), &cleanup_transition?/1)
+      assert :ok = ScenarioHarness.assert_consistent!(harness)
+    after
+      ScenarioHarness.stop(harness)
+    end
+
+    restarted =
+      ScenarioHarness.start!(Module.concat(__MODULE__, :RestartedPreservationRunner), ledger_path)
+
+    try do
+      snapshot =
+        ScenarioHarness.await_snapshot(restarted, fn snapshot ->
+          case snapshot.parked do
+            [%{tracker_state: "Human Clarification"}] -> true
+            _other -> false
+          end
+        end)
+
+      assert snapshot.running == []
+      assert snapshot.retrying == []
+      assert [%{reason: "run_budget_exhausted"}] = snapshot.parked
+      assert File.read!(sentinel) == "create table preserved_work();\n"
+      refute Enum.any?(ScenarioHarness.events(restarted), &cleanup_transition?/1)
+      assert :ok = ScenarioHarness.assert_consistent!(restarted)
+    after
+      ScenarioHarness.stop(restarted)
+    end
+  end
+
   test "live model mismatch blocks prompt delivery while unavailable discovery stays compatible" do
     root = scenario_root("model-boundary")
     on_exit(fn -> File.rm_rf(root) end)
@@ -385,5 +483,11 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
 
   defp count_transition(events, transition) do
     Enum.count(events, &(&1["transition"] == transition))
+  end
+
+  defp cleanup_transition?(event) do
+    event["transition"]
+    |> to_string()
+    |> String.starts_with?("workspace_cleanup_")
   end
 end

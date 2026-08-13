@@ -78,7 +78,7 @@ defmodule SymphonyElixir.ScenarioHarness do
       identifier: issue.identifier,
       issue: issue,
       worker_host: nil,
-      workspace_path: nil,
+      workspace_path: Keyword.get(opts, :workspace_path),
       session_id: nil,
       session_title: nil,
       resolved_model: nil,

@@ -690,6 +690,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
+  - Typed operator-wait states are excluded from destructive terminal semantics
+    even if a legacy configuration also includes them here.
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
 - `hooks.after_create`: shell script or null
@@ -980,11 +982,15 @@ Part B: Tracker state refresh
 
 - Fetch current issue states for all running issue IDs.
 - For each running issue:
-  - If tracker state is terminal: terminate worker and clean workspace.
-  - If tracker state is still active: update the in-memory issue snapshot.
   - If tracker state is `Human Review` or `Human Clarification`: durably park with
     `waiting_owner`.
   - If tracker state is `Deploy Ready`: durably park with `waiting_live_approval`.
+  - If tracker state is `Blocked`: durably park with `waiting_infrastructure`.
+  - Typed operator-wait states take precedence over `terminal_states` when a
+    legacy or invalid configuration lists a state in both categories.
+  - If tracker state is terminal after excluding typed wait states: terminate
+    worker and request durability-gated workspace cleanup.
+  - If tracker state is still active: update the in-memory issue snapshot.
   - If tracker state is any other non-active/non-terminal state: terminate worker without workspace
     cleanup.
 - Refresh parked issue states separately. Terminal or unrouted issues release their wait; all other
@@ -1030,13 +1036,15 @@ preserve retry attempt numbers and SHOULD make queued retries immediately due.
 
 ### 8.7 Startup Terminal Workspace Cleanup
 
-When the service starts:
+When an implementation performs a startup terminal-workspace sweep:
 
-1. Query tracker for issues in terminal states.
-2. For each returned issue identifier, remove the corresponding workspace directory.
+1. Query the tracker only for true terminal states after excluding all typed
+   operator-wait states.
+2. For each returned issue identifier, request the same durability-gated
+   cleanup used during active reconciliation.
 3. If the terminal-issues fetch fails, log a warning and continue startup.
 
-This prevents stale terminal workspaces from accumulating after restarts.
+Startup cleanup MUST NOT bypass the preservation rules in Section 9.6.
 
 ## 9. Workspace Management and Safety
 
@@ -1137,6 +1145,30 @@ Invariant 3: Workspace key is sanitized.
 
 - Only `[A-Za-z0-9._-]` allowed in workspace directory names.
 - Replace all other characters with `_`.
+
+### 9.6 Automatic Terminal Cleanup Preservation Gate
+
+Automatic terminal cleanup is destructive and MUST fail closed unless the
+workspace is proven durable.
+
+For a Git workspace, the implementation MUST verify before `before_remove` and
+repeat the verification immediately after that hook and before removal:
+
+1. the exact persisted workspace path is still contained by its exact captured
+   workspace root and worker host;
+2. no modified, staged, or untracked files exist;
+3. `git fetch --prune origin` succeeds; and
+4. `HEAD` is reachable from at least one freshly fetched remote ref.
+
+If a pre-hook check fails, the implementation MUST NOT run `before_remove`. If
+either verification fails, it MUST NOT delete the workspace. It keeps the
+cleanup claim visible with bounded error code `workspace_preservation_required`.
+A non-Git or unreachable workspace is not assumed disposable. Local and SSH
+workers follow the same contract.
+
+An operator may resolve the condition by committing and publishing the work,
+or by using a separately approved explicit cleanup path. A tracker state change
+alone never authorizes deletion of non-durable work.
 
 ## 10. Agent Runner Protocol (Coding Agent Integration)
 
@@ -2359,6 +2391,11 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
+- Automatic terminal cleanup preserves dirty, untracked, non-Git, unreachable,
+  and locally committed-but-unpublished workspaces
+- Automatic terminal cleanup succeeds for a clean workspace whose `HEAD` is
+  reachable from freshly fetched remote refs
+- Local and SSH cleanup failures expose `workspace_preservation_required`
 - Workspace path sanitization and root containment invariants are enforced before agent launch
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
 
@@ -2385,6 +2422,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Active-state issue refresh updates running entry state
 - Non-active state stops running agent without workspace cleanup
 - Human Review parks a running agent with `waiting_owner` and no retry
+- Human Clarification, Human Review, Deploy Ready, and Blocked remain typed
+  waits even when a legacy `terminal_states` list overlaps them
 - `$stop` parks a matching active run with `operator_stopped` and preserves its workspace
 - Parked issues are excluded from dispatch until a matching wait is resumed
 - Unresolved waits are restored from the run ledger after restart
@@ -2396,7 +2435,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Global pause is durable, idempotent, and blocks candidate/retry dispatch without stopping
   in-flight reconciliation
 - Resume wakes deferred retry entries without incrementing their attempt
-- Terminal state stops running agent and cleans workspace
+- True terminal state stops the running agent and cleans only a durable workspace
 - Reconciliation with no running issues is a no-op
 - Normal worker exit schedules a short continuation retry (attempt 1)
 - Abnormal worker exit increments retries with 10s-based exponential backoff

@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Workspace do
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
   @remote_affinity_marker "__SYMPHONY_AFFINITY__"
+  @remote_durability_marker "__SYMPHONY_DURABILITY__"
 
   @type worker_host :: String.t() | nil
   @type prepared_workspace :: %{
@@ -214,9 +215,44 @@ defmodule SymphonyElixir.Workspace do
   def remove_exact(workspace, captured_root, worker_host),
     do: {:error, {:invalid_exact_workspace, workspace, captured_root, worker_host}, ""}
 
+  @spec remove_exact_if_durable(Path.t(), Path.t(), worker_host()) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_exact_if_durable(workspace, captured_root, nil)
+      when is_binary(workspace) and is_binary(captured_root) do
+    with :ok <- validate_path_against_root(workspace, captured_root, nil),
+         :ok <- validate_local_workspace_durable(workspace),
+         :ok <- maybe_run_before_remove_hook(workspace, nil),
+         :ok <- validate_local_workspace_durable(workspace) do
+      File.rm_rf(workspace)
+    else
+      {:error, reason} -> {:error, reason, ""}
+    end
+  end
+
+  def remove_exact_if_durable(workspace, captured_root, worker_host)
+      when is_binary(workspace) and is_binary(captured_root) and is_binary(worker_host) do
+    with :ok <- validate_affinity_path(workspace, worker_host),
+         :ok <- validate_affinity_path(captured_root, worker_host),
+         {:ok, target} <- canonical_affinity_target(workspace, captured_root, worker_host),
+         :ok <- validate_path_against_root(target.path, target.root, worker_host),
+         :ok <- validate_remote_workspace_durable(target.path, worker_host),
+         :ok <- maybe_run_before_remove_hook(target.path, worker_host),
+         :ok <- validate_remote_workspace_durable(target.path, worker_host) do
+      remove_exact_remote_after_hook(target.path, worker_host)
+    else
+      {:error, reason} -> {:error, reason, ""}
+    end
+  end
+
+  def remove_exact_if_durable(workspace, captured_root, worker_host),
+    do: {:error, {:invalid_exact_workspace, workspace, captured_root, worker_host}, ""}
+
   defp remove_exact_remote(workspace, worker_host) do
     maybe_run_before_remove_hook(workspace, worker_host)
+    remove_exact_remote_after_hook(workspace, worker_host)
+  end
 
+  defp remove_exact_remote_after_hook(workspace, worker_host) do
     script =
       [
         remote_shell_assign("workspace", workspace),
@@ -228,6 +264,82 @@ defmodule SymphonyElixir.Workspace do
       {:ok, {_output, 0}} -> {:ok, []}
       {:ok, {output, status}} -> {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
       {:error, reason} -> {:error, reason, ""}
+    end
+  end
+
+  defp validate_local_workspace_durable(workspace) do
+    workspace
+    |> File.exists?()
+    |> validate_local_workspace_exists(workspace)
+  end
+
+  defp validate_local_workspace_exists(false, _workspace), do: :ok
+
+  defp validate_local_workspace_exists(true, workspace) do
+    "git"
+    |> System.cmd(
+      ["-C", workspace, "status", "--porcelain=v1", "--untracked-files=all"],
+      stderr_to_stdout: true
+    )
+    |> validate_local_git_status(workspace)
+  end
+
+  defp validate_local_git_status({output, 0}, workspace) do
+    if String.trim(output) == "",
+      do: validate_local_head_durable(workspace),
+      else: {:error, :workspace_preservation_required}
+  end
+
+  defp validate_local_git_status({_output, _status}, _workspace),
+    do: {:error, :workspace_preservation_required}
+
+  defp validate_local_head_durable(workspace) do
+    with {_output, 0} <-
+           System.cmd("git", ["-C", workspace, "fetch", "--quiet", "--prune", "origin"], stderr_to_stdout: true),
+         {remote_refs, 0} <-
+           System.cmd(
+             "git",
+             ["-C", workspace, "for-each-ref", "--format=%(refname)", "--contains", "HEAD", "refs/remotes/"],
+             stderr_to_stdout: true
+           ) do
+      if String.trim(remote_refs) == "",
+        do: {:error, :workspace_preservation_required},
+        else: :ok
+    else
+      {_output, _status} ->
+        {:error, :workspace_preservation_required}
+    end
+  end
+
+  defp validate_remote_workspace_durable(workspace, worker_host) do
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("workspace", workspace),
+        "if [ ! -e \"$workspace\" ]; then",
+        "  printf '%s\\n' '#{@remote_durability_marker}'",
+        "  exit 0",
+        "fi",
+        "git -C \"$workspace\" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 73",
+        "test -z \"$(git -C \"$workspace\" status --porcelain=v1 --untracked-files=all)\" || exit 74",
+        "git -C \"$workspace\" fetch --quiet --prune origin >/dev/null 2>&1 || exit 75",
+        "remote_refs=$(git -C \"$workspace\" for-each-ref --format='%(refname)' --contains HEAD refs/remotes/)",
+        "test -n \"$remote_refs\" || exit 76",
+        "printf '%s\\n' '#{@remote_durability_marker}'"
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {output, 0}} ->
+        if output |> String.split("\n", trim: true) |> Enum.member?(@remote_durability_marker),
+          do: :ok,
+          else: {:error, :workspace_preservation_required}
+
+      {:ok, {_output, _status}} ->
+        {:error, :workspace_preservation_required}
+
+      {:error, _reason} ->
+        {:error, :workspace_preservation_required}
     end
   end
 

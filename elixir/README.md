@@ -24,8 +24,18 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
 skills can make raw Linear GraphQL calls.
 
-If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
-Symphony stops the active agent for that issue and cleans up matching workspaces.
+If a claimed issue moves to a true terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
+Symphony stops the active agent for that issue and requests cleanup of its exact
+recorded workspace. Human/operator wait states win over a conflicting legacy
+`terminal_states` entry and never request cleanup.
+
+Automatic terminal cleanup is Git-durability-gated. The workspace must have no
+modified or untracked files, `git fetch --prune origin` must succeed, and `HEAD`
+must be reachable from a fetched remote ref. Otherwise cleanup fails closed as
+`workspace_preservation_required`; the workspace and runner claim remain
+visible until work is made durable or an operator performs a separately
+approved cleanup. The check runs before and after `before_remove`, on both local
+and SSH workers, so hook-created work is also preserved.
 
 ## How to use it
 
@@ -101,10 +111,12 @@ truncated before resume or cleanup.
 
 Human Review and Human Clarification transitions are recorded as durable
 `waiting_owner` operator waits; Deploy Ready is recorded as
-`waiting_live_approval`. The same typed wait model supports secret,
-infrastructure, review-cap, authentication, and explicit `operator_stopped`
-pauses. Parked issues have no retry timer, are excluded from automatic pickup,
-and are restored from the ledger after restart. Resuming a wait creates a
+`waiting_live_approval`, and Blocked as `waiting_infrastructure`. These wait
+states take precedence if a legacy workflow also lists them as terminal. The
+same typed wait model supports secret, infrastructure, review-cap,
+authentication, and explicit `operator_stopped` pauses. Parked issues have no
+retry timer, are excluded from automatic pickup, and are restored from the
+ledger after restart. Resuming a wait creates a
 durable `resume_queued` entry that remains visible with its next attempt while
 dispatch is paused or blocked; the next durable claim consumes it. Resume does
 not bypass the normal exact Linear state eligibility check. Resume and restart

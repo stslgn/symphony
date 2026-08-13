@@ -28,6 +28,7 @@ defmodule SymphonyElixir.OperatorWaitTest do
     assert OperatorWait.reason_for_tracker_state("Human Review") == "waiting_owner"
     assert OperatorWait.reason_for_tracker_state(" human clarification ") == "waiting_owner"
     assert OperatorWait.reason_for_tracker_state("Deploy Ready") == "waiting_live_approval"
+    assert OperatorWait.reason_for_tracker_state("Blocked") == "waiting_infrastructure"
     assert OperatorWait.reason_for_tracker_state("Paused") == nil
     assert OperatorWait.reason_for_tracker_state(nil) == nil
   end

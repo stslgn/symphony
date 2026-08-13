@@ -1541,7 +1541,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert Enum.find(missing_snapshot.retrying, &(&1.stage == "cleanup_pending")).error ==
              "workspace_affinity_missing"
 
-    for code <- ~w(workspace_cleanup_pending workspace_cleanup_failed workspace_affinity_missing) do
+    for code <- ~w(workspace_cleanup_pending workspace_cleanup_failed workspace_affinity_missing workspace_preservation_required) do
       assert SymphonyElixir.ObservabilitySanitizer.retry_error_code(code) == code
     end
 

@@ -38,6 +38,9 @@ defmodule SymphonyElixir.ObservabilitySanitizerTest do
     assert ObservabilitySanitizer.retry_error_code(:workspace_cleanup_failed) ==
              "workspace_cleanup_failed"
 
+    assert ObservabilitySanitizer.retry_error_code(:workspace_preservation_required) ==
+             "workspace_preservation_required"
+
     assert ObservabilitySanitizer.retry_error_code({"opaque", :details}) == "worker_failure"
   end
 end
