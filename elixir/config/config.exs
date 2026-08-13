@@ -3,7 +3,8 @@ import Config
 config :phoenix, :json_library, Jason
 
 config :symphony_elixir,
-  codex_model_discovery_enabled: config_env() != :test
+  codex_model_discovery_enabled: config_env() != :test,
+  allow_test_local_durability_remotes: config_env() == :test
 
 config :symphony_elixir, SymphonyElixirWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,

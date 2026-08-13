@@ -20,6 +20,7 @@ polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
+  durability_remote_url: https://github.com/openai/symphony.git
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .

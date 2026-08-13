@@ -16,9 +16,27 @@ operator resolution instead of silently starting another attempt.
 
 Automatic terminal cleanup is fail-closed. Human/operator wait states always
 preserve their workspace, even when a legacy workflow also lists them as
-terminal. A true terminal cleanup removes a Git workspace only after proving
-that it is clean and that its current commit is reachable from freshly fetched
-remote refs; otherwise the workspace remains claimed for operator recovery.
+terminal. A true terminal cleanup first proves that the Git workspace has no
+modified, staged, or non-ignored untracked files and that its current commit is
+reachable through a fresh fetch from the
+operator-configured durability remote. Verification runs in a new runner-owned
+bare repository outside the workspace. The original path is atomically renamed
+to a retained quarantine artifact and is never automatically deleted; failures
+restore it only when the exact quarantined directory still owns the identity
+and the original path is empty, otherwise both paths remain untouched for
+operator recovery. Repository-controlled executable Git features such as
+`core.fsmonitor` are disabled during the proof. Production cleanup accepts only
+credential-free network Git remotes; mutable path and `file://` remotes are
+rejected.
+Cleanup I/O runs in one supervised deadline-limited task, so a stalled Git
+transport cannot block status or operator controls, and stable preservation
+failures are not retried on every poll.
+Cleanup authorization is also durable. The ledger records request, I/O start,
+operator-required, explicit retry, I/O completion, and final completion as
+separate transitions. A restart after I/O starts never infers that it is safe to
+repeat the operation; only an explicit operator retry can authorize another
+attempt. Once I/O completion is durable, restart retries only the final ledger
+completion.
 
 The Elixir implementation also supports durable operator commands and a global
 dispatch pause so operators can stop or resume work without losing restart

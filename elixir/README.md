@@ -30,12 +30,26 @@ recorded workspace. Human/operator wait states win over a conflicting legacy
 `terminal_states` entry and never request cleanup.
 
 Automatic terminal cleanup is Git-durability-gated. The workspace must have no
-modified or untracked files, `git fetch --prune origin` must succeed, and `HEAD`
-must be reachable from a fetched remote ref. Otherwise cleanup fails closed as
-`workspace_preservation_required`; the workspace and runner claim remain
-visible until work is made durable or an operator performs a separately
-approved cleanup. The check runs before and after `before_remove`, on both local
-and SSH workers, so hook-created work is also preserved.
+modified, staged, or non-ignored untracked files,
+`workspace.durability_remote_url` must be set, and
+`HEAD` must be reachable through a fresh fetch from that operator-controlled
+remote into a new runner-owned bare verifier outside the workspace.
+Worker-controlled Git config and refs are never accepted as durability
+evidence. Repository-controlled executable Git features such as
+`core.fsmonitor` are disabled during inspection. Production cleanup accepts only
+credential-free network Git remotes and rejects mutable path and `file://`
+sources. Cleanup atomically renames the
+exact workspace to a recoverable quarantine, checks before and after
+`before_remove`, and restores it on failure only when its exact identity still
+matches and the original path remains empty. A successful proof completes lifecycle cleanup but retains the
+quarantine artifact; physical deletion remains a separate operator/GC gate.
+The proof runs outside the orchestrator in one supervised task with an overall
+deadline. Stable preservation failures become operator-required and are not
+repeated on each poll.
+The ledger records cleanup request, I/O start, operator-required, explicit
+retry, I/O completion, and final completion separately. A restart after I/O
+start stays operator-required; tracker state cannot authorize a replay. Once
+I/O completion is durable, only the final completion record is retried.
 
 ## How to use it
 
@@ -145,6 +159,7 @@ tracker:
   project_slug: "..."
 workspace:
   root: ~/code/workspaces
+  durability_remote_url: git@github.com:your-org/your-repo.git
 hooks:
   after_create: |
     git clone git@github.com:your-org/your-repo.git .
@@ -297,7 +312,8 @@ the start of a native Linear issue comment authored by a configured `tracker.ope
 actor:
 
 - `$stop` durably parks an active run as `operator_stopped` and preserves its workspace.
-- `$retry` resolves a matching wait that allows retry.
+- `$retry` resolves a matching wait that allows retry, or explicitly authorizes
+  one new attempt for an operator-required workspace cleanup.
 - `$approve`, `$approved`, or a standalone `👍` resolves a matching wait that allows approval.
 - `$reject` records rejection for a matching wait and keeps the issue parked.
 
@@ -331,7 +347,8 @@ The observability UI now runs on a minimal Phoenix stack:
   with their next attempt and host/path affinity,
   while `cleanup_pending` retains its durable claim, has no retry deadline, and
   exposes captured host/path affinity plus only `workspace_cleanup_pending`,
-  `workspace_cleanup_failed`, or `workspace_affinity_missing`,
+  `workspace_cleanup_failed`, `workspace_affinity_missing`, or
+  `workspace_preservation_required`,
   and parked rows include the stable wait id, typed reason, allowed actions,
   issue/run identity, worker host, and canonical workspace path. JSON and
   LiveView share one control-safe, stably sorted parked projection with

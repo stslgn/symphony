@@ -6,6 +6,12 @@ defmodule SymphonyElixir.Workspace do
   require Logger
   alias SymphonyElixir.{Config, PathSafety, SSH}
 
+  @allow_test_local_durability_remotes Application.compile_env(
+                                         :symphony_elixir,
+                                         :allow_test_local_durability_remotes,
+                                         false
+                                       )
+
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
   @remote_affinity_marker "__SYMPHONY_AFFINITY__"
   @remote_durability_marker "__SYMPHONY_DURABILITY__"
@@ -220,10 +226,9 @@ defmodule SymphonyElixir.Workspace do
   def remove_exact_if_durable(workspace, captured_root, nil)
       when is_binary(workspace) and is_binary(captured_root) do
     with :ok <- validate_path_against_root(workspace, captured_root, nil),
-         :ok <- validate_local_workspace_durable(workspace),
-         :ok <- maybe_run_before_remove_hook(workspace, nil),
-         :ok <- validate_local_workspace_durable(workspace) do
-      File.rm_rf(workspace)
+         {:ok, remote_url} <- durability_remote_url(captured_root, nil),
+         {:ok, quarantine} <- quarantine_local_workspace(workspace, captured_root) do
+      cleanup_local_quarantine(quarantine, workspace, captured_root, remote_url)
     else
       {:error, reason} -> {:error, reason, ""}
     end
@@ -235,10 +240,14 @@ defmodule SymphonyElixir.Workspace do
          :ok <- validate_affinity_path(captured_root, worker_host),
          {:ok, target} <- canonical_affinity_target(workspace, captured_root, worker_host),
          :ok <- validate_path_against_root(target.path, target.root, worker_host),
-         :ok <- validate_remote_workspace_durable(target.path, worker_host),
-         :ok <- maybe_run_before_remove_hook(target.path, worker_host),
-         :ok <- validate_remote_workspace_durable(target.path, worker_host) do
-      remove_exact_remote_after_hook(target.path, worker_host)
+         {:ok, remote_url} <- durability_remote_url(target.root, worker_host) do
+      remove_remote_quarantine_if_durable(
+        target.path,
+        target.root,
+        remote_url,
+        durability_boundary_path(remote_url),
+        worker_host
+      )
     else
       {:error, reason} -> {:error, reason, ""}
     end
@@ -267,64 +276,381 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp validate_local_workspace_durable(workspace) do
-    workspace
-    |> File.exists?()
-    |> validate_local_workspace_exists(workspace)
-  end
+  defp durability_remote_url(captured_root, worker_host) do
+    case Config.settings!().workspace.durability_remote_url do
+      value when is_binary(value) and value != "" ->
+        with :ok <- validate_local_durability_boundary(value, captured_root, worker_host) do
+          {:ok, value}
+        end
 
-  defp validate_local_workspace_exists(false, _workspace), do: :ok
-
-  defp validate_local_workspace_exists(true, workspace) do
-    "git"
-    |> System.cmd(
-      ["-C", workspace, "status", "--porcelain=v1", "--untracked-files=all"],
-      stderr_to_stdout: true
-    )
-    |> validate_local_git_status(workspace)
-  end
-
-  defp validate_local_git_status({output, 0}, workspace) do
-    if String.trim(output) == "",
-      do: validate_local_head_durable(workspace),
-      else: {:error, :workspace_preservation_required}
-  end
-
-  defp validate_local_git_status({_output, _status}, _workspace),
-    do: {:error, :workspace_preservation_required}
-
-  defp validate_local_head_durable(workspace) do
-    with {_output, 0} <-
-           System.cmd("git", ["-C", workspace, "fetch", "--quiet", "--prune", "origin"], stderr_to_stdout: true),
-         {remote_refs, 0} <-
-           System.cmd(
-             "git",
-             ["-C", workspace, "for-each-ref", "--format=%(refname)", "--contains", "HEAD", "refs/remotes/"],
-             stderr_to_stdout: true
-           ) do
-      if String.trim(remote_refs) == "",
-        do: {:error, :workspace_preservation_required},
-        else: :ok
-    else
-      {_output, _status} ->
+      _value ->
         {:error, :workspace_preservation_required}
     end
   end
 
-  defp validate_remote_workspace_durable(workspace, worker_host) do
+  defp validate_local_durability_boundary(remote_url, captured_root, nil) do
+    case local_durability_path(remote_url) do
+      {:ok, remote_path} ->
+        validate_test_local_durability_boundary(remote_path, captured_root)
+
+      :external ->
+        :ok
+
+      :invalid ->
+        {:error, :workspace_preservation_required}
+    end
+  end
+
+  defp validate_local_durability_boundary(_remote_url, _captured_root, worker_host)
+       when is_binary(worker_host),
+       do: :ok
+
+  if @allow_test_local_durability_remotes do
+    defp validate_test_local_durability_boundary(remote_path, captured_root) do
+      with {:ok, canonical_root} <- PathSafety.canonicalize(captured_root),
+           {:ok, canonical_remote} <- PathSafety.canonicalize(remote_path),
+           false <- path_at_or_below?(canonical_remote, canonical_root) do
+        :ok
+      else
+        _other -> {:error, :workspace_preservation_required}
+      end
+    end
+
+    defp path_at_or_below?(path, root) do
+      relative = Path.relative_to(path, root)
+      path == root or (Path.type(relative) == :relative and hd(Path.split(relative)) != "..")
+    end
+  else
+    defp validate_test_local_durability_boundary(_remote_path, _captured_root),
+      do: {:error, :workspace_preservation_required}
+  end
+
+  defp local_durability_path(remote_url) when is_binary(remote_url) do
+    cond do
+      Path.type(remote_url) == :absolute ->
+        {:ok, remote_url}
+
+      String.starts_with?(remote_url, "file://") ->
+        case URI.parse(remote_url) do
+          %URI{scheme: "file", host: host, path: path}
+          when host in [nil, ""] and is_binary(path) ->
+            decode_uri_path(path)
+
+          _uri ->
+            :external
+        end
+
+      true ->
+        :external
+    end
+  end
+
+  defp decode_uri_path(path) do
+    if Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, path),
+      do: :invalid,
+      else: {:ok, URI.decode(path)}
+  end
+
+  defp durability_boundary_path(remote_url) do
+    case local_durability_path(remote_url) do
+      {:ok, path} -> path
+      _external_or_invalid -> ""
+    end
+  end
+
+  defp quarantine_local_workspace(workspace, captured_root) do
+    quarantine = workspace <> ".symphony-cleanup"
+
+    with {:ok, source_identity} <- validate_local_cleanup_source(workspace, quarantine) do
+      rename_local_workspace_to_quarantine(
+        workspace,
+        quarantine,
+        captured_root,
+        source_identity
+      )
+    end
+  end
+
+  defp rename_local_workspace_to_quarantine(workspace, quarantine, captured_root, source_identity) do
+    case File.rename(workspace, quarantine) do
+      :ok ->
+        case validate_local_quarantine(quarantine, captured_root, source_identity) do
+          :ok ->
+            {:ok, {quarantine, source_identity}}
+
+          {:error, reason} ->
+            restore_local_quarantine(quarantine, workspace, captured_root, source_identity)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, {:workspace_quarantine_failed, reason}}
+    end
+  end
+
+  defp validate_local_cleanup_source(workspace, quarantine) do
+    case {File.lstat(workspace), File.lstat(quarantine)} do
+      {{:ok, %File.Stat{type: :directory} = stat}, {:error, :enoent}} ->
+        {:ok, {stat.major_device, stat.minor_device, stat.inode}}
+
+      _other ->
+        {:error, :workspace_preservation_required}
+    end
+  end
+
+  defp local_quarantine_identity(quarantine) do
+    case File.lstat(quarantine) do
+      {:ok, %File.Stat{type: :directory} = stat} ->
+        {:ok, {stat.major_device, stat.minor_device, stat.inode}}
+
+      _other ->
+        {:error, :workspace_preservation_required}
+    end
+  end
+
+  defp validate_local_quarantine(quarantine, captured_root, expected_identity) do
+    with {:ok, ^expected_identity} <- local_quarantine_identity(quarantine),
+         :ok <- validate_path_against_root(quarantine, captured_root, nil) do
+      :ok
+    else
+      _other -> {:error, :workspace_preservation_required}
+    end
+  end
+
+  defp cleanup_local_quarantine(
+         {quarantine, identity},
+         workspace,
+         captured_root,
+         remote_url
+       ) do
+    do_cleanup_local_quarantine(quarantine, workspace, captured_root, identity, remote_url)
+  end
+
+  defp do_cleanup_local_quarantine(quarantine, workspace, captured_root, identity, remote_url) do
+    result =
+      with :ok <- validate_local_quarantine(quarantine, captured_root, identity),
+           :ok <- validate_local_workspace_durable(quarantine, remote_url),
+           :ok <- maybe_run_before_remove_hook(quarantine, nil),
+           :ok <- validate_local_quarantine(quarantine, captured_root, identity),
+           :ok <- maybe_revalidate_local_durability_after_hook(quarantine, remote_url),
+           :ok <- validate_local_quarantine(quarantine, captured_root, identity) do
+        {:ok, []}
+      end
+
+    case result do
+      {:ok, _removed_paths} = removed ->
+        removed
+
+      {:error, reason} ->
+        restore_local_quarantine(quarantine, workspace, captured_root, identity)
+        {:error, reason, ""}
+    end
+  end
+
+  defp restore_local_quarantine(quarantine, workspace, captured_root, expected_identity) do
+    with {:error, :enoent} <- File.lstat(workspace),
+         :ok <- validate_local_quarantine(quarantine, captured_root, expected_identity) do
+      File.rename(quarantine, workspace)
+    else
+      _other -> {:error, :workspace_preservation_required}
+    end
+  end
+
+  defp maybe_revalidate_local_durability_after_hook(workspace, remote_url) do
+    case Config.settings!().hooks.before_remove do
+      command when is_binary(command) and command != "" ->
+        validate_local_workspace_durable(workspace, remote_url)
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp validate_local_workspace_durable(workspace, remote_url) do
+    case File.lstat(workspace) do
+      {:ok, %File.Stat{type: :directory}} ->
+        "git"
+        |> System.cmd(
+          [
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            workspace,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal"
+          ],
+          stderr_to_stdout: true
+        )
+        |> validate_local_git_status(workspace, remote_url)
+
+      _other ->
+        {:error, :workspace_preservation_required}
+    end
+  end
+
+  defp validate_local_git_status({output, 0}, workspace, remote_url) do
+    if String.trim(output) == "",
+      do: validate_local_head_durable(workspace, remote_url),
+      else: {:error, :workspace_preservation_required}
+  end
+
+  defp validate_local_git_status({_output, _status}, _workspace, _remote_url),
+    do: {:error, :workspace_preservation_required}
+
+  defp validate_local_head_durable(workspace, remote_url) do
+    verifier_root = Path.join(System.tmp_dir!(), "symphony-durability-" <> cleanup_token())
+    verifier_repo = Path.join(verifier_root, "repo.git")
+    verifier_home = Path.join(verifier_root, "home")
+
+    git_env = [
+      {"GIT_CONFIG_NOSYSTEM", "1"},
+      {"GIT_TERMINAL_PROMPT", "0"},
+      {"GCM_INTERACTIVE", "never"},
+      {"GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1"},
+      {"HOME", verifier_home},
+      {"XDG_CONFIG_HOME", verifier_home}
+    ]
+
+    try do
+      with {head_oid, 0} <-
+             System.cmd(
+               "git",
+               ["-C", workspace, "rev-parse", "--verify", "HEAD^{commit}"],
+               stderr_to_stdout: true
+             ),
+           :ok <- File.mkdir_p(verifier_home),
+           :ok <- File.chmod(verifier_root, 0o700),
+           {_output, 0} <-
+             System.cmd("git", ["init", "--quiet", "--bare", verifier_repo],
+               stderr_to_stdout: true,
+               env: git_env
+             ),
+           {_output, 0} <-
+             System.cmd(
+               "git",
+               [
+                 "-C",
+                 verifier_repo,
+                 "fetch",
+                 "--quiet",
+                 "--no-tags",
+                 "--force",
+                 remote_url,
+                 "+refs/heads/*:refs/verify/*"
+               ],
+               stderr_to_stdout: true,
+               env: git_env
+             ),
+           {remote_refs, 0} <-
+             System.cmd(
+               "git",
+               [
+                 "-C",
+                 verifier_repo,
+                 "for-each-ref",
+                 "--format=%(refname)",
+                 "--contains",
+                 String.trim(head_oid),
+                 "refs/verify/"
+               ],
+               stderr_to_stdout: true,
+               env: git_env
+             ) do
+        if String.trim(remote_refs) == "",
+          do: {:error, :workspace_preservation_required},
+          else: :ok
+      else
+        {_output, _status} -> {:error, :workspace_preservation_required}
+      end
+    after
+      File.rm_rf(verifier_root)
+    end
+  end
+
+  defp remove_remote_quarantine_if_durable(
+         workspace,
+         root,
+         remote_url,
+         durability_path,
+         worker_host
+       ) do
+    hook_command = Config.settings!().hooks.before_remove || ""
+
     script =
       [
         "set -eu",
+        remote_shell_assign("root", root),
         remote_shell_assign("workspace", workspace),
-        "if [ ! -e \"$workspace\" ]; then",
-        "  printf '%s\\n' '#{@remote_durability_marker}'",
-        "  exit 0",
+        remote_shell_assign("remote_url", remote_url),
+        remote_shell_assign("durability_path", durability_path),
+        remote_shell_assign("hook_command", hook_command),
+        "quarantine=\"${workspace}.symphony-cleanup\"",
+        "canonical_root=$(CDPATH= cd -P \"$root\" 2>/dev/null && pwd -P) || exit 75",
+        "if [ -n \"$durability_path\" ]; then",
+        "  canonical_durability=$(CDPATH= cd -P \"$durability_path\" 2>/dev/null && pwd -P) || exit 75",
+        "  case \"$canonical_durability\" in",
+        "    \"$canonical_root\"|\"$canonical_root\"/*) exit 75 ;;",
+        "  esac",
         "fi",
-        "git -C \"$workspace\" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 73",
-        "test -z \"$(git -C \"$workspace\" status --porcelain=v1 --untracked-files=all)\" || exit 74",
-        "git -C \"$workspace\" fetch --quiet --prune origin >/dev/null 2>&1 || exit 75",
-        "remote_refs=$(git -C \"$workspace\" for-each-ref --format='%(refname)' --contains HEAD refs/remotes/)",
-        "test -n \"$remote_refs\" || exit 76",
+        "quarantine_parent=${quarantine%/*}",
+        "canonical_parent=$(CDPATH= cd -P \"$quarantine_parent\" 2>/dev/null && pwd -P) || exit 75",
+        "test \"$canonical_parent\" = \"$canonical_root\" || exit 75",
+        "if [ ! -e \"$workspace\" ]; then",
+        "  exit 72",
+        "fi",
+        "test ! -e \"$quarantine\" || exit 72",
+        "test -d \"$workspace\" && test ! -L \"$workspace\" || exit 73",
+        "source_identity=$(stat -f '%d:%i' \"$workspace\" 2>/dev/null || stat -c '%d:%i' \"$workspace\" 2>/dev/null) || exit 73",
+        "mv -- \"$workspace\" \"$quarantine\" || exit 73",
+        "restore=1",
+        "verifier=",
+        "check_identity() {",
+        "  test -d \"$quarantine\" && test ! -L \"$quarantine\" || return 74",
+        "  current_identity=$(stat -f '%d:%i' \"$quarantine\" 2>/dev/null || stat -c '%d:%i' \"$quarantine\" 2>/dev/null) || return 74",
+        "  test \"$current_identity\" = \"$source_identity\" || return 74",
+        "  current_parent=${quarantine%/*}",
+        "  current_canonical_parent=$(CDPATH= cd -P \"$current_parent\" 2>/dev/null && pwd -P) || return 75",
+        "  test \"$current_canonical_parent\" = \"$canonical_root\" || return 75",
+        "}",
+        "restore_workspace() {",
+        "  status=$?",
+        "  trap - EXIT HUP INT TERM",
+        "  if [ -n \"$verifier\" ]; then rm -rf -- \"$verifier\" >/dev/null 2>&1 || true; fi",
+        "  if [ \"$restore\" = 1 ] && [ -e \"$quarantine\" ] && [ ! -e \"$workspace\" ]; then",
+        "    if check_identity; then mv -- \"$quarantine\" \"$workspace\" >/dev/null 2>&1 || true; fi",
+        "  fi",
+        "  exit \"$status\"",
+        "}",
+        "trap restore_workspace EXIT HUP INT TERM",
+        "check_identity",
+        "check_durable() {",
+        "  git -C \"$quarantine\" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 76",
+        "  test -z \"$(git -c core.fsmonitor=false -C \"$quarantine\" status --porcelain=v1 --untracked-files=normal)\" || return 77",
+        "  head_oid=$(git -C \"$quarantine\" rev-parse --verify 'HEAD^{commit}') || return 78",
+        "  verifier=$(mktemp -d \"${TMPDIR:-/tmp}/symphony-durability.XXXXXX\") || return 79",
+        "  chmod 700 \"$verifier\" || return 79",
+        "  mkdir -p \"$verifier/home\" || return 79",
+        "  export GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never",
+        "  export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1'",
+        "  export HOME=\"$verifier/home\" XDG_CONFIG_HOME=\"$verifier/home\"",
+        "  git init --quiet --bare \"$verifier/repo.git\" || return 79",
+        "  git -C \"$verifier/repo.git\" fetch --quiet --no-tags --force \"$remote_url\" '+refs/heads/*:refs/verify/*' >/dev/null 2>&1 || return 79",
+        "  remote_refs=$(git -C \"$verifier/repo.git\" for-each-ref --format='%(refname)' --contains \"$head_oid\" refs/verify/)",
+        "  rm -rf -- \"$verifier\"",
+        "  verifier=",
+        "  test -n \"$remote_refs\" || return 80",
+        "}",
+        "check_identity",
+        "check_durable",
+        "if [ -n \"$hook_command\" ]; then",
+        "  (cd \"$quarantine\" && sh -lc \"$hook_command\") || true",
+        "  check_identity",
+        "  check_durable",
+        "fi",
+        "check_identity",
+        "restore=0",
+        "trap - EXIT HUP INT TERM",
         "printf '%s\\n' '#{@remote_durability_marker}'"
       ]
       |> Enum.join("\n")
@@ -332,15 +658,21 @@ defmodule SymphonyElixir.Workspace do
     case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
       {:ok, {output, 0}} ->
         if output |> String.split("\n", trim: true) |> Enum.member?(@remote_durability_marker),
-          do: :ok,
-          else: {:error, :workspace_preservation_required}
+          do: {:ok, []},
+          else: {:error, :workspace_preservation_required, ""}
 
       {:ok, {_output, _status}} ->
-        {:error, :workspace_preservation_required}
+        {:error, :workspace_preservation_required, ""}
 
       {:error, _reason} ->
-        {:error, :workspace_preservation_required}
+        {:error, :workspace_preservation_required, ""}
     end
+  end
+
+  defp cleanup_token do
+    12
+    |> :crypto.strong_rand_bytes()
+    |> Base.encode16(case: :lower)
   end
 
   @spec remove_issue_workspaces(term()) :: :ok

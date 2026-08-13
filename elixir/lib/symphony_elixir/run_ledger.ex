@@ -31,6 +31,10 @@ defmodule SymphonyElixir.RunLedger do
     "wait_rejected" => ["parked"],
     "wait_released" => ["parked"],
     "workspace_cleanup_requested" => ["cleanup"],
+    "workspace_cleanup_io_started" => ["cleanup"],
+    "workspace_cleanup_operator_required" => ["cleanup"],
+    "workspace_cleanup_retry_requested" => ["cleanup"],
+    "workspace_cleanup_io_completed" => ["cleanup"],
     "workspace_cleanup_completed" => ["cleanup"],
     "dispatch_paused" => ["operator"],
     "dispatch_resumed" => ["operator"],
@@ -136,6 +140,23 @@ defmodule SymphonyElixir.RunLedger do
       required_strings: ~w(stage run_id issue_id issue_identifier terminal_reason),
       required_attempt: true
     },
+    "workspace_cleanup_io_started" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier workspace_path workspace_root),
+      required_attempt: true
+    },
+    "workspace_cleanup_operator_required" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier workspace_path workspace_root cleanup_error),
+      required_attempt: true,
+      typed_cleanup_error: true
+    },
+    "workspace_cleanup_retry_requested" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier workspace_path workspace_root),
+      required_attempt: true
+    },
+    "workspace_cleanup_io_completed" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier workspace_path workspace_root),
+      required_attempt: true
+    },
     "dispatch_paused" => %{required_strings: ~w(stage runner_generation)},
     "dispatch_resumed" => %{required_strings: ~w(stage runner_generation)},
     "operator_cursor_initialized" => %{
@@ -160,6 +181,7 @@ defmodule SymphonyElixir.RunLedger do
                     :attempt,
                     :comment_created_at,
                     :comment_id,
+                    :cleanup_error,
                     :issue_id,
                     :issue_identifier,
                     :operator_command,
@@ -512,7 +534,33 @@ defmodule SymphonyElixir.RunLedger do
          acc
        )
        when is_binary(issue_id) do
-    Map.put(acc, issue_id, event)
+    Map.put(acc, issue_id, Map.put(event, "cleanup_status", "cleanup_pending"))
+  end
+
+  defp update_cleanup_pending_state(
+         %{"transition" => transition, "issue_id" => issue_id} = event,
+         acc
+       )
+       when transition in [
+              "workspace_cleanup_io_started",
+              "workspace_cleanup_operator_required",
+              "workspace_cleanup_retry_requested",
+              "workspace_cleanup_io_completed"
+            ] and is_binary(issue_id) do
+    status =
+      case transition do
+        "workspace_cleanup_io_started" -> "operator_required"
+        "workspace_cleanup_operator_required" -> "operator_required"
+        "workspace_cleanup_retry_requested" -> "cleanup_pending"
+        "workspace_cleanup_io_completed" -> "completion_pending"
+      end
+
+    Map.update(
+      acc,
+      issue_id,
+      Map.put(event, "cleanup_status", status),
+      &(&1 |> Map.merge(event) |> Map.put("cleanup_status", status))
+    )
   end
 
   defp update_cleanup_pending_state(
@@ -773,6 +821,7 @@ defmodule SymphonyElixir.RunLedger do
          :ok <- validate_required_attempt(event, Map.get(schema, :required_attempt, false)),
          :ok <- validate_required_next_attempt(event, Map.get(schema, :required_next_attempt, false)),
          :ok <- validate_typed_wait(event, Map.get(schema, :typed_wait, false)),
+         :ok <- validate_typed_cleanup_error(event, Map.get(schema, :typed_cleanup_error, false)),
          :ok <-
            validate_optional_operator_context(
              event,
@@ -843,6 +892,20 @@ defmodule SymphonyElixir.RunLedger do
 
       true ->
         validate_wait_persisted_fields(event)
+    end
+  end
+
+  defp validate_typed_cleanup_error(_event, false), do: :ok
+
+  defp validate_typed_cleanup_error(event, true) do
+    if event["cleanup_error"] in [
+         "workspace_affinity_missing",
+         "workspace_cleanup_failed",
+         "workspace_preservation_required"
+       ] do
+      :ok
+    else
+      {:error, {:invalid_field, "cleanup_error"}}
     end
   end
 
@@ -1097,6 +1160,7 @@ defmodule SymphonyElixir.RunLedger do
               retry_event: nil,
               cleanup_intent: false,
               cleanup_requested: nil,
+              cleanup_lifecycle: nil,
               cleanup_completed: nil
             })
 
@@ -1209,7 +1273,27 @@ defmodule SymphonyElixir.RunLedger do
          :ok <- require_terminal(run),
          :ok <- require_cleanup_request(run),
          {:ok, run} <- merge_run_affinity(run, event),
+         :ok <- require_cleanup_completion_state(run),
          {:ok, run} <- record_cleanup_completed(run, event) do
+      {:ok, put_run(state, event["run_id"], run)}
+    end
+  end
+
+  defp validate_ordered_event(
+         %{"transition" => transition} = event,
+         state
+       )
+       when transition in [
+              "workspace_cleanup_io_started",
+              "workspace_cleanup_operator_required",
+              "workspace_cleanup_retry_requested",
+              "workspace_cleanup_io_completed"
+            ] do
+    with {:ok, run} <- fetch_run(state, event),
+         :ok <- require_terminal(run),
+         :ok <- require_cleanup_request(run),
+         {:ok, run} <- merge_run_affinity(run, event),
+         {:ok, run} <- advance_cleanup_lifecycle(run, transition) do
       {:ok, put_run(state, event["run_id"], run)}
     end
   end
@@ -1491,7 +1575,12 @@ defmodule SymphonyElixir.RunLedger do
   defp require_cleanup_request(_run), do: {:error, :missing_cleanup_request}
 
   defp record_cleanup_request(%{cleanup_requested: nil} = run, event) do
-    {:ok, %{run | cleanup_requested: cleanup_event_identity(event)}}
+    {:ok,
+     %{
+       run
+       | cleanup_requested: cleanup_event_identity(event),
+         cleanup_lifecycle: :cleanup_pending
+     }}
   end
 
   defp record_cleanup_request(%{cleanup_requested: request} = run, event) do
@@ -1501,7 +1590,12 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp record_cleanup_completed(%{cleanup_completed: nil} = run, event) do
-    {:ok, %{run | cleanup_completed: cleanup_event_identity(event)}}
+    {:ok,
+     %{
+       run
+       | cleanup_completed: cleanup_event_identity(event),
+         cleanup_lifecycle: :completed
+     }}
   end
 
   defp record_cleanup_completed(%{cleanup_completed: completed} = run, event) do
@@ -1509,6 +1603,43 @@ defmodule SymphonyElixir.RunLedger do
       do: {:ok, run},
       else: {:error, :non_idempotent_cleanup_completion}
   end
+
+  # Projection recovers a started I/O transition as operator-required, while
+  # ordered validation retains the more precise in-stream state. This prevents
+  # a recorded failure from being followed by a forged I/O completion.
+  defp advance_cleanup_lifecycle(%{cleanup_lifecycle: :cleanup_pending} = run, "workspace_cleanup_io_started"),
+    do: {:ok, %{run | cleanup_lifecycle: :io_started}}
+
+  defp advance_cleanup_lifecycle(
+         %{cleanup_lifecycle: :io_started} = run,
+         "workspace_cleanup_operator_required"
+       ),
+       do: {:ok, %{run | cleanup_lifecycle: :operator_required}}
+
+  defp advance_cleanup_lifecycle(
+         %{cleanup_lifecycle: :operator_required} = run,
+         "workspace_cleanup_retry_requested"
+       ),
+       do: {:ok, %{run | cleanup_lifecycle: :cleanup_pending}}
+
+  defp advance_cleanup_lifecycle(
+         %{cleanup_lifecycle: :io_started} = run,
+         "workspace_cleanup_io_completed"
+       ),
+       do: {:ok, %{run | cleanup_lifecycle: :completion_pending}}
+
+  defp advance_cleanup_lifecycle(_run, _transition), do: {:error, :invalid_cleanup_lifecycle}
+
+  defp require_cleanup_completion_state(%{cleanup_lifecycle: :completion_pending}), do: :ok
+  defp require_cleanup_completion_state(%{cleanup_lifecycle: :completed}), do: :ok
+
+  # Compatibility for ledgers written before the I/O lifecycle transitions
+  # existed. New writers always append io_completed before completed.
+  defp require_cleanup_completion_state(%{cleanup_lifecycle: state})
+       when state in [nil, :cleanup_pending],
+       do: :ok
+
+  defp require_cleanup_completion_state(_run), do: {:error, :cleanup_io_not_completed}
 
   defp cleanup_event_identity(event) do
     Map.take(event, [

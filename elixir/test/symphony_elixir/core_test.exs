@@ -185,6 +185,94 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.mcp_elicitation_auto_approve_allowlist"
 
+    for remote_url <- [
+          "/srv/git/repo.git",
+          "git@github.com:owner/repo.git",
+          "https://github.com/owner/repo.git",
+          "git://github.com/owner/repo.git",
+          "ssh://git@github.com/owner/repo.git",
+          "file:///srv/git/repo.git"
+        ] do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_durability_remote_url: remote_url
+      )
+
+      assert :ok = Config.validate!()
+    end
+
+    for remote_url <- [
+          ".",
+          "relative/repo.git",
+          "https://token@github.com/owner/repo.git",
+          "https://github.com/owner/repo.git?token=secret",
+          "ssh://token@github.com/owner/repo.git",
+          "ssh://git@-oProxyCommand.example/owner/repo.git",
+          "ssh://git@github.com",
+          "git@github.com",
+          "git@github.com:",
+          "git@bad host:owner/repo.git",
+          "git@github.com:owner/repo.git;command",
+          "https://github.com/owner/repo.git#fragment",
+          "file://relative/repo.git",
+          "https://github.com/owner/repo.git\t",
+          " git@github.com:owner/repo.git "
+        ] do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_durability_remote_url: remote_url
+      )
+
+      assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+      assert message =~ "workspace.durability_remote_url"
+    end
+
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-config-durability-boundary-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace_root)
+    on_exit(fn -> File.rm_rf(workspace_root) end)
+
+    encoded_workspace_root =
+      String.replace(workspace_root, "symphony", "%73ymphony", global: false)
+
+    for remote_url <- [
+          workspace_root,
+          Path.join(workspace_root, "DUD-152"),
+          "file://#{Path.join(workspace_root, "remote.git")}",
+          "file://#{Path.join(encoded_workspace_root, "remote.git")}"
+        ] do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: remote_url
+      )
+
+      assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+      assert message =~ "workspace.durability_remote_url"
+      assert message =~ "outside workspace.root"
+    end
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      workspace_durability_remote_url: "file:///tmp/%ZZ/repo.git"
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "workspace.durability_remote_url"
+
+    blocking_file = Path.join(workspace_root, "not-a-directory")
+    File.write!(blocking_file, "blocked")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: Path.join(blocking_file, "workspaces"),
+      workspace_durability_remote_url: "/srv/git/repo.git"
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "workspace.durability_remote_url"
+    assert message =~ "resolve outside workspace.root"
+
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "123")
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
   end
@@ -213,6 +301,10 @@ defmodule SymphonyElixir.CoreTest do
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
+
+    assert get_in(config, ["workspace", "durability_remote_url"]) ==
+             "https://github.com/openai/symphony.git"
+
     assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
     assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
     assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
@@ -1012,7 +1104,8 @@ defmodule SymphonyElixir.CoreTest do
   test "terminal parked issue releases durably and removes its local recorded workspace" do
     root = parked_workspace_root("local-terminal")
     workspace = Path.join(root, "MT-PARKED-LOCAL-TERMINAL")
-    install_durable_local_workspace!(workspace, %{"remove-me" => "old"})
+    remote_url = install_durable_local_workspace!(workspace, %{"remove-me" => "old"})
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_durability_remote_url: remote_url)
 
     {state, wait} = parked_reconcile_state("local-terminal", workspace, root, nil)
 
@@ -1095,6 +1188,11 @@ defmodule SymphonyElixir.CoreTest do
 
   test "terminal parked issue releases durably and removes its remote recorded workspace" do
     {remote_root, workspace, trace_file} = install_fake_parked_cleanup_ssh!("remote-terminal")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_durability_remote_url: "git@example.test:repo.git"
+    )
+
     {state, wait} = parked_reconcile_state("remote-terminal", workspace, remote_root, "worker-a")
 
     reconciled =
@@ -1138,7 +1236,11 @@ defmodule SymphonyElixir.CoreTest do
   test "parked terminal release recovers local cleanup when request append crashes" do
     root = parked_workspace_root("local-release-recovery")
     workspace = Path.join(root, "MT-PARKED-LOCAL-RELEASE-RECOVERY")
-    install_durable_local_workspace!(workspace, %{"remove-after-restart" => "old"})
+
+    remote_url =
+      install_durable_local_workspace!(workspace, %{"remove-after-restart" => "old"})
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_durability_remote_url: remote_url)
 
     {state, wait} = parked_reconcile_state("local-release-recovery", workspace, root, nil)
     state = %{state | run_ledger_append_fn: cleanup_request_failure_append_fn()}
@@ -1170,6 +1272,10 @@ defmodule SymphonyElixir.CoreTest do
   test "parked terminal release recovers exact remote cleanup when request append crashes" do
     {remote_root, workspace, trace_file} =
       install_fake_parked_cleanup_ssh!("remote-release-recovery")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_durability_remote_url: "git@example.test:repo.git"
+    )
 
     {state, wait} =
       parked_reconcile_state("remote-release-recovery", workspace, remote_root, "worker-a")
@@ -1435,12 +1541,13 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-root-change"
 
     on_exit(fn -> File.rm_rf(test_root) end)
-    install_durable_local_workspace!(old_workspace, %{"remove-me" => "old"})
+    remote_url = install_durable_local_workspace!(old_workspace, %{"remove-me" => "old"})
     File.mkdir_p!(new_workspace)
     File.write!(new_sentinel, "new")
 
     write_workflow_file!(Workflow.workflow_file_path(),
       workspace_root: new_root,
+      workspace_durability_remote_url: remote_url,
       tracker_terminal_states: ["Closed"]
     )
 
@@ -1515,6 +1622,669 @@ defmodule SymphonyElixir.CoreTest do
              row.issue_id == issue_id and row.stage == "cleanup_pending" and
                row.error == "workspace_affinity_missing"
            end)
+  end
+
+  test "workspace cleanup runs asynchronously and releases a durable quarantine" do
+    root = parked_workspace_root("async-cleanup-success")
+    workspace = Path.join(root, "MT-ASYNC-CLEANUP")
+    remote_url = install_durable_local_workspace!(workspace)
+    issue_id = "issue-async-cleanup"
+    server_name = Module.concat(__MODULE__, :AsyncCleanupSuccess)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      poll_interval_ms: 60_000
+    )
+
+    assert {:ok, pid} =
+             Orchestrator.start_link(
+               name: server_name,
+               run_ledger_path: ledger_path("async-cleanup-success"),
+               run_ledger_append_fn: fn _path, _event -> :ok end
+             )
+
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    entry = %{
+      issue_id: issue_id,
+      run_id: "run-async-cleanup",
+      identifier: "MT-ASYNC-CLEANUP",
+      attempt: 0,
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: root,
+      terminal_reason: "tracker_terminal",
+      status: :cleanup_pending
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | cleanup_pending: %{issue_id => entry},
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    end)
+
+    send(pid, :start_pending_workspace_cleanups)
+
+    completed =
+      await_orchestrator_state(pid, fn state ->
+        not Map.has_key?(state.cleanup_pending, issue_id)
+      end)
+
+    refute MapSet.member?(completed.claimed, issue_id)
+    refute File.exists?(workspace)
+    assert File.read!(Path.join(workspace <> ".symphony-cleanup", "tracked.txt")) == "durable\n"
+  end
+
+  test "explicit workspace cleanup retry is durable and never inferred from tracker state" do
+    root = parked_workspace_root("explicit-cleanup-retry")
+    workspace = Path.join(root, "MT-EXPLICIT-CLEANUP-RETRY")
+    remote_url = install_durable_local_workspace!(workspace)
+    issue_id = "issue-explicit-cleanup-retry"
+    server_name = Module.concat(__MODULE__, :ExplicitCleanupRetry)
+    parent = self()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      poll_interval_ms: 60_000
+    )
+
+    append_fn = fn _path, event ->
+      send(parent, {:cleanup_transition, event.transition})
+      :ok
+    end
+
+    assert {:ok, pid} =
+             Orchestrator.start_link(
+               name: server_name,
+               run_ledger_path: ledger_path("explicit-cleanup-retry"),
+               run_ledger_append_fn: append_fn
+             )
+
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    entry = %{
+      issue_id: issue_id,
+      run_id: "run-explicit-cleanup-retry",
+      identifier: "MT-EXPLICIT-CLEANUP-RETRY",
+      attempt: 0,
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: root,
+      terminal_reason: "tracker_terminal",
+      status: :operator_required,
+      cleanup_error: :workspace_preservation_required
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | cleanup_pending: %{issue_id => entry},
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    end)
+
+    assert {:error, :cleanup_not_found} =
+             Orchestrator.retry_workspace_cleanup(server_name, "missing-cleanup")
+
+    assert {:ok, %{issue_id: ^issue_id, retry_requested: true}} =
+             Orchestrator.retry_workspace_cleanup(server_name, issue_id)
+
+    assert {:error, :cleanup_retry_not_allowed} =
+             Orchestrator.retry_workspace_cleanup(server_name, issue_id)
+
+    completed =
+      await_orchestrator_state(pid, fn state ->
+        not Map.has_key?(state.cleanup_pending, issue_id)
+      end)
+
+    refute MapSet.member?(completed.claimed, issue_id)
+    refute File.exists?(workspace)
+
+    assert_receive {:cleanup_transition, "workspace_cleanup_retry_requested"}
+    assert_receive {:cleanup_transition, "workspace_cleanup_io_started"}
+    assert_receive {:cleanup_transition, "workspace_cleanup_io_completed"}
+    assert_receive {:cleanup_transition, "workspace_cleanup_completed"}
+  end
+
+  test "cleanup I/O start append failure performs no workspace I/O" do
+    root = parked_workspace_root("cleanup-start-append-failure")
+    workspace = Path.join(root, "MT-CLEANUP-START-APPEND-FAILURE")
+    remote_url = install_durable_local_workspace!(workspace)
+    trace_file = Path.join(root, "before-remove.trace")
+    issue_id = "issue-cleanup-start-append-failure"
+    server_name = Module.concat(__MODULE__, :CleanupStartAppendFailure)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      hook_before_remove: "printf called >> '#{trace_file}'",
+      poll_interval_ms: 60_000
+    )
+
+    append_fn = fn _path, event ->
+      if event.transition == "workspace_cleanup_io_started",
+        do: {:error, :forced_io_start_append_failure},
+        else: :ok
+    end
+
+    assert {:ok, pid} =
+             Orchestrator.start_link(
+               name: server_name,
+               run_ledger_path: ledger_path("cleanup-start-append-failure"),
+               run_ledger_append_fn: append_fn
+             )
+
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    entry = cleanup_test_entry(issue_id, workspace, root, :cleanup_pending)
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | cleanup_pending: %{issue_id => entry},
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    end)
+
+    send(pid, :start_pending_workspace_cleanups)
+
+    blocked =
+      await_orchestrator_state(pid, fn state ->
+        get_in(state.cleanup_pending, [issue_id, :persistence_error]) ==
+          :forced_io_start_append_failure
+      end)
+
+    assert blocked.cleanup_pending[issue_id].status == :cleanup_pending
+    assert MapSet.member?(blocked.claimed, issue_id)
+    assert File.dir?(workspace)
+    refute File.exists?(workspace <> ".symphony-cleanup")
+    refute File.exists?(trace_file)
+  end
+
+  test "cleanup retry append failure performs no workspace I/O" do
+    root = parked_workspace_root("cleanup-retry-append-failure")
+    workspace = Path.join(root, "MT-CLEANUP-RETRY-APPEND-FAILURE")
+    remote_url = install_durable_local_workspace!(workspace)
+    trace_file = Path.join(root, "before-remove.trace")
+    issue_id = "issue-cleanup-retry-append-failure"
+    server_name = Module.concat(__MODULE__, :CleanupRetryAppendFailure)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      hook_before_remove: "printf called >> '#{trace_file}'",
+      poll_interval_ms: 60_000
+    )
+
+    append_fn = fn _path, event ->
+      if event.transition == "workspace_cleanup_retry_requested",
+        do: {:error, :forced_retry_append_failure},
+        else: :ok
+    end
+
+    assert {:ok, pid} =
+             Orchestrator.start_link(
+               name: server_name,
+               run_ledger_path: ledger_path("cleanup-retry-append-failure"),
+               run_ledger_append_fn: append_fn
+             )
+
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    entry =
+      issue_id
+      |> cleanup_test_entry(workspace, root, :operator_required)
+      |> Map.put(:cleanup_error, :workspace_preservation_required)
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | cleanup_pending: %{issue_id => entry},
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    end)
+
+    assert {:error, {:ledger_write_failed, :forced_retry_append_failure}} =
+             Orchestrator.retry_workspace_cleanup(server_name, issue_id)
+
+    blocked = :sys.get_state(pid)
+    assert blocked.cleanup_pending[issue_id] == entry
+    assert MapSet.member?(blocked.claimed, issue_id)
+    assert File.dir?(workspace)
+    refute File.exists?(workspace <> ".symphony-cleanup")
+    refute File.exists?(trace_file)
+  end
+
+  test "cleanup I/O completion append failure never repeats workspace I/O" do
+    root = parked_workspace_root("cleanup-io-completion-append-failure")
+    workspace = Path.join(root, "MT-CLEANUP-IO-COMPLETION-APPEND-FAILURE")
+    remote_url = install_durable_local_workspace!(workspace)
+    trace_file = Path.join(root, "before-remove.trace")
+    issue_id = "issue-cleanup-io-completion-append-failure"
+    server_name = Module.concat(__MODULE__, :CleanupIoCompletionAppendFailure)
+    {:ok, failure_switch} = Agent.start_link(fn -> true end)
+    on_exit(fn -> if Process.alive?(failure_switch), do: Agent.stop(failure_switch) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      hook_before_remove: "printf 'called\\n' >> '#{trace_file}'",
+      poll_interval_ms: 60_000
+    )
+
+    append_fn = fn _path, event ->
+      if event.transition == "workspace_cleanup_io_completed" and Agent.get(failure_switch, & &1),
+        do: {:error, :forced_io_completion_append_failure},
+        else: :ok
+    end
+
+    assert {:ok, pid} =
+             Orchestrator.start_link(
+               name: server_name,
+               run_ledger_path: ledger_path("cleanup-io-completion-append-failure"),
+               run_ledger_append_fn: append_fn
+             )
+
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    entry = cleanup_test_entry(issue_id, workspace, root, :cleanup_pending)
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | cleanup_pending: %{issue_id => entry},
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    end)
+
+    send(pid, :start_pending_workspace_cleanups)
+
+    blocked =
+      await_orchestrator_state(pid, fn state ->
+        get_in(state.cleanup_pending, [issue_id, :status]) == :io_completion_pending
+      end)
+
+    assert MapSet.member?(blocked.claimed, issue_id)
+    refute File.exists?(workspace)
+    assert File.dir?(workspace <> ".symphony-cleanup")
+    assert File.read!(trace_file) == "called\n"
+
+    send(pid, :start_pending_workspace_cleanups)
+    send(pid, :start_pending_workspace_cleanups)
+    Process.sleep(50)
+    assert File.read!(trace_file) == "called\n"
+
+    Agent.update(failure_switch, fn _failed -> false end)
+    send(pid, :start_pending_workspace_cleanups)
+
+    completed =
+      await_orchestrator_state(pid, fn state ->
+        not Map.has_key?(state.cleanup_pending, issue_id)
+      end)
+
+    refute MapSet.member?(completed.claimed, issue_id)
+    assert File.read!(trace_file) == "called\n"
+  end
+
+  test "cleanup completion append failure retains ownership without repeating I/O" do
+    root = parked_workspace_root("cleanup-completion-append-failure")
+    workspace = Path.join(root, "MT-CLEANUP-COMPLETION-APPEND-FAILURE")
+    remote_url = install_durable_local_workspace!(workspace)
+    trace_file = Path.join(root, "before-remove.trace")
+    issue_id = "issue-cleanup-completion-append-failure"
+    server_name = Module.concat(__MODULE__, :CleanupCompletionAppendFailure)
+    {:ok, failure_switch} = Agent.start_link(fn -> true end)
+    on_exit(fn -> if Process.alive?(failure_switch), do: Agent.stop(failure_switch) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      hook_before_remove: "printf 'called\\n' >> '#{trace_file}'",
+      poll_interval_ms: 60_000
+    )
+
+    append_fn = fn _path, event ->
+      if event.transition == "workspace_cleanup_completed" and Agent.get(failure_switch, & &1),
+        do: {:error, :forced_cleanup_completion_append_failure},
+        else: :ok
+    end
+
+    assert {:ok, pid} =
+             Orchestrator.start_link(
+               name: server_name,
+               run_ledger_path: ledger_path("cleanup-completion-append-failure"),
+               run_ledger_append_fn: append_fn
+             )
+
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    entry = cleanup_test_entry(issue_id, workspace, root, :cleanup_pending)
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | cleanup_pending: %{issue_id => entry},
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    end)
+
+    send(pid, :start_pending_workspace_cleanups)
+
+    blocked =
+      await_orchestrator_state(pid, fn state ->
+        get_in(state.cleanup_pending, [issue_id, :status]) == :completion_pending
+      end)
+
+    assert MapSet.member?(blocked.claimed, issue_id)
+    refute File.exists?(workspace)
+    assert File.dir?(workspace <> ".symphony-cleanup")
+    assert File.read!(trace_file) == "called\n"
+
+    send(pid, :start_pending_workspace_cleanups)
+    send(pid, :start_pending_workspace_cleanups)
+    Process.sleep(50)
+    assert File.read!(trace_file) == "called\n"
+
+    Agent.update(failure_switch, fn _failed -> false end)
+    send(pid, :start_pending_workspace_cleanups)
+
+    completed =
+      await_orchestrator_state(pid, fn state ->
+        not Map.has_key?(state.cleanup_pending, issue_id)
+      end)
+
+    refute MapSet.member?(completed.claimed, issue_id)
+    assert File.read!(trace_file) == "called\n"
+  end
+
+  test "cleanup task crash preserves quarantine ownership and requires explicit retry" do
+    root = parked_workspace_root("cleanup-task-crash")
+    workspace = Path.join(root, "MT-CLEANUP-TASK-CRASH")
+    remote_url = install_durable_local_workspace!(workspace)
+    fake_bin = Path.join(root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    trace_file = Path.join(root, "git.trace")
+    issue_id = "issue-cleanup-task-crash"
+    server_name = Module.concat(__MODULE__, :CleanupTaskCrash)
+    previous_path = System.get_env("PATH")
+
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    printf 'called\\n' >> '#{trace_file}'
+    sleep 2
+    printf 'survived\\n' >> '#{trace_file}'
+    exit 1
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+    on_exit(fn -> restore_env("PATH", previous_path) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      hook_timeout_ms: 10_000,
+      poll_interval_ms: 60_000
+    )
+
+    assert {:ok, pid} =
+             Orchestrator.start_link(
+               name: server_name,
+               run_ledger_path: ledger_path("cleanup-task-crash"),
+               run_ledger_append_fn: fn _path, _event -> :ok end
+             )
+
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    entry = cleanup_test_entry(issue_id, workspace, root, :cleanup_pending)
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | cleanup_pending: %{issue_id => entry},
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    end)
+
+    send(pid, :start_pending_workspace_cleanups)
+
+    running =
+      await_orchestrator_state(pid, fn state ->
+        get_in(state.cleanup_pending, [issue_id, :cleanup_task, :pid]) != nil and
+          File.exists?(trace_file)
+      end)
+
+    task_pid = get_in(running.cleanup_pending, [issue_id, :cleanup_task, :pid])
+    assert :ok = Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, task_pid)
+
+    preserved =
+      await_orchestrator_state(pid, fn state ->
+        get_in(state.cleanup_pending, [issue_id, :status]) == :operator_required
+      end)
+
+    assert MapSet.member?(preserved.claimed, issue_id)
+
+    assert preserved.cleanup_pending[issue_id].cleanup_error ==
+             :workspace_preservation_required
+
+    refute File.exists?(workspace)
+    assert File.read!(Path.join(workspace <> ".symphony-cleanup", "tracked.txt")) == "durable\n"
+
+    send(pid, :start_pending_workspace_cleanups)
+    Process.sleep(2_200)
+    assert trace_file |> File.read!() |> String.split("\n", trim: true) |> Enum.count(&(&1 == "called")) == 1
+    assert :sys.get_state(pid).cleanup_pending[issue_id].status == :operator_required
+  end
+
+  test "restart after durable cleanup I/O completion retries only the completion event" do
+    root = parked_workspace_root("cleanup-completion-restart")
+    workspace = Path.join(root, "MT-CLEANUP-COMPLETION-RESTART")
+    sentinel = Path.join(workspace, "must-remain.txt")
+    ledger_path = ledger_path("cleanup-completion-restart")
+    issue_id = "issue-cleanup-completion-restart"
+
+    File.mkdir_p!(workspace)
+    File.write!(sentinel, "no repeated I/O\n")
+
+    base = %{
+      run_id: "run-cleanup-completion-restart",
+      issue_id: issue_id,
+      issue_identifier: "MT-CLEANUP-COMPLETION-RESTART",
+      attempt: 1,
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: root
+    }
+
+    for event <- [
+          %{transition: "run_claimed", stage: "claimed"},
+          %{transition: "run_started", stage: "running"},
+          %{
+            transition: "run_stopped",
+            stage: "released",
+            terminal_reason: "tracker_terminal",
+            next_action: "none"
+          },
+          %{
+            transition: "workspace_cleanup_requested",
+            stage: "cleanup",
+            terminal_reason: "tracker_terminal"
+          },
+          %{transition: "workspace_cleanup_io_started", stage: "cleanup"},
+          %{transition: "workspace_cleanup_io_completed", stage: "cleanup"}
+        ] do
+      assert :ok = RunLedger.append(ledger_path, Map.merge(base, event))
+    end
+
+    assert {:ok, restarted} = Orchestrator.init(run_ledger_path: ledger_path)
+    if is_reference(restarted.tick_timer_ref), do: Process.cancel_timer(restarted.tick_timer_ref)
+
+    assert restarted.cleanup_pending == %{}
+    refute MapSet.member?(restarted.claimed, issue_id)
+    assert File.read!(sentinel) == "no repeated I/O\n"
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+    assert List.last(events)["transition"] == "workspace_cleanup_completed"
+  end
+
+  test "restart after cleanup I/O start requires operator retry without touching either path" do
+    root = parked_workspace_root("cleanup-start-restart")
+    workspace = Path.join(root, "MT-CLEANUP-START-RESTART")
+    quarantine = workspace <> ".symphony-cleanup"
+    sentinel = Path.join(quarantine, "must-remain.txt")
+    ledger_path = ledger_path("cleanup-start-restart")
+    issue_id = "issue-cleanup-start-restart"
+
+    File.mkdir_p!(quarantine)
+    File.write!(sentinel, "interrupted cleanup\n")
+
+    base = %{
+      run_id: "run-cleanup-start-restart",
+      issue_id: issue_id,
+      issue_identifier: "MT-CLEANUP-START-RESTART",
+      attempt: 1,
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: root
+    }
+
+    for event <- [
+          %{transition: "run_claimed", stage: "claimed"},
+          %{transition: "run_started", stage: "running"},
+          %{
+            transition: "run_stopped",
+            stage: "released",
+            terminal_reason: "tracker_terminal",
+            next_action: "none"
+          },
+          %{
+            transition: "workspace_cleanup_requested",
+            stage: "cleanup",
+            terminal_reason: "tracker_terminal"
+          },
+          %{transition: "workspace_cleanup_io_started", stage: "cleanup"}
+        ] do
+      assert :ok = RunLedger.append(ledger_path, Map.merge(base, event))
+    end
+
+    assert {:ok, restarted} = Orchestrator.init(run_ledger_path: ledger_path)
+    if is_reference(restarted.tick_timer_ref), do: Process.cancel_timer(restarted.tick_timer_ref)
+
+    assert %{
+             status: :operator_required,
+             cleanup_error: :workspace_preservation_required
+           } = restarted.cleanup_pending[issue_id]
+
+    refute File.exists?(workspace)
+    assert File.read!(sentinel) == "interrupted cleanup\n"
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(events, &(&1["transition"] == "workspace_cleanup_io_started")) == 1
+  end
+
+  test "workspace cleanup timeout stays responsive and requires an operator retry" do
+    root = parked_workspace_root("async-cleanup-timeout")
+    workspace = Path.join(root, "MT-ASYNC-TIMEOUT")
+    fake_bin = Path.join(root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    trace_file = Path.join(root, "git.trace")
+    issue_id = "issue-async-timeout"
+    server_name = Module.concat(__MODULE__, :AsyncCleanupTimeout)
+    previous_path = System.get_env("PATH")
+
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "preserve.txt"), "must survive\n")
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    printf 'called\\n' >> '#{trace_file}'
+    sleep 2
+    printf 'survived\\n' >> '#{trace_file}'
+    exit 1
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+    on_exit(fn -> restore_env("PATH", previous_path) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: "/srv/git/repo.git",
+      hook_timeout_ms: 1_000,
+      poll_interval_ms: 60_000
+    )
+
+    assert {:ok, pid} =
+             Orchestrator.start_link(
+               name: server_name,
+               run_ledger_path: ledger_path("async-cleanup-timeout"),
+               run_ledger_append_fn: fn _path, _event -> :ok end
+             )
+
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    entry = %{
+      issue_id: issue_id,
+      run_id: "run-async-timeout",
+      identifier: "MT-ASYNC-TIMEOUT",
+      attempt: 0,
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: root,
+      terminal_reason: "tracker_terminal",
+      status: :cleanup_pending
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | cleanup_pending: %{issue_id => entry},
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    end)
+
+    send(pid, :start_pending_workspace_cleanups)
+
+    _running =
+      await_orchestrator_state(pid, fn state ->
+        get_in(state.cleanup_pending, [issue_id, :cleanup_task]) != nil
+      end)
+
+    assert %{} = Orchestrator.snapshot(server_name, 100)
+
+    preserved =
+      await_orchestrator_state(pid, fn state ->
+        get_in(state.cleanup_pending, [issue_id, :status]) == :operator_required
+      end)
+
+    assert preserved.cleanup_pending[issue_id].cleanup_error ==
+             :workspace_preservation_required
+
+    assert MapSet.member?(preserved.claimed, issue_id)
+    refute File.exists?(workspace)
+    assert File.read!(Path.join(workspace <> ".symphony-cleanup", "preserve.txt")) == "must survive\n"
+    assert File.read!(trace_file) == "called\n"
+
+    send(pid, :start_pending_workspace_cleanups)
+    send(pid, :start_pending_workspace_cleanups)
+    Process.sleep(1_200)
+    assert File.read!(trace_file) == "called\n"
+    assert :operator_required == :sys.get_state(pid).cleanup_pending[issue_id].status
   end
 
   test "completion ledger failure retains claim and blocks continuation until persisted" do
@@ -1867,7 +2637,15 @@ defmodule SymphonyElixir.CoreTest do
         tracker_terminal_states: ["Closed"]
       )
 
-      install_durable_local_workspace!(workspace)
+      remote_url = install_durable_local_workspace!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        workspace_durability_remote_url: remote_url,
+        tracker_active_states: ["Todo", "In Progress"],
+        tracker_terminal_states: ["Closed"]
+      )
+
       parent = self()
       shutdown_marker = Path.join(test_root, "worker-shutdown-established")
 
@@ -1923,9 +2701,22 @@ defmodule SymphonyElixir.CoreTest do
       refute Process.alive?(agent_pid)
       refute File.exists?(workspace)
 
-      assert {:ok, [_claim, _started, event, cleanup_event]} = RunLedger.read_events(valid_path)
+      assert {:ok,
+              [
+                _claim,
+                _started,
+                event,
+                cleanup_request,
+                cleanup_start,
+                cleanup_io_completed,
+                cleanup_event
+              ]} = RunLedger.read_events(valid_path)
+
       assert event["transition"] == "run_stopped"
       assert event["terminal_reason"] == "tracker_terminal"
+      assert cleanup_request["transition"] == "workspace_cleanup_requested"
+      assert cleanup_start["transition"] == "workspace_cleanup_io_started"
+      assert cleanup_io_completed["transition"] == "workspace_cleanup_io_completed"
       assert cleanup_event["transition"] == "workspace_cleanup_completed"
       assert cleanup_event["workspace_path"] == workspace
     after
@@ -2404,6 +3195,101 @@ defmodule SymphonyElixir.CoreTest do
 
     assert {:ok, events} = RunLedger.read_events(ledger_path)
     assert Enum.count(events, &(&1["transition"] == "resume_queued")) == 1
+    assert Enum.count(events, &(&1["transition"] == "operator_command_applied")) == 1
+  end
+
+  test "Linear retry command explicitly releases an operator-required workspace cleanup" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"]
+    )
+
+    ledger_path = ledger_path("operator-cleanup-retry")
+    issue_id = "issue-operator-cleanup-retry"
+    run_id = "run-operator-cleanup-retry"
+    identifier = "MT-OPERATOR-CLEANUP-RETRY"
+    cursor_at = ~U[2026-08-03 10:00:00Z]
+    command_at = ~U[2026-08-03 10:00:01Z]
+
+    base = %{
+      run_id: run_id,
+      issue_id: issue_id,
+      issue_identifier: identifier,
+      attempt: 1,
+      worker_host: nil,
+      workspace_path: "/tmp/MT-OPERATOR-CLEANUP-RETRY",
+      workspace_root: "/tmp"
+    }
+
+    for event <- [
+          %{transition: "run_claimed", stage: "claimed"},
+          %{transition: "run_started", stage: "running"},
+          %{
+            transition: "run_stopped",
+            stage: "released",
+            terminal_reason: "tracker_terminal",
+            next_action: "none"
+          },
+          %{
+            transition: "workspace_cleanup_requested",
+            stage: "cleanup",
+            terminal_reason: "tracker_terminal"
+          },
+          %{transition: "workspace_cleanup_io_started", stage: "cleanup"},
+          %{
+            transition: "workspace_cleanup_operator_required",
+            stage: "cleanup",
+            cleanup_error: "workspace_preservation_required"
+          }
+        ] do
+      assert :ok = RunLedger.append(ledger_path, Map.merge(base, event))
+    end
+
+    comment = %SymphonyElixir.Linear.Comment{
+      id: "comment-cleanup-retry",
+      body: "$retry",
+      created_at: command_at,
+      author_id: "operator-1"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue_id => [comment]})
+
+    cleanup_entry = %{
+      issue_id: issue_id,
+      run_id: run_id,
+      identifier: identifier,
+      attempt: 1,
+      worker_host: nil,
+      workspace_path: base.workspace_path,
+      workspace_root: base.workspace_root,
+      terminal_reason: "tracker_terminal",
+      status: :operator_required,
+      cleanup_error: :workspace_preservation_required
+    }
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: ledger_path,
+      runner_generation: "runner-operator-cleanup-retry",
+      dispatch_paused: true,
+      cleanup_pending: %{issue_id => cleanup_entry},
+      claimed: MapSet.new([issue_id]),
+      operator_comment_cursors: %{
+        issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    retried_state = Orchestrator.run_poll_cycle_for_test(state)
+    assert retried_state.cleanup_pending[issue_id].status == :cleanup_pending
+    refute Map.has_key?(retried_state.cleanup_pending[issue_id], :cleanup_error)
+
+    repeated_state = Orchestrator.run_poll_cycle_for_test(retried_state)
+    if is_reference(repeated_state.tick_timer_ref), do: Process.cancel_timer(repeated_state.tick_timer_ref)
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(events, &(&1["transition"] == "workspace_cleanup_retry_requested")) == 1
     assert Enum.count(events, &(&1["transition"] == "operator_command_applied")) == 1
   end
 
@@ -4891,7 +5777,13 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   defp install_durable_local_workspace!(workspace, files \\ %{"tracked.txt" => "durable\n"}) do
-    source = workspace <> "-remote-#{System.unique_integer([:positive])}"
+    workspace_root = Path.dirname(workspace)
+
+    source =
+      Path.join(
+        Path.dirname(workspace_root),
+        "#{Path.basename(workspace)}-remote-#{System.unique_integer([:positive])}"
+      )
 
     File.mkdir_p!(source)
 
@@ -4910,7 +5802,7 @@ defmodule SymphonyElixir.CoreTest do
     System.cmd("git", ["clone", source, workspace])
 
     on_exit(fn -> File.rm_rf(source) end)
-    workspace
+    source
   end
 
   defp cleanup_request_failure_append_fn do
@@ -4919,6 +5811,37 @@ defmodule SymphonyElixir.CoreTest do
         do: {:error, :forced_cleanup_request_append_failure},
         else: RunLedger.append(ledger_path, event)
     end
+  end
+
+  defp cleanup_test_entry(issue_id, workspace, root, status) do
+    %{
+      issue_id: issue_id,
+      run_id: "run-#{issue_id}",
+      identifier: String.upcase(issue_id),
+      attempt: 0,
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: root,
+      terminal_reason: "tracker_terminal",
+      status: status
+    }
+  end
+
+  defp await_orchestrator_state(pid, predicate, attempts \\ 100)
+
+  defp await_orchestrator_state(pid, predicate, attempts) when attempts > 0 do
+    state = :sys.get_state(pid)
+
+    if predicate.(state) do
+      state
+    else
+      Process.sleep(10)
+      await_orchestrator_state(pid, predicate, attempts - 1)
+    end
+  end
+
+  defp await_orchestrator_state(pid, _predicate, 0) do
+    flunk("orchestrator state did not reach the expected condition: #{inspect(:sys.get_state(pid))}")
   end
 
   defp blocked_ledger_path do

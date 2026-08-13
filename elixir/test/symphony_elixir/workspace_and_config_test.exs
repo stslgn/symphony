@@ -215,10 +215,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       System.cmd("git", ["clone", source, workspace])
       File.write!(uncommitted, "create table preserved_work();\n")
 
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: source,
+        hook_before_remove: "touch #{Path.join(test_root, "hook-must-not-run")}"
+      )
+
       assert {:error, :workspace_preservation_required, ""} =
                Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
 
       assert File.read!(uncommitted) == "create table preserved_work();\n"
+      refute File.exists?(Path.join(test_root, "hook-must-not-run"))
     after
       File.rm_rf(test_root)
     end
@@ -252,6 +259,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       System.cmd("git", ["-C", workspace, "add", "migration.sql"])
       System.cmd("git", ["-C", workspace, "commit", "-m", "unpublished migration"])
 
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: source
+      )
+
       assert {:error, :workspace_preservation_required, ""} =
                Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
 
@@ -261,7 +273,139 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "automatic terminal cleanup removes a clean remote-backed workspace" do
+  test "automatic terminal cleanup rejects unrelated remote-tracking refs" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-forged-ref-preservation-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-152")
+    committed = Path.join(workspace, "migration.sql")
+
+    try do
+      File.mkdir_p!(source)
+      File.write!(Path.join(source, "README.md"), "baseline\n")
+      System.cmd("git", ["-C", source, "init", "-b", "main"])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", source, "add", "README.md"])
+      System.cmd("git", ["-C", source, "commit", "-m", "baseline"])
+      File.mkdir_p!(workspace_root)
+      System.cmd("git", ["clone", source, workspace])
+      System.cmd("git", ["-C", workspace, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", workspace, "config", "user.email", "test@example.com"])
+      File.write!(committed, "create table preserved_work();\n")
+      System.cmd("git", ["-C", workspace, "add", "migration.sql"])
+      System.cmd("git", ["-C", workspace, "commit", "-m", "unpublished migration"])
+      System.cmd("git", ["-C", workspace, "update-ref", "refs/remotes/fake/main", "HEAD"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: source
+      )
+
+      assert {:error, :workspace_preservation_required, ""} =
+               Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+
+      assert File.read!(committed) == "create table preserved_work();\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "automatic terminal cleanup ignores a worker-modified origin URL" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-forged-origin-preservation-#{System.unique_integer([:positive])}"
+      )
+
+    trusted_source = Path.join(test_root, "trusted-source")
+    forged_source = Path.join(test_root, "forged-source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-152")
+    committed = Path.join(workspace, "migration.sql")
+
+    try do
+      File.mkdir_p!(trusted_source)
+      File.write!(Path.join(trusted_source, "README.md"), "baseline\n")
+      System.cmd("git", ["-C", trusted_source, "init", "-b", "main"])
+      System.cmd("git", ["-C", trusted_source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", trusted_source, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", trusted_source, "add", "README.md"])
+      System.cmd("git", ["-C", trusted_source, "commit", "-m", "baseline"])
+      File.mkdir_p!(workspace_root)
+      System.cmd("git", ["clone", trusted_source, workspace])
+      System.cmd("git", ["-C", workspace, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", workspace, "config", "user.email", "test@example.com"])
+      File.write!(committed, "create table preserved_work();\n")
+      System.cmd("git", ["-C", workspace, "add", "migration.sql"])
+      System.cmd("git", ["-C", workspace, "commit", "-m", "unpublished migration"])
+      System.cmd("git", ["clone", "--bare", workspace, forged_source])
+      System.cmd("git", ["-C", workspace, "remote", "set-url", "origin", forged_source])
+
+      System.cmd("git", [
+        "-C",
+        workspace,
+        "config",
+        "url.#{forged_source}.insteadOf",
+        trusted_source
+      ])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: trusted_source
+      )
+
+      assert {:error, :workspace_preservation_required, ""} =
+               Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+
+      assert File.read!(committed) == "create table preserved_work();\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "automatic terminal cleanup preserves a clean workspace when trusted fetch fails" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-fetch-failure-preservation-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-152")
+
+    try do
+      File.mkdir_p!(source)
+      File.write!(Path.join(source, "README.md"), "baseline\n")
+      System.cmd("git", ["-C", source, "init", "-b", "main"])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", source, "add", "README.md"])
+      System.cmd("git", ["-C", source, "commit", "-m", "baseline"])
+      File.mkdir_p!(workspace_root)
+      System.cmd("git", ["clone", source, workspace])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: Path.join(test_root, "missing-source")
+      )
+
+      assert {:error, :workspace_preservation_required, ""} =
+               Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+
+      assert File.dir?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "automatic terminal cleanup quarantines a clean remote-backed workspace" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -271,6 +415,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     source = Path.join(test_root, "source")
     workspace_root = Path.join(test_root, "workspaces")
     workspace = Path.join(workspace_root, "DUD-153")
+    quarantine = workspace <> ".symphony-cleanup"
 
     try do
       File.mkdir_p!(source)
@@ -283,10 +428,215 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.mkdir_p!(workspace_root)
       System.cmd("git", ["clone", source, workspace])
 
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: source
+      )
+
       assert {:ok, _removed_paths} =
                Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
 
       refute File.exists?(workspace)
+      assert File.read!(Path.join(quarantine, "README.md")) == "durable baseline\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "automatic terminal cleanup disables worker-controlled fsmonitor" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-fsmonitor-preservation-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-153")
+    fsmonitor = Path.join(test_root, "worker-fsmonitor")
+    trace_file = Path.join(test_root, "fsmonitor.trace")
+
+    try do
+      File.mkdir_p!(source)
+      File.write!(Path.join(source, "README.md"), "durable baseline\n")
+      System.cmd("git", ["-C", source, "init", "-b", "main"])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", source, "add", "README.md"])
+      System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+      File.mkdir_p!(workspace_root)
+      System.cmd("git", ["clone", source, workspace])
+
+      File.write!(fsmonitor, "#!/bin/sh\nprintf invoked >> '#{trace_file}'\n")
+      File.chmod!(fsmonitor, 0o755)
+      System.cmd("git", ["-C", workspace, "config", "core.fsmonitor", fsmonitor])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: source
+      )
+
+      assert {:ok, []} =
+               Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+
+      refute File.exists?(trace_file)
+      assert File.dir?(workspace <> ".symphony-cleanup")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "successful terminal quarantine retains ignored and alternate-ref data" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-terminal-artifact-retention-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-153")
+    quarantine = workspace <> ".symphony-cleanup"
+
+    try do
+      File.mkdir_p!(source)
+      File.write!(Path.join(source, "README.md"), "durable baseline\n")
+      File.write!(Path.join(source, ".gitignore"), "ignored.log\n")
+      System.cmd("git", ["-C", source, "init", "-b", "main"])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", source, "add", "README.md", ".gitignore"])
+      System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+      File.mkdir_p!(workspace_root)
+      System.cmd("git", ["clone", source, workspace])
+      File.write!(Path.join(workspace, "ignored.log"), "local ignored evidence\n")
+      System.cmd("git", ["-C", workspace, "branch", "local-evidence"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: source
+      )
+
+      assert {:ok, _removed_paths} =
+               Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+
+      assert File.read!(Path.join(quarantine, "ignored.log")) == "local ignored evidence\n"
+      assert {_output, 0} = System.cmd("git", ["-C", quarantine, "rev-parse", "local-evidence"])
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "automatic terminal cleanup fails closed without a trusted durability remote" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-missing-durability-remote-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-153")
+
+    try do
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "progress.txt"), "preserve me\n")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:error, :workspace_preservation_required, ""} =
+               Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+
+      assert File.read!(Path.join(workspace, "progress.txt")) == "preserve me\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "automatic terminal cleanup preserves an interrupted local quarantine" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-quarantine-recovery-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-153")
+    quarantine = workspace <> ".symphony-cleanup"
+
+    try do
+      File.mkdir_p!(source)
+      File.write!(Path.join(source, "README.md"), "durable baseline\n")
+      System.cmd("git", ["-C", source, "init", "-b", "main"])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", source, "add", "README.md"])
+      System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+      File.mkdir_p!(workspace_root)
+      System.cmd("git", ["clone", source, workspace])
+      File.rename!(workspace, quarantine)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: source
+      )
+
+      assert {:error, :workspace_preservation_required, ""} =
+               Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+
+      refute File.exists?(workspace)
+      assert File.read!(Path.join(quarantine, "README.md")) == "durable baseline\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "automatic terminal cleanup fails closed when workspace and quarantine are absent" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-missing-artifact-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-153")
+    File.mkdir_p!(workspace_root)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: "/srv/git/repo.git"
+      )
+
+      assert {:error, :workspace_preservation_required, ""} =
+               Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "automatic terminal cleanup rejects conflicting workspace and quarantine paths" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-quarantine-conflict-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-153")
+    quarantine = workspace <> ".symphony-cleanup"
+
+    try do
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(quarantine)
+      File.write!(Path.join(workspace, "progress.txt"), "primary\n")
+      File.write!(Path.join(quarantine, "progress.txt"), "quarantine\n")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:error, :workspace_preservation_required, ""} =
+               Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+
+      assert File.read!(Path.join(workspace, "progress.txt")) == "primary\n"
+      assert File.read!(Path.join(quarantine, "progress.txt")) == "quarantine\n"
     after
       File.rm_rf(test_root)
     end
@@ -317,6 +667,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
+        workspace_durability_remote_url: source,
         hook_before_remove: "printf generated > post-hook.txt"
       )
 
@@ -324,6 +675,103 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
 
       assert File.read!(hook_output) == "generated"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "automatic terminal cleanup rejects a quarantine path swap" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-quarantine-swap-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-155")
+    outside = Path.join(test_root, "outside")
+    sentinel = Path.join(outside, "must-survive.txt")
+
+    try do
+      File.mkdir_p!(source)
+      File.mkdir_p!(outside)
+      File.write!(Path.join(source, "README.md"), "durable baseline\n")
+      File.write!(sentinel, "outside data\n")
+      System.cmd("git", ["-C", source, "init", "-b", "main"])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", source, "add", "README.md"])
+      System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+      File.mkdir_p!(workspace_root)
+      System.cmd("git", ["clone", source, workspace])
+
+      swap_command =
+        "quarantine=$PWD; original=${quarantine%.symphony-cleanup}; " <>
+          "cd ..; mv \"$quarantine\" \"$original\"; ln -s #{outside} \"$quarantine\""
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: source,
+        hook_before_remove: swap_command
+      )
+
+      assert {:error, :workspace_preservation_required, ""} =
+               Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+
+      assert File.read!(Path.join(workspace, "README.md")) == "durable baseline\n"
+      assert File.read!(sentinel) == "outside data\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "automatic terminal cleanup rejects a real-directory quarantine swap" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-quarantine-directory-swap-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    replacement_source = Path.join(test_root, "replacement-source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-157")
+    saved = Path.join(test_root, "saved-original")
+
+    try do
+      File.mkdir_p!(source)
+      File.write!(Path.join(source, "README.md"), "durable baseline\n")
+      System.cmd("git", ["-C", source, "init", "-b", "main"])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", source, "add", "README.md"])
+      System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+      File.write!(Path.join(source, "README.md"), "attacker replacement\n")
+      System.cmd("git", ["-C", source, "commit", "-am", "replacement"])
+      System.cmd("git", ["clone", "--bare", source, replacement_source])
+      System.cmd("git", ["-C", source, "reset", "--hard", "HEAD~1"])
+      File.mkdir_p!(workspace_root)
+      System.cmd("git", ["clone", source, workspace])
+
+      swap_command =
+        "quarantine=$PWD; cd ..; mv \"$quarantine\" #{saved}; " <>
+          "git clone #{replacement_source} \"$quarantine\" >/dev/null 2>&1"
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_durability_remote_url: source,
+        hook_before_remove: swap_command
+      )
+
+      assert {:error, :workspace_preservation_required, ""} =
+               Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+
+      assert File.read!(Path.join(saved, "README.md")) == "durable baseline\n"
+      refute File.exists?(workspace)
+
+      assert File.read!(Path.join(workspace <> ".symphony-cleanup", "README.md")) ==
+               "attacker replacement\n"
     after
       File.rm_rf(test_root)
     end
@@ -1507,7 +1955,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     """)
 
     File.chmod!(fake_ssh, 0o755)
-    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: remote_root)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: remote_root,
+      workspace_durability_remote_url: "git@example.test:repo.git"
+    )
 
     assert {:error, :workspace_preservation_required, ""} =
              Workspace.remove_exact_if_durable(remote_workspace, remote_root, worker_host)
@@ -1545,7 +1997,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         printf '%s\t%s\t%s\n' '__SYMPHONY_AFFINITY__' '#{remote_root}' '#{remote_workspace}'
         ;;
       *"__SYMPHONY_DURABILITY__"*)
-        sleep 2
+        sleep 3
         ;;
     esac
     """)
@@ -1554,11 +2006,351 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       workspace_root: remote_root,
-      hook_timeout_ms: 500
+      workspace_durability_remote_url: "git@example.test:repo.git",
+      hook_timeout_ms: 1_500
     )
 
     assert {:error, :workspace_preservation_required, ""} =
              Workspace.remove_exact_if_durable(remote_workspace, remote_root, worker_host)
+  end
+
+  test "remote terminal cleanup restores a workspace dirtied by before_remove" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-remote-post-hook-preservation-#{System.unique_integer([:positive])}"
+      )
+
+    worker_host = "worker-post-hook"
+    source = Path.join(test_root, "source")
+    remote_root = Path.join(test_root, "remote-workspaces")
+    remote_workspace = Path.join(remote_root, "DUD-156")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "durable baseline\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+    File.mkdir_p!(remote_root)
+    System.cmd("git", ["clone", source, remote_workspace])
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    case "$*" in
+      *"__SYMPHONY_AFFINITY__"*)
+        printf '%s\t%s\t%s\n' '__SYMPHONY_AFFINITY__' '#{remote_root}' '#{remote_workspace}'
+        ;;
+      *)
+        for last_arg do :; done
+        exec sh -lc "$last_arg"
+        ;;
+    esac
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: remote_root,
+      workspace_durability_remote_url: source,
+      hook_before_remove: "printf generated > post-hook.txt"
+    )
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(remote_workspace, remote_root, worker_host)
+
+    assert File.read!(Path.join(remote_workspace, "post-hook.txt")) == "generated"
+    assert File.read!(Path.join(remote_workspace, "README.md")) == "durable baseline\n"
+  end
+
+  test "remote terminal cleanup executes retained quarantine contract" do
+    {:ok, canonical_tmp} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+
+    test_root =
+      Path.join(
+        canonical_tmp,
+        "symphony-elixir-remote-retained-quarantine-#{System.unique_integer([:positive])}"
+      )
+
+    worker_host = "worker-retained-quarantine"
+    source = Path.join(test_root, "source")
+    remote_root = Path.join(test_root, "remote-workspaces")
+    remote_workspace = Path.join(remote_root, "DUD-158")
+    quarantine = remote_workspace <> ".symphony-cleanup"
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "durable remote bytes\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+    File.mkdir_p!(remote_root)
+    System.cmd("git", ["clone", source, remote_workspace])
+    original_inode = File.stat!(remote_workspace).inode
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    for last_arg do :; done
+    exec sh -lc "$last_arg"
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: remote_root,
+      workspace_durability_remote_url: source
+    )
+
+    assert {:ok, []} =
+             Workspace.remove_exact_if_durable(remote_workspace, remote_root, worker_host)
+
+    refute File.exists?(remote_workspace)
+    assert File.stat!(quarantine).inode == original_inode
+    assert File.read!(Path.join(quarantine, "README.md")) == "durable remote bytes\n"
+  end
+
+  test "remote terminal cleanup disables worker-controlled fsmonitor" do
+    {:ok, canonical_tmp} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+
+    test_root =
+      Path.join(
+        canonical_tmp,
+        "symphony-elixir-remote-fsmonitor-#{System.unique_integer([:positive])}"
+      )
+
+    worker_host = "worker-fsmonitor"
+    source = Path.join(test_root, "source")
+    remote_root = Path.join(test_root, "remote-workspaces")
+    remote_workspace = Path.join(remote_root, "DUD-158")
+    fsmonitor = Path.join(test_root, "worker-fsmonitor")
+    trace_file = Path.join(test_root, "fsmonitor.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "durable remote bytes\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+    File.mkdir_p!(remote_root)
+    System.cmd("git", ["clone", source, remote_workspace])
+
+    File.write!(fsmonitor, "#!/bin/sh\nprintf invoked >> '#{trace_file}'\n")
+    File.chmod!(fsmonitor, 0o755)
+    System.cmd("git", ["-C", remote_workspace, "config", "core.fsmonitor", fsmonitor])
+
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    for last_arg do :; done
+    exec sh -lc "$last_arg"
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: remote_root,
+      workspace_durability_remote_url: source
+    )
+
+    assert {:ok, []} =
+             Workspace.remove_exact_if_durable(remote_workspace, remote_root, worker_host)
+
+    refute File.exists?(trace_file)
+    assert File.dir?(remote_workspace <> ".symphony-cleanup")
+  end
+
+  test "remote terminal cleanup checks the decoded file URL path on the worker" do
+    {:ok, canonical_tmp} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+
+    test_root =
+      Path.join(
+        canonical_tmp,
+        "symphony-elixir-remote-decoded-boundary-#{System.unique_integer([:positive])}"
+      )
+
+    worker_host = "worker-decoded-boundary"
+    raw_source = Path.join(test_root, "%72epo.git")
+    decoded_source = Path.join(test_root, "repo.git")
+    remote_root = Path.join(test_root, "remote-workspaces")
+    remote_workspace = Path.join(remote_root, "DUD-158")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(raw_source)
+    File.write!(Path.join(raw_source, "README.md"), "durable remote bytes\n")
+    System.cmd("git", ["-C", raw_source, "init", "-b", "main"])
+    System.cmd("git", ["-C", raw_source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", raw_source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", raw_source, "add", "README.md"])
+    System.cmd("git", ["-C", raw_source, "commit", "-m", "durable baseline"])
+    File.mkdir_p!(remote_root)
+    System.cmd("git", ["clone", raw_source, remote_workspace])
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    case "$*" in
+      *"__SYMPHONY_DURABILITY__"*)
+        ln -s '#{remote_workspace}' '#{decoded_source}'
+        ;;
+    esac
+    for last_arg do :; done
+    exec sh -lc "$last_arg"
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: remote_root,
+      workspace_durability_remote_url: "file://#{raw_source}"
+    )
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(remote_workspace, remote_root, worker_host)
+
+    assert File.dir?(remote_workspace)
+    refute File.exists?(remote_workspace <> ".symphony-cleanup")
+  end
+
+  test "remote terminal cleanup fails closed when both paths are absent" do
+    {:ok, canonical_tmp} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+
+    test_root =
+      Path.join(
+        canonical_tmp,
+        "symphony-elixir-remote-missing-artifacts-#{System.unique_integer([:positive])}"
+      )
+
+    worker_host = "worker-missing-artifacts"
+    remote_root = Path.join(test_root, "remote-workspaces")
+    remote_workspace = Path.join(remote_root, "DUD-159")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(remote_root)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    for last_arg do :; done
+    exec sh -lc "$last_arg"
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: remote_root,
+      workspace_durability_remote_url: "/srv/git/repo.git"
+    )
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(remote_workspace, remote_root, worker_host)
+
+    refute File.exists?(remote_workspace)
+    refute File.exists?(remote_workspace <> ".symphony-cleanup")
+  end
+
+  test "remote terminal cleanup rejects a real-directory quarantine swap" do
+    {:ok, canonical_tmp} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+
+    test_root =
+      Path.join(
+        canonical_tmp,
+        "symphony-elixir-remote-directory-swap-#{System.unique_integer([:positive])}"
+      )
+
+    worker_host = "worker-directory-swap"
+    source = Path.join(test_root, "source")
+    replacement_source = Path.join(test_root, "replacement-source")
+    remote_root = Path.join(test_root, "remote-workspaces")
+    remote_workspace = Path.join(remote_root, "DUD-160")
+    saved = Path.join(test_root, "saved-original")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "durable original bytes\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+    File.write!(Path.join(source, "README.md"), "attacker replacement\n")
+    System.cmd("git", ["-C", source, "commit", "-am", "replacement"])
+    System.cmd("git", ["clone", "--bare", source, replacement_source])
+    System.cmd("git", ["-C", source, "reset", "--hard", "HEAD~1"])
+    File.mkdir_p!(remote_root)
+    System.cmd("git", ["clone", source, remote_workspace])
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    for last_arg do :; done
+    exec sh -lc "$last_arg"
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    swap_command =
+      "quarantine=$PWD; cd ..; mv \"$quarantine\" #{saved}; " <>
+        "git clone #{replacement_source} \"$quarantine\" >/dev/null 2>&1"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: remote_root,
+      workspace_durability_remote_url: source,
+      hook_before_remove: swap_command
+    )
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(remote_workspace, remote_root, worker_host)
+
+    assert File.read!(Path.join(saved, "README.md")) == "durable original bytes\n"
+    refute File.exists?(remote_workspace)
+
+    assert File.read!(Path.join(remote_workspace <> ".symphony-cleanup", "README.md")) ==
+             "attacker replacement\n"
   end
 
   test "mixed remote affinity keeps each absolute field immutable before prepare and exact cleanup" do

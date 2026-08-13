@@ -452,6 +452,13 @@ Fields:
   - `~` is expanded.
   - Relative paths are resolved relative to the directory containing `WORKFLOW.md`.
   - The effective workspace root is normalized to an absolute path before use.
+- `durability_remote_url` (credential-free network Git URL, OPTIONAL)
+  - REQUIRED before automatic terminal cleanup may finalize an existing workspace.
+  - Comes from operator-controlled workflow configuration, not workspace Git config.
+  - MUST NOT contain embedded credentials or control characters.
+  - Absolute paths, relative paths, and `file://` URLs MUST be rejected outside
+    test-only fixtures because a same-host source cannot provide an immutable
+    durability boundary.
 
 #### 5.3.4 `hooks` (object)
 
@@ -469,8 +476,9 @@ Fields:
     exists.
   - Failure is logged but ignored.
 - `before_remove` (multiline shell script string, OPTIONAL)
-  - Runs before workspace deletion if the directory exists.
-  - Failure is logged but ignored; cleanup still proceeds.
+  - Runs against the quarantined workspace before terminal lifecycle finalization.
+  - Failure is logged but ignored, but the post-hook durability proof still fails
+    closed if the hook changes tracked or untracked workspace state.
 - `timeout_ms` (integer, OPTIONAL)
   - Default: `60000`
   - Applies to all workspace hooks.
@@ -694,6 +702,8 @@ not require recognizing or validating extension fields unless that extension is 
     even if a legacy configuration also includes them here.
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
+- `workspace.durability_remote_url`: Git URL or path, default `null`; automatic
+  terminal cleanup fails closed while absent
 - `hooks.after_create`: shell script or null
 - `hooks.before_run`: shell script or null
 - `hooks.after_run`: shell script or null
@@ -857,7 +867,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - Resuming a wait atomically replaces the runner-side park with a durable `resume_queued` entry;
   normal exact-state eligibility still applies, and the next durable claim consumes the queue entry.
 - A redispatched issue continues with an incremented attempt and a new run id.
-- Startup terminal cleanup removes stale workspaces for issues already in terminal states.
+- Startup terminal cleanup finalizes stale workspace ownership for issues already
+  in terminal states while retaining the quarantined artifact.
 
 ## 8. Polling, Scheduling, and Reconciliation
 
@@ -1148,23 +1159,67 @@ Invariant 3: Workspace key is sanitized.
 
 ### 9.6 Automatic Terminal Cleanup Preservation Gate
 
-Automatic terminal cleanup is destructive and MUST fail closed unless the
-workspace is proven durable.
+Automatic terminal cleanup changes the active workspace pathname and MUST fail
+closed unless the workspace is proven durable.
 
-For a Git workspace, the implementation MUST verify before `before_remove` and
-repeat the verification immediately after that hook and before removal:
+The implementation MUST atomically rename the exact path to a deterministic
+quarantine under the captured workspace root before executing Git commands or
+`before_remove`. An interrupted cleanup with no persisted completion manifest
+MUST preserve that quarantine and remain `workspace_preservation_required` for
+operator recovery. For the quarantined Git workspace, the implementation MUST verify
+before `before_remove` and repeat the verification immediately after that hook:
 
 1. the exact persisted workspace path is still contained by its exact captured
    workspace root and worker host;
-2. no modified, staged, or untracked files exist;
-3. `git fetch --prune origin` succeeds; and
-4. `HEAD` is reachable from at least one freshly fetched remote ref.
+2. no modified, staged, or non-ignored untracked files exist; ignored files and
+   alternate refs remain safe because the retained quarantine is not deleted;
+3. a fresh fetch from operator-configured `workspace.durability_remote_url`
+   into a new runner-owned bare repository outside the workspace succeeds; and
+4. `HEAD` is reachable from a ref created by that exact external fetch.
+
+The cleanup MUST ignore `remote.origin.url`, repository-local URL rewrites,
+normal remote-tracking refs, and any other Git evidence writable by the worker.
+It MUST disable repository-controlled executable Git features, including
+`core.fsmonitor`, while inspecting the quarantined worktree. Production cleanup
+MUST reject mutable path-form and `file://` durability remotes.
+The external verifier MUST be removed after each proof attempt.
 
 If a pre-hook check fails, the implementation MUST NOT run `before_remove`. If
-either verification fails, it MUST NOT delete the workspace. It keeps the
-cleanup claim visible with bounded error code `workspace_preservation_required`.
+either verification fails, it MUST attempt to restore the quarantine to the exact
+recorded workspace path without overwriting any replacement path. A successful
+proof MUST retain the quarantine artifact rather than physically delete it. A
+failed proof keeps the cleanup claim visible with bounded error code
+`workspace_preservation_required`.
 A non-Git or unreachable workspace is not assumed disposable. Local and SSH
 workers follow the same contract.
+
+Durability proof and hook I/O MUST run outside the orchestrator GenServer in a
+supervised, bounded-concurrency cleanup task with one overall deadline. Status,
+pause, operator commands, polling, and snapshots remain responsive while that
+task runs. A stable preservation failure becomes operator-required and MUST NOT
+be retried on every poll. Only ledger request/completion persistence may be
+retried automatically without repeating workspace I/O.
+
+Cleanup authorization MUST use a durable lifecycle:
+
+1. `workspace_cleanup_requested` records the exact cleanup request and affinity.
+2. `workspace_cleanup_io_started` is appended before any cleanup I/O. On
+   restart, this transition MUST recover as operator-required because the
+   ledger cannot prove where the interrupted process stopped.
+3. `workspace_cleanup_operator_required` records only a bounded cleanup error.
+4. `workspace_cleanup_retry_requested` is the sole transition that authorizes
+   one new I/O attempt after operator-required recovery. It is emitted by an
+   explicit operator action such as `$retry`, never inferred from tracker state.
+5. `workspace_cleanup_io_completed` records that workspace I/O finished. On
+   restart, this state MUST retry only durable finalization and MUST NOT repeat
+   workspace I/O.
+6. `workspace_cleanup_completed` releases the cleanup claim.
+
+The lifecycle MUST reject reordered or duplicate I/O-start transitions unless
+an intervening explicit retry returned it to the pending state. A process crash
+after `workspace_cleanup_io_started`, including a crash before the child task
+actually begins, intentionally requires operator review rather than risking an
+automatic destructive replay.
 
 An operator may resolve the condition by committing and publishing the work,
 or by using a separately approved explicit cleanup path. A tracker state change
@@ -2390,11 +2445,26 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `after_create` hook runs only on new workspace creation
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
-- `before_remove` hook runs on cleanup and failures/timeouts are ignored
-- Automatic terminal cleanup preserves dirty, untracked, non-Git, unreachable,
+- `before_remove` hook runs only after the pre-hook durability proof; command
+  failure is ignored, but any resulting workspace change is caught by the
+  repeated post-hook durability proof
+- Automatic terminal cleanup preserves dirty, non-ignored untracked, non-Git, unreachable,
   and locally committed-but-unpublished workspaces
-- Automatic terminal cleanup succeeds for a clean workspace whose `HEAD` is
-  reachable from freshly fetched remote refs
+- Automatic terminal cleanup requires an operator-configured durability remote,
+  ignores worker-controlled remote configuration, and succeeds only when a clean
+  workspace's `HEAD` is reachable through a fresh fetch in a runner-owned bare verifier
+- Production rejects path-form and `file://` durability remotes, and
+  repository-controlled executable Git features are disabled during inspection
+- Automatic cleanup quarantines the exact workspace with an atomic rename,
+  restores that path after any failed pre-hook/post-hook proof, and preserves an
+  interrupted quarantine for operator recovery
+- Automatic cleanup never physically deletes the quarantined artifact; deletion
+  is an explicit operator or retention-policy action outside this lifecycle gate
+- Cleanup I/O is supervised outside the orchestrator, bounded to one task, and
+  deadline-limited; stable preservation failures do not retry every poll
+- Cleanup request, I/O start, operator-required, explicit retry, I/O completion,
+  and final completion are durable ordered states; restart never repeats I/O
+  without a recorded operator retry
 - Local and SSH cleanup failures expose `workspace_preservation_required`
 - Workspace path sanitization and root containment invariants are enforced before agent launch
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
