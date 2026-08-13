@@ -31,6 +31,7 @@ defmodule SymphonyElixir.Orchestrator do
   @poll_failure_backoff_base_ms 250
   @poll_failure_backoff_max_ms 5_000
   @refresh_call_timeout_ms 500
+  @max_workspace_cleanup_tasks 1
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -138,7 +139,7 @@ defmodule SymphonyElixir.Orchestrator do
           state =
             state
             |> retry_pending_operator_outcomes()
-            |> retry_pending_workspace_cleanups()
+            |> initialize_workspace_cleanup_recovery()
             |> schedule_tick(0)
 
           {:ok, state}
@@ -288,7 +289,7 @@ defmodule SymphonyElixir.Orchestrator do
       ) do
     case find_issue_id_for_ref(running, ref) do
       nil ->
-        {:noreply, state}
+        handle_workspace_cleanup_down(ref, reason, state)
 
       issue_id ->
         running_entry =
@@ -415,6 +416,60 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
+
+  def handle_info(:start_pending_workspace_cleanups, state) do
+    state = retry_pending_workspace_cleanups(state)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({ref, result}, state) when is_reference(ref) do
+    case cleanup_task_for_ref(state.cleanup_pending, ref) do
+      {issue_id, task_entry} ->
+        Process.demonitor(ref, [:flush])
+
+        state =
+          state
+          |> clear_workspace_cleanup_task(issue_id, task_entry)
+          |> apply_workspace_cleanup_result(issue_id, result)
+          |> retry_pending_workspace_cleanups()
+
+        notify_dashboard()
+        {:noreply, state}
+
+      nil ->
+        Logger.debug("Orchestrator ignored message: #{inspect({ref, result})}")
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(
+        {:workspace_cleanup_timeout, issue_id, timeout_token},
+        %{cleanup_pending: cleanup_pending} = state
+      ) do
+    case get_in(cleanup_pending, [issue_id, :cleanup_task]) do
+      %{timeout_token: ^timeout_token} = task_entry ->
+        _result = Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, task_entry.pid)
+        Process.demonitor(task_entry.ref, [:flush])
+
+        Logger.warning("Workspace cleanup timed out issue_id=#{issue_id}")
+
+        state =
+          state
+          |> clear_workspace_cleanup_task(issue_id, task_entry)
+          |> apply_workspace_cleanup_result(
+            issue_id,
+            {:error, :workspace_preservation_required, ""}
+          )
+          |> retry_pending_workspace_cleanups()
+
+        notify_dashboard()
+        {:noreply, state}
+
+      _other ->
+        {:noreply, state}
+    end
+  end
 
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
@@ -771,17 +826,23 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec reconcile_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
-    reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+    issues
+    |> reconcile_running_issue_states(state, active_state_set(), terminal_state_set())
+    |> retry_pending_workspace_cleanups_sync()
   end
 
   def reconcile_issue_states_for_test(issues, state) when is_list(issues) do
-    reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+    issues
+    |> reconcile_running_issue_states(state, active_state_set(), terminal_state_set())
+    |> retry_pending_workspace_cleanups_sync()
   end
 
   @doc false
   @spec reconcile_parked_issue_for_test(Issue.t(), term()) :: term()
   def reconcile_parked_issue_for_test(%Issue{} = issue, %State{} = state) do
-    reconcile_parked_issue(issue, state)
+    issue
+    |> reconcile_parked_issue(state)
+    |> retry_pending_workspace_cleanups_sync()
   end
 
   @doc false
@@ -827,7 +888,9 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec retry_pending_terminal_transitions_for_test(term()) :: term()
   def retry_pending_terminal_transitions_for_test(%State{} = state) do
-    retry_pending_terminal_transitions(state)
+    state
+    |> retry_pending_terminal_transitions()
+    |> retry_pending_workspace_cleanups_sync()
   end
 
   @doc false
@@ -1423,6 +1486,7 @@ defmodule SymphonyElixir.Orchestrator do
     Config.settings!().tracker.terminal_states
     |> Enum.map(&normalize_issue_state/1)
     |> Enum.filter(&(&1 != ""))
+    |> Enum.reject(&(OperatorWait.reason_for_tracker_state(&1) != nil))
     |> MapSet.new()
   end
 
@@ -2104,7 +2168,7 @@ defmodule SymphonyElixir.Orchestrator do
         state
         |> consume_pending_retry(issue_id)
         |> put_cleanup_pending(issue_id, %{cleanup_entry | status: :cleanup_pending})
-        |> perform_workspace_cleanup(issue_id)
+        |> retry_pending_workspace_cleanups()
 
       {:error, reason} ->
         Logger.error("Failed to persist workspace cleanup request issue_id=#{issue_id}: #{inspect(reason)}")
@@ -2143,48 +2207,424 @@ defmodule SymphonyElixir.Orchestrator do
     Enum.reduce(state.cleanup_pending, state, &retry_pending_workspace_cleanup/2)
   end
 
+  defp initialize_workspace_cleanup_recovery(state) do
+    if orchestrator_server_process?(state) do
+      send(self(), :start_pending_workspace_cleanups)
+      state
+    else
+      retry_pending_workspace_cleanups_sync(state)
+    end
+  end
+
   defp retry_pending_workspace_cleanup({issue_id, %{status: :request_pending} = entry}, state) do
     case append_workspace_cleanup_request(state, entry) do
       :ok ->
         state
         |> put_cleanup_pending(issue_id, %{entry | status: :cleanup_pending})
-        |> perform_workspace_cleanup(issue_id)
+        |> maybe_start_workspace_cleanup(issue_id)
 
       {:error, _reason} ->
         state
     end
   end
 
-  defp retry_pending_workspace_cleanup({issue_id, %{status: :cleanup_pending}}, state),
-    do: perform_workspace_cleanup(state, issue_id)
+  defp retry_pending_workspace_cleanup({issue_id, %{status: :cleanup_pending}}, state) do
+    maybe_start_workspace_cleanup(state, issue_id)
+  end
 
-  defp perform_workspace_cleanup(state, issue_id) do
+  defp retry_pending_workspace_cleanup(
+         {issue_id, %{status: :io_completion_pending} = entry},
+         state
+       ) do
+    case append_workspace_cleanup_io_completed(state, entry) do
+      :ok ->
+        state
+        |> put_cleanup_pending(issue_id, cleanup_completion_pending_entry(entry))
+        |> retry_pending_workspace_cleanup_completion(issue_id)
+
+      {:error, _reason} ->
+        state
+    end
+  end
+
+  defp retry_pending_workspace_cleanup({issue_id, %{status: :completion_pending} = entry}, state) do
+    retry_pending_workspace_cleanup_completion(state, issue_id, entry)
+  end
+
+  defp retry_pending_workspace_cleanup({_issue_id, %{status: :operator_required}}, state),
+    do: state
+
+  defp retry_pending_workspace_cleanup({_issue_id, %{status: :cleanup_running}}, state),
+    do: state
+
+  defp maybe_start_workspace_cleanup(state, issue_id) do
+    cond do
+      not orchestrator_server_process?(state) ->
+        state
+
+      active_workspace_cleanup_count(state.cleanup_pending) >= @max_workspace_cleanup_tasks ->
+        state
+
+      get_in(state.cleanup_pending, [issue_id, :cleanup_task]) != nil ->
+        state
+
+      true ->
+        entry = Map.fetch!(state.cleanup_pending, issue_id)
+
+        case append_workspace_cleanup_io_started(state, entry) do
+          :ok ->
+            state
+            |> put_cleanup_pending(issue_id, cleanup_running_entry(entry))
+            |> start_workspace_cleanup_task(issue_id)
+
+          {:error, reason} ->
+            Logger.error("Failed to persist workspace cleanup I/O start issue_id=#{issue_id}: #{inspect(reason)}")
+            put_cleanup_pending(state, issue_id, Map.put(entry, :persistence_error, reason))
+        end
+    end
+  end
+
+  defp start_workspace_cleanup_task(state, issue_id) do
+    entry = Map.fetch!(state.cleanup_pending, issue_id)
+    do_start_workspace_cleanup_task(state, issue_id, entry)
+  end
+
+  defp do_start_workspace_cleanup_task(state, issue_id, entry) do
+    timeout_ms = Config.settings!().hooks.timeout_ms
+
+    task =
+      Task.Supervisor.async_nolink(SymphonyElixir.TaskSupervisor, fn ->
+        perform_workspace_cleanup_io(entry)
+      end)
+
+    timeout_token = make_ref()
+
+    timeout_ref =
+      Process.send_after(
+        self(),
+        {:workspace_cleanup_timeout, issue_id, timeout_token},
+        timeout_ms
+      )
+
+    task_entry = %{
+      pid: task.pid,
+      ref: task.ref,
+      timeout_ref: timeout_ref,
+      timeout_token: timeout_token
+    }
+
+    update_in(state.cleanup_pending[issue_id], &Map.put(&1, :cleanup_task, task_entry))
+  catch
+    :exit, reason ->
+      Logger.warning("Unable to start workspace cleanup task issue_id=#{issue_id} reason=#{inspect(reason)}")
+      require_workspace_cleanup_operator(state, issue_id, entry, :workspace_preservation_required)
+  end
+
+  defp perform_workspace_cleanup_io(entry) do
+    if valid_expected_workspace_path?(entry.workspace_path) and
+         valid_expected_workspace_path?(entry.workspace_root) do
+      Workspace.remove_exact_if_durable(
+        entry.workspace_path,
+        entry.workspace_root,
+        entry.worker_host
+      )
+    else
+      {:error, :workspace_affinity_missing, ""}
+    end
+  end
+
+  defp apply_workspace_cleanup_result(state, issue_id, {:ok, _removed}) do
+    entry = Map.fetch!(state.cleanup_pending, issue_id)
+
+    case append_workspace_cleanup_io_completed(state, entry) do
+      :ok ->
+        put_cleanup_pending(state, issue_id, cleanup_completion_pending_entry(entry))
+
+      {:error, reason} ->
+        Logger.error("Workspace cleanup I/O completion remains pending issue_id=#{issue_id}: #{inspect(reason)}")
+
+        put_cleanup_pending(
+          state,
+          issue_id,
+          entry
+          |> Map.put(:status, :io_completion_pending)
+          |> Map.put(:persistence_error, reason)
+        )
+    end
+  end
+
+  defp apply_workspace_cleanup_result(state, issue_id, {:error, reason, _output}) do
+    Logger.error("Workspace cleanup requires operator recovery issue_id=#{issue_id}: #{inspect(reason)}")
+    entry = Map.fetch!(state.cleanup_pending, issue_id)
+    require_workspace_cleanup_operator(state, issue_id, entry, reason)
+  end
+
+  defp apply_workspace_cleanup_result(state, issue_id, {:error, reason}) do
+    apply_workspace_cleanup_result(state, issue_id, {:error, reason, ""})
+  end
+
+  defp apply_workspace_cleanup_result(state, issue_id, _invalid_result) do
+    apply_workspace_cleanup_result(
+      state,
+      issue_id,
+      {:error, :workspace_preservation_required, ""}
+    )
+  end
+
+  defp complete_workspace_cleanup(state, issue_id) do
+    %{
+      state
+      | cleanup_pending: Map.delete(state.cleanup_pending, issue_id),
+        claimed: MapSet.delete(state.claimed, issue_id)
+    }
+  end
+
+  defp retry_pending_workspace_cleanup_completion(state, issue_id) do
+    entry = Map.fetch!(state.cleanup_pending, issue_id)
+    retry_pending_workspace_cleanup_completion(state, issue_id, entry)
+  end
+
+  defp retry_pending_workspace_cleanup_completion(state, issue_id, entry) do
+    case append_workspace_cleanup_completed(state, entry) do
+      :ok -> complete_workspace_cleanup(state, issue_id)
+      {:error, _reason} -> state
+    end
+  end
+
+  defp cleanup_running_entry(entry) do
+    entry
+    |> Map.put(:status, :cleanup_running)
+    |> Map.delete(:cleanup_error)
+    |> Map.delete(:persistence_error)
+  end
+
+  defp cleanup_completion_pending_entry(entry) do
+    entry
+    |> Map.put(:status, :completion_pending)
+    |> Map.delete(:cleanup_task)
+    |> Map.delete(:cleanup_error)
+    |> Map.delete(:persistence_error)
+  end
+
+  defp clear_workspace_cleanup_task(state, issue_id, task_entry) do
+    if is_reference(task_entry.timeout_ref), do: Process.cancel_timer(task_entry.timeout_ref)
+
+    update_in(state.cleanup_pending[issue_id], fn
+      nil -> nil
+      entry -> Map.delete(entry, :cleanup_task)
+    end)
+  end
+
+  defp active_workspace_cleanup_count(cleanup_pending) do
+    Enum.count(cleanup_pending, fn {_issue_id, entry} -> Map.has_key?(entry, :cleanup_task) end)
+  end
+
+  defp cleanup_task_for_ref(cleanup_pending, ref) do
+    Enum.find_value(cleanup_pending, fn {issue_id, entry} ->
+      case Map.get(entry, :cleanup_task) do
+        %{ref: ^ref} = task_entry -> {issue_id, task_entry}
+        _other -> nil
+      end
+    end)
+  end
+
+  defp handle_workspace_cleanup_down(ref, reason, state) do
+    case cleanup_task_for_ref(state.cleanup_pending, ref) do
+      {issue_id, task_entry} ->
+        Logger.warning("Workspace cleanup task exited issue_id=#{issue_id} reason=#{inspect(reason)}")
+
+        state =
+          state
+          |> clear_workspace_cleanup_task(issue_id, task_entry)
+          |> apply_workspace_cleanup_result(
+            issue_id,
+            {:error, :workspace_preservation_required, ""}
+          )
+          |> retry_pending_workspace_cleanups()
+
+        notify_dashboard()
+        {:noreply, state}
+
+      nil ->
+        {:noreply, state}
+    end
+  end
+
+  defp orchestrator_server_process?(state) do
+    case GenServer.whereis(state.poll_owner_key || __MODULE__) do
+      pid when pid == self() -> true
+      _other -> false
+    end
+  catch
+    :exit, _reason -> false
+  end
+
+  defp retry_pending_workspace_cleanups_sync(%State{} = state) do
+    Enum.reduce(state.cleanup_pending, state, fn
+      {issue_id, %{status: :request_pending} = entry}, state_acc ->
+        case append_workspace_cleanup_request(state_acc, entry) do
+          :ok ->
+            state_acc
+            |> put_cleanup_pending(issue_id, %{entry | status: :cleanup_pending})
+            |> start_workspace_cleanup_sync(issue_id)
+
+          {:error, _reason} ->
+            state_acc
+        end
+
+      {issue_id, %{status: :cleanup_pending}}, state_acc ->
+        start_workspace_cleanup_sync(state_acc, issue_id)
+
+      {issue_id, %{status: :io_completion_pending} = entry}, state_acc ->
+        case append_workspace_cleanup_io_completed(state_acc, entry) do
+          :ok ->
+            state_acc
+            |> put_cleanup_pending(issue_id, cleanup_completion_pending_entry(entry))
+            |> retry_pending_workspace_cleanup_completion(issue_id)
+
+          {:error, _reason} ->
+            state_acc
+        end
+
+      {issue_id, %{status: :completion_pending} = entry}, state_acc ->
+        case append_workspace_cleanup_completed(state_acc, entry) do
+          :ok -> complete_workspace_cleanup(state_acc, issue_id)
+          {:error, _reason} -> state_acc
+        end
+
+      {_issue_id, _entry}, state_acc ->
+        state_acc
+    end)
+  end
+
+  defp start_workspace_cleanup_sync(state, issue_id) do
+    entry = Map.fetch!(state.cleanup_pending, issue_id)
+
+    case append_workspace_cleanup_io_started(state, entry) do
+      :ok ->
+        state
+        |> put_cleanup_pending(issue_id, cleanup_running_entry(entry))
+        |> perform_workspace_cleanup_sync(issue_id)
+
+      {:error, reason} ->
+        put_cleanup_pending(state, issue_id, Map.put(entry, :persistence_error, reason))
+    end
+  end
+
+  defp perform_workspace_cleanup_sync(state, issue_id) do
     entry = Map.fetch!(state.cleanup_pending, issue_id)
 
     with true <- valid_expected_workspace_path?(entry.workspace_path),
          true <- valid_expected_workspace_path?(entry.workspace_root),
          {:ok, _removed} <-
-           Workspace.remove_exact(entry.workspace_path, entry.workspace_root, entry.worker_host),
-         :ok <- append_workspace_cleanup_completed(state, entry) do
-      %{
-        state
-        | cleanup_pending: Map.delete(state.cleanup_pending, issue_id),
-          claimed: MapSet.delete(state.claimed, issue_id)
-      }
+           Workspace.remove_exact_if_durable(
+             entry.workspace_path,
+             entry.workspace_root,
+             entry.worker_host
+           ) do
+      persist_synchronous_workspace_cleanup_completion(state, issue_id, entry)
     else
       false ->
         Logger.error("Workspace cleanup pending because exact affinity is missing issue_id=#{issue_id}")
-        put_cleanup_pending(state, issue_id, Map.put(entry, :cleanup_error, :workspace_affinity_missing))
-
-      {:error, reason} ->
-        Logger.error("Workspace cleanup remains pending issue_id=#{issue_id}: #{inspect(reason)}")
-        put_cleanup_pending(state, issue_id, Map.put(entry, :cleanup_error, reason))
+        require_workspace_cleanup_operator(state, issue_id, entry, :workspace_affinity_missing)
 
       {:error, reason, _output} ->
         Logger.error("Workspace cleanup remains pending issue_id=#{issue_id}: #{inspect(reason)}")
-        put_cleanup_pending(state, issue_id, Map.put(entry, :cleanup_error, reason))
+        require_workspace_cleanup_operator(state, issue_id, entry, reason)
     end
   end
+
+  defp persist_synchronous_workspace_cleanup_completion(state, issue_id, entry) do
+    case append_workspace_cleanup_io_completed(state, entry) do
+      :ok ->
+        state
+        |> put_cleanup_pending(issue_id, cleanup_completion_pending_entry(entry))
+        |> retry_pending_workspace_cleanup_completion(issue_id)
+
+      {:error, reason} ->
+        put_cleanup_pending(
+          state,
+          issue_id,
+          entry
+          |> Map.put(:status, :io_completion_pending)
+          |> Map.put(:persistence_error, reason)
+        )
+    end
+  end
+
+  defp append_workspace_cleanup_io_started(state, entry) do
+    append_workspace_cleanup_lifecycle_event(state, entry, "workspace_cleanup_io_started")
+  end
+
+  defp append_workspace_cleanup_io_completed(state, entry) do
+    append_workspace_cleanup_lifecycle_event(state, entry, "workspace_cleanup_io_completed")
+  end
+
+  defp append_workspace_cleanup_operator_required(state, entry, cleanup_error) do
+    state
+    |> append_workspace_cleanup_lifecycle_event(
+      entry,
+      "workspace_cleanup_operator_required",
+      %{cleanup_error: cleanup_error}
+    )
+  end
+
+  defp append_workspace_cleanup_retry_requested(state, entry) do
+    append_workspace_cleanup_lifecycle_event(state, entry, "workspace_cleanup_retry_requested")
+  end
+
+  defp append_workspace_cleanup_lifecycle_event(state, entry, transition, extra \\ %{}) do
+    append_run_event(
+      state,
+      Map.merge(
+        %{
+          transition: transition,
+          stage: "cleanup",
+          run_id: entry.run_id,
+          issue_id: entry.issue_id,
+          issue_identifier: entry.identifier,
+          attempt: entry.attempt,
+          worker_host: entry.worker_host,
+          workspace_path: entry.workspace_path,
+          workspace_root: entry.workspace_root
+        },
+        extra
+      )
+    )
+  end
+
+  defp require_workspace_cleanup_operator(state, issue_id, entry, reason) do
+    cleanup_error = persisted_cleanup_error(reason)
+
+    entry =
+      entry
+      |> Map.put(:status, :operator_required)
+      |> Map.put(:cleanup_error, restored_cleanup_error(cleanup_error))
+      |> Map.delete(:cleanup_task)
+
+    case append_workspace_cleanup_operator_required(state, entry, cleanup_error) do
+      :ok ->
+        put_cleanup_pending(state, issue_id, Map.delete(entry, :persistence_error))
+
+      {:error, persistence_error} ->
+        put_cleanup_pending(state, issue_id, Map.put(entry, :persistence_error, persistence_error))
+    end
+  end
+
+  defp persisted_cleanup_error(:workspace_affinity_missing), do: "workspace_affinity_missing"
+
+  defp persisted_cleanup_error(:workspace_preservation_required),
+    do: "workspace_preservation_required"
+
+  defp persisted_cleanup_error(_reason), do: "workspace_cleanup_failed"
+
+  defp restored_cleanup_error("workspace_affinity_missing"), do: :workspace_affinity_missing
+
+  defp restored_cleanup_error("workspace_preservation_required"),
+    do: :workspace_preservation_required
+
+  defp restored_cleanup_error(nil), do: :workspace_preservation_required
+  defp restored_cleanup_error(_reason), do: :workspace_cleanup_failed
 
   defp append_workspace_cleanup_completed(state, entry) do
     append_run_event(state, %{
@@ -2210,7 +2650,7 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_path: Map.get(running_entry, :workspace_path),
       workspace_root: Map.get(running_entry, :workspace_root),
       terminal_reason: "tracker_terminal",
-      status: :cleanup_pending
+      status: :request_pending
     }
   end
 
@@ -2604,6 +3044,21 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec retry_workspace_cleanup(String.t()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def retry_workspace_cleanup(issue_id),
+    do: retry_workspace_cleanup(__MODULE__, issue_id)
+
+  @spec retry_workspace_cleanup(GenServer.server(), String.t()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def retry_workspace_cleanup(server, issue_id) when is_binary(issue_id) do
+    if GenServer.whereis(server) do
+      GenServer.call(server, {:retry_workspace_cleanup, issue_id})
+    else
+      :unavailable
+    end
+  end
+
   @spec resolve_wait(String.t(), String.t(), String.t()) ::
           {:ok, map()} | {:error, term()} | :unavailable
   def resolve_wait(issue_id, wait_id, action),
@@ -2662,6 +3117,13 @@ defmodule SymphonyElixir.Orchestrator do
 
       wait ->
         resolve_operator_wait(state, wait, action)
+    end
+  end
+
+  def handle_call({:retry_workspace_cleanup, issue_id}, _from, state) do
+    case request_workspace_cleanup_retry(state, issue_id) do
+      {:ok, payload, updated_state} -> {:reply, {:ok, payload}, updated_state}
+      {:error, reason, unchanged_state} -> {:reply, {:error, reason}, unchanged_state}
     end
   end
 
@@ -3200,7 +3662,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     state
     |> put_cleanup_pending(issue_id, cleanup_entry)
-    |> perform_workspace_cleanup(issue_id)
+    |> retry_pending_workspace_cleanups()
   end
 
   defp finish_terminal_stop(state, issue_id, _running_entry, false),
@@ -3396,6 +3858,7 @@ defmodule SymphonyElixir.Orchestrator do
     state.running
     |> Map.keys()
     |> Enum.concat(Map.keys(state.parked))
+    |> Enum.concat(Map.keys(state.cleanup_pending))
     |> MapSet.new()
   end
 
@@ -3553,7 +4016,39 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp apply_operator_comment(state, issue_id, comment, "retry") do
+    case Map.get(state.cleanup_pending, issue_id) do
+      %{status: :operator_required} ->
+        case request_workspace_cleanup_retry(state, issue_id) do
+          {:ok, _payload, updated_state} ->
+            record_operator_command_outcome(
+              updated_state,
+              issue_id,
+              comment,
+              "retry",
+              "operator_command_applied"
+            )
+
+          {:error, _reason, unchanged_state} ->
+            record_operator_command_outcome(
+              unchanged_state,
+              issue_id,
+              comment,
+              "retry",
+              "operator_command_rejected"
+            )
+        end
+
+      _cleanup ->
+        apply_operator_wait_comment(state, issue_id, comment, "retry")
+    end
+  end
+
   defp apply_operator_comment(state, issue_id, comment, action) do
+    apply_operator_wait_comment(state, issue_id, comment, action)
+  end
+
+  defp apply_operator_wait_comment(state, issue_id, comment, action) do
     case Map.get(state.parked, issue_id) do
       nil ->
         record_operator_command_outcome(
@@ -3584,6 +4079,42 @@ defmodule SymphonyElixir.Orchestrator do
               "operator_command_rejected"
             )
         end
+    end
+  end
+
+  defp request_workspace_cleanup_retry(state, issue_id) do
+    case Map.get(state.cleanup_pending, issue_id) do
+      %{status: :operator_required} = entry ->
+        case append_workspace_cleanup_retry_requested(state, entry) do
+          :ok ->
+            updated_entry =
+              entry
+              |> Map.put(:status, :cleanup_pending)
+              |> Map.delete(:cleanup_error)
+              |> Map.delete(:persistence_error)
+
+            updated_state =
+              state
+              |> put_cleanup_pending(issue_id, updated_entry)
+              |> retry_pending_workspace_cleanups()
+
+            {:ok,
+             %{
+               issue_id: issue_id,
+               run_id: entry.run_id,
+               retry_requested: true,
+               requested_at: DateTime.utc_now()
+             }, updated_state}
+
+          {:error, reason} ->
+            {:error, {:ledger_write_failed, reason}, state}
+        end
+
+      nil ->
+        {:error, :cleanup_not_found, state}
+
+      _entry ->
+        {:error, :cleanup_retry_not_allowed, state}
     end
   end
 
@@ -3857,22 +4388,39 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp restore_cleanup_pending(events) when is_map(events) do
     Map.new(events, fn {issue_id, event} ->
+      status = restored_cleanup_status(event["cleanup_status"])
+
       {issue_id,
-       %{
-         issue_id: issue_id,
-         run_id: event["run_id"],
-         identifier: event["issue_identifier"],
-         attempt: event["attempt"],
-         worker_host: event["worker_host"],
-         workspace_path: event["workspace_path"],
-         workspace_root: event["workspace_root"],
-         terminal_reason: event["terminal_reason"] || "tracker_terminal",
-         status: :cleanup_pending
-       }}
+       maybe_restore_cleanup_error(
+         %{
+           issue_id: issue_id,
+           run_id: event["run_id"],
+           identifier: event["issue_identifier"],
+           attempt: event["attempt"],
+           worker_host: event["worker_host"],
+           workspace_path: event["workspace_path"],
+           workspace_root: event["workspace_root"],
+           terminal_reason: event["terminal_reason"] || "tracker_terminal",
+           status: status
+         },
+         status,
+         event["cleanup_error"]
+       )}
     end)
   end
 
   defp restore_cleanup_pending(_events), do: %{}
+
+  defp restored_cleanup_status("cleanup_pending"), do: :cleanup_pending
+  defp restored_cleanup_status("operator_required"), do: :operator_required
+  defp restored_cleanup_status("completion_pending"), do: :completion_pending
+  defp restored_cleanup_status(_legacy), do: :request_pending
+
+  defp maybe_restore_cleanup_error(entry, :operator_required, cleanup_error) do
+    Map.put(entry, :cleanup_error, restored_cleanup_error(cleanup_error))
+  end
+
+  defp maybe_restore_cleanup_error(entry, _status, _cleanup_error), do: entry
 
   defp queued_resume_from_ledger_event(event) do
     case DateTime.from_iso8601(event["occurred_at"]) do
@@ -3951,6 +4499,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_pending_error(%{cleanup_error: :workspace_affinity_missing}),
     do: "workspace_affinity_missing"
+
+  defp cleanup_pending_error(%{cleanup_error: :workspace_preservation_required}),
+    do: "workspace_preservation_required"
 
   defp cleanup_pending_error(%{cleanup_error: _reason}), do: "workspace_cleanup_failed"
   defp cleanup_pending_error(_cleanup), do: "workspace_cleanup_pending"

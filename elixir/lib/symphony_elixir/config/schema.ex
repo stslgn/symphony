@@ -127,15 +127,174 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    alias SymphonyElixir.PathSafety
+
+    @allow_test_local_durability_remotes Application.compile_env(
+                                           :symphony_elixir,
+                                           :allow_test_local_durability_remotes,
+                                           false
+                                         )
+
     @primary_key false
     embedded_schema do
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:durability_remote_url, :string)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root], empty_values: [])
+      |> cast(attrs, [:root, :durability_remote_url], empty_values: [])
+      |> validate_change(:durability_remote_url, &validate_durability_remote_url/2)
+      |> validate_durability_remote_boundary()
+    end
+
+    defp validate_durability_remote_url(field, value) do
+      if valid_durability_remote_url?(value),
+        do: [],
+        else: [{field, "must be a credential-free network Git URL"}]
+    end
+
+    defp valid_durability_remote_url?(value) do
+      value == String.trim(value) and value != "" and not contains_control_character?(value) and
+        valid_durability_remote_shape?(value)
+    end
+
+    defp contains_control_character?(value) do
+      value
+      |> String.to_charlist()
+      |> Enum.any?(fn codepoint -> codepoint < 32 or codepoint in 127..159 end)
+    end
+
+    defp valid_durability_remote_shape?("git@" <> rest) do
+      case String.split(rest, ":", parts: 2) do
+        [host, path] -> valid_remote_host?(host) and valid_ssh_repository_path?(path)
+        _parts -> false
+      end
+    end
+
+    defp valid_durability_remote_shape?(value) do
+      if Path.type(value) == :absolute,
+        do: @allow_test_local_durability_remotes,
+        else: valid_durability_uri?(URI.parse(value))
+    end
+
+    defp valid_durability_uri?(%URI{
+           scheme: scheme,
+           host: host,
+           userinfo: nil,
+           query: nil,
+           fragment: nil
+         })
+         when scheme in ["https", "git"] and is_binary(host),
+         do: valid_remote_host?(host)
+
+    defp valid_durability_uri?(%URI{
+           scheme: "ssh",
+           host: host,
+           userinfo: userinfo,
+           path: path,
+           query: nil,
+           fragment: nil
+         })
+         when is_binary(host) and (is_nil(userinfo) or userinfo == "git"),
+         do: valid_remote_host?(host) and valid_ssh_repository_path?(path)
+
+    defp valid_durability_uri?(%URI{
+           scheme: "file",
+           host: host,
+           userinfo: nil,
+           path: path,
+           query: nil,
+           fragment: nil
+         }),
+         do:
+           @allow_test_local_durability_remotes and host in [nil, ""] and is_binary(path) and
+             Path.type(path) == :absolute
+
+    defp valid_durability_uri?(_uri), do: false
+
+    defp valid_remote_host?(host) do
+      host != "" and not String.starts_with?(host, "-") and
+        Regex.match?(~r/\A[A-Za-z0-9._:-]+\z/, host)
+    end
+
+    defp valid_ssh_repository_path?(path) when is_binary(path) do
+      path != "" and not String.starts_with?(path, "-") and
+        Regex.match?(~r/\A[A-Za-z0-9._~\/-]+\z/, path)
+    end
+
+    defp valid_ssh_repository_path?(_path), do: false
+
+    defp validate_durability_remote_boundary(changeset) do
+      root = get_field(changeset, :root)
+      remote_url = get_field(changeset, :durability_remote_url)
+
+      case local_durability_path(remote_url) do
+        {:ok, remote_path} ->
+          with {:ok, canonical_root} <- PathSafety.canonicalize(root),
+               {:ok, canonical_remote} <- PathSafety.canonicalize(remote_path),
+               false <- path_at_or_below?(canonical_remote, canonical_root) do
+            changeset
+          else
+            true ->
+              add_error(
+                changeset,
+                :durability_remote_url,
+                "must be outside workspace.root"
+              )
+
+            {:error, _reason} ->
+              add_error(
+                changeset,
+                :durability_remote_url,
+                "must resolve outside workspace.root"
+              )
+          end
+
+        :external ->
+          changeset
+
+        :invalid ->
+          add_error(
+            changeset,
+            :durability_remote_url,
+            "must contain a valid absolute file URL path"
+          )
+      end
+    end
+
+    defp local_durability_path(value) when is_binary(value) do
+      cond do
+        Path.type(value) == :absolute ->
+          {:ok, value}
+
+        String.starts_with?(value, "file://") ->
+          case URI.parse(value) do
+            %URI{scheme: "file", host: host, path: path}
+            when host in [nil, ""] and is_binary(path) ->
+              decode_uri_path(path)
+
+            _uri ->
+              :external
+          end
+
+        true ->
+          :external
+      end
+    end
+
+    defp local_durability_path(_value), do: :external
+
+    defp decode_uri_path(path) do
+      if Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, path),
+        do: :invalid,
+        else: {:ok, URI.decode(path)}
+    end
+
+    defp path_at_or_below?(path, root) do
+      relative = Path.relative_to(path, root)
+      path == root or (Path.type(relative) == :relative and hd(Path.split(relative)) != "..")
     end
   end
 

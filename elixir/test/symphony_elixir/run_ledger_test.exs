@@ -1280,15 +1280,128 @@ defmodule SymphonyElixir.RunLedgerTest do
     cleanup_path = ledger_path()
     append_cleanup_run!(cleanup_path)
     cleanup_requested = cleanup_requested_event()
+    cleanup_io_started = cleanup_lifecycle_event("workspace_cleanup_io_started")
+    cleanup_io_completed = cleanup_lifecycle_event("workspace_cleanup_io_completed")
     cleanup_completed = cleanup_completed_event()
 
     assert :ok = RunLedger.append(cleanup_path, cleanup_requested)
     assert :ok = RunLedger.append(cleanup_path, cleanup_requested)
+    assert :ok = RunLedger.append(cleanup_path, cleanup_io_started)
+    assert :ok = RunLedger.append(cleanup_path, cleanup_io_completed)
     assert :ok = RunLedger.append(cleanup_path, cleanup_completed)
     assert :ok = RunLedger.append(cleanup_path, cleanup_completed)
     assert {:ok, _events} = RunLedger.read_events(cleanup_path)
 
     assert {:ok, recovery} = RunLedger.reconcile_startup(cleanup_path, "runner-new")
+    assert recovery.cleanup_pending == %{}
+  end
+
+  test "cleanup I/O lifecycle recovers fail-closed and requires an explicit retry" do
+    path = ledger_path()
+    append_cleanup_run!(path)
+
+    assert :ok = RunLedger.append(path, cleanup_requested_event())
+    assert :ok = RunLedger.append(path, cleanup_lifecycle_event("workspace_cleanup_io_started"))
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-after-start")
+
+    assert recovery.cleanup_pending["issue-cleanup"]["cleanup_status"] ==
+             "operator_required"
+
+    operator_required =
+      cleanup_lifecycle_event("workspace_cleanup_operator_required")
+      |> Map.put(:cleanup_error, "workspace_preservation_required")
+
+    assert :ok = RunLedger.append(path, operator_required)
+    assert :ok = RunLedger.append(path, cleanup_lifecycle_event("workspace_cleanup_retry_requested"))
+
+    assert {:ok, retry_recovery} = RunLedger.reconcile_startup(path, "runner-after-retry")
+    assert retry_recovery.cleanup_pending["issue-cleanup"]["cleanup_status"] == "cleanup_pending"
+
+    assert :ok = RunLedger.append(path, cleanup_lifecycle_event("workspace_cleanup_io_started"))
+    assert :ok = RunLedger.append(path, cleanup_lifecycle_event("workspace_cleanup_io_completed"))
+
+    assert {:ok, completed_io_recovery} =
+             RunLedger.reconcile_startup(path, "runner-after-io-completed")
+
+    assert completed_io_recovery.cleanup_pending["issue-cleanup"]["cleanup_status"] ==
+             "completion_pending"
+  end
+
+  test "cleanup lifecycle rejects automatic I/O replay and unbounded error values" do
+    replay_path = ledger_path()
+    append_cleanup_run!(replay_path)
+    assert :ok = RunLedger.append(replay_path, cleanup_requested_event())
+    assert :ok = RunLedger.append(replay_path, cleanup_lifecycle_event("workspace_cleanup_io_started"))
+    assert :ok = RunLedger.append(replay_path, cleanup_lifecycle_event("workspace_cleanup_io_started"))
+
+    assert_sequence_error(
+      replay_path,
+      6,
+      "workspace_cleanup_io_started",
+      :invalid_cleanup_lifecycle
+    )
+
+    premature_completion_path = ledger_path()
+    append_cleanup_run!(premature_completion_path)
+    assert :ok = RunLedger.append(premature_completion_path, cleanup_requested_event())
+
+    assert :ok =
+             RunLedger.append(
+               premature_completion_path,
+               cleanup_lifecycle_event("workspace_cleanup_io_started")
+             )
+
+    assert :ok = RunLedger.append(premature_completion_path, cleanup_completed_event())
+
+    assert_sequence_error(
+      premature_completion_path,
+      6,
+      "workspace_cleanup_completed",
+      :cleanup_io_not_completed
+    )
+
+    failed_io_path = ledger_path()
+    append_cleanup_run!(failed_io_path)
+    assert :ok = RunLedger.append(failed_io_path, cleanup_requested_event())
+    assert :ok = RunLedger.append(failed_io_path, cleanup_lifecycle_event("workspace_cleanup_io_started"))
+
+    assert :ok =
+             RunLedger.append(
+               failed_io_path,
+               cleanup_lifecycle_event("workspace_cleanup_operator_required")
+               |> Map.put(:cleanup_error, "workspace_preservation_required")
+             )
+
+    assert :ok = RunLedger.append(failed_io_path, cleanup_lifecycle_event("workspace_cleanup_io_completed"))
+
+    assert_sequence_error(
+      failed_io_path,
+      7,
+      "workspace_cleanup_io_completed",
+      :invalid_cleanup_lifecycle
+    )
+
+    error_path = ledger_path()
+    append_cleanup_run!(error_path)
+    assert :ok = RunLedger.append(error_path, cleanup_requested_event())
+    assert :ok = RunLedger.append(error_path, cleanup_lifecycle_event("workspace_cleanup_io_started"))
+
+    assert {:error, {:invalid_field, "cleanup_error"}} =
+             RunLedger.append(
+               error_path,
+               cleanup_lifecycle_event("workspace_cleanup_operator_required")
+               |> Map.put(:cleanup_error, "raw exception with secrets")
+             )
+  end
+
+  test "accepts a legacy cleanup completion without lifecycle transitions" do
+    path = ledger_path()
+    append_cleanup_run!(path)
+
+    assert :ok = RunLedger.append(path, cleanup_completed_event())
+    assert {:ok, _events} = RunLedger.read_events(path)
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-after-legacy-cleanup")
     assert recovery.cleanup_pending == %{}
   end
 
@@ -1626,6 +1739,20 @@ defmodule SymphonyElixir.RunLedgerTest do
   defp cleanup_completed_event do
     %{
       transition: "workspace_cleanup_completed",
+      stage: "cleanup",
+      run_id: "run-cleanup",
+      issue_id: "issue-cleanup",
+      issue_identifier: "DUD-CLEANUP",
+      attempt: 1,
+      worker_host: "worker-a",
+      workspace_path: "/tmp/DUD-CLEANUP",
+      workspace_root: "/tmp"
+    }
+  end
+
+  defp cleanup_lifecycle_event(transition) do
+    %{
+      transition: transition,
       stage: "cleanup",
       run_id: "run-cleanup",
       issue_id: "issue-cleanup",

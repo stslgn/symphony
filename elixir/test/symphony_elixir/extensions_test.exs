@@ -1508,9 +1508,26 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert MapSet.member?(restarted.claimed, issue_id)
 
     assert %{
-             status: :cleanup_pending,
-             cleanup_error: {:workspace_outside_root, _canonical_workspace, _canonical_root}
+             status: :operator_required,
+             cleanup_error: :workspace_cleanup_failed
            } = restarted.cleanup_pending[issue_id]
+
+    assert {:ok, before_restart_events} = RunLedger.read_events(ledger_path)
+
+    assert {:ok, restarted_again} = Orchestrator.init(run_ledger_path: ledger_path)
+
+    if is_reference(restarted_again.tick_timer_ref),
+      do: Process.cancel_timer(restarted_again.tick_timer_ref)
+
+    assert restarted_again.cleanup_pending[issue_id].status == :operator_required
+    assert File.read!(sentinel) == "preserve"
+    assert {:ok, after_restart_events} = RunLedger.read_events(ledger_path)
+
+    assert Enum.count(before_restart_events, &(&1["transition"] == "workspace_cleanup_io_started")) ==
+             1
+
+    assert Enum.count(after_restart_events, &(&1["transition"] == "workspace_cleanup_io_started")) ==
+             1
 
     assert {:reply, raw_snapshot, _state} =
              Orchestrator.handle_call(:snapshot, {self(), make_ref()}, restarted)
@@ -1541,7 +1558,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert Enum.find(missing_snapshot.retrying, &(&1.stage == "cleanup_pending")).error ==
              "workspace_affinity_missing"
 
-    for code <- ~w(workspace_cleanup_pending workspace_cleanup_failed workspace_affinity_missing) do
+    for code <- ~w(workspace_cleanup_pending workspace_cleanup_failed workspace_affinity_missing workspace_preservation_required) do
       assert SymphonyElixir.ObservabilitySanitizer.retry_error_code(code) == code
     end
 

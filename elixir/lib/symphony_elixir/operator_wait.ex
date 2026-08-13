@@ -83,6 +83,7 @@ defmodule SymphonyElixir.OperatorWait do
       "human review" -> "waiting_owner"
       "human clarification" -> "waiting_owner"
       "deploy ready" -> "waiting_live_approval"
+      "blocked" -> "waiting_infrastructure"
       _other -> nil
     end
   end
