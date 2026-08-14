@@ -285,6 +285,7 @@ defmodule SymphonyElixir.WorkflowStore do
         kind: Map.get(tracker, "kind"),
         endpoint: Map.get(tracker, "endpoint", "https://api.linear.app/graphql"),
         api_key_selector: Map.get(tracker, "api_key"),
+        webhook_secret_selector: Map.get(tracker, "webhook_secret"),
         project_slug: Map.get(tracker, "project_slug"),
         operator_user_ids: if(is_list(operator_user_ids), do: Enum.sort(operator_user_ids), else: operator_user_ids)
       }

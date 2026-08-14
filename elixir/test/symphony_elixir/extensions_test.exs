@@ -205,6 +205,7 @@ defmodule SymphonyElixir.ExtensionsTest do
               kind: "linear",
               endpoint: "https://api.linear.app/graphql",
               api_key_selector: "token",
+              webhook_secret_selector: nil,
               project_slug: "project",
               operator_user_ids: []
             }} = WorkflowStore.authority_generation()
@@ -214,6 +215,7 @@ defmodule SymphonyElixir.ExtensionsTest do
               kind: "linear",
               endpoint: "https://api.linear.app/graphql",
               api_key_selector: "token",
+              webhook_secret_selector: nil,
               project_slug: "project"
             }} = WorkflowStore.tracker_authority_generation()
 
@@ -312,6 +314,29 @@ defmodule SymphonyElixir.ExtensionsTest do
 
       assert Process.alive?(Process.whereis(WorkflowStore))
     end)
+  end
+
+  test "webhook secret selector changes invalidate pinned tracker authority" do
+    ensure_workflow_store_running()
+    workflow_path = Workflow.workflow_file_path()
+
+    write_workflow_file!(workflow_path,
+      tracker_kind: "memory",
+      tracker_webhook_secret: "$SYMP_TEST_WEBHOOK_SECRET_A"
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+    context = Tracker.current_poll_context()
+    initial_generation = WorkflowStore.tracker_authority_generation()
+
+    write_workflow_file!(workflow_path,
+      tracker_kind: "memory",
+      tracker_webhook_secret: "$SYMP_TEST_WEBHOOK_SECRET_B"
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+    refute WorkflowStore.tracker_authority_generation() == initial_generation
+    refute Tracker.authority_valid?(context)
   end
 
   test "workflow store start_link and poll callback cover missing-file error paths" do
