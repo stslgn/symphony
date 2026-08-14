@@ -187,6 +187,18 @@ defmodule SymphonyElixir.ExtensionsTest do
               project_slug: "project"
             }} = WorkflowStore.tracker_authority_generation()
 
+    invalid_tracker_path =
+      Path.join(Path.dirname(third_workflow), "INVALID_TRACKER_AUTHORITY_WORKFLOW.md")
+
+    File.write!(
+      invalid_tracker_path,
+      "---\ntracker: []\n---\n## Symphony Runtime Prompt\nInvalid tracker authority fixture\n"
+    )
+
+    Workflow.set_workflow_file_path(invalid_tracker_path)
+    assert {:standalone, {:invalid_tracker, []}} = WorkflowStore.authority_generation()
+    assert {:standalone, {:invalid_tracker, []}} = WorkflowStore.tracker_authority_generation()
+
     missing_path = Path.join(Path.dirname(third_workflow), "MISSING_AUTHORITY_WORKFLOW.md")
     Workflow.set_workflow_file_path(missing_path)
 
