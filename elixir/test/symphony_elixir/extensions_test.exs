@@ -561,6 +561,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert {:ok, %{runtime_sha256: ^runtime_digest}} = StartupAttestation.admit(opts)
 
+    File.chmod!(runtime_image, 0o600)
     File.write!(runtime_image, "runtime-b")
 
     assert {:error, {:runtime_image_digest_mismatch, ^runtime_digest, actual_digest}} =

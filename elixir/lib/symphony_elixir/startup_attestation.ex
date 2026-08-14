@@ -129,21 +129,28 @@ defmodule SymphonyElixir.StartupAttestation do
 
   defp verify_runtime_digest(expected, opts) do
     if managed?() do
-      with {:ok, expected_path} <- runtime_image_path(),
-           {:ok, script_path} <- executing_script_path(opts),
-           :ok <- compare_runtime_paths(expected_path, script_path),
-           :ok <- validate_runtime_image(expected_path),
-           {:ok, content} <- read_runtime_image(expected_path) do
-        actual = :sha256 |> :crypto.hash(content) |> Base.encode16(case: :lower)
-
-        if actual == String.downcase(expected) do
-          {:ok, actual}
-        else
-          {:error, {:runtime_image_digest_mismatch, expected, actual}}
-        end
-      end
+      verify_managed_runtime_digest(expected, opts)
     else
       {:ok, expected}
+    end
+  end
+
+  defp verify_managed_runtime_digest(expected, opts) do
+    with {:ok, expected_path} <- runtime_image_path(),
+         {:ok, script_path} <- executing_script_path(opts),
+         :ok <- compare_runtime_paths(expected_path, script_path),
+         :ok <- validate_runtime_image(expected_path),
+         {:ok, content} <- read_runtime_image(expected_path) do
+      actual = :sha256 |> :crypto.hash(content) |> Base.encode16(case: :lower)
+      compare_runtime_digests(expected, actual)
+    end
+  end
+
+  defp compare_runtime_digests(expected, actual) do
+    if actual == String.downcase(expected) do
+      {:ok, actual}
+    else
+      {:error, {:runtime_image_digest_mismatch, expected, actual}}
     end
   end
 
