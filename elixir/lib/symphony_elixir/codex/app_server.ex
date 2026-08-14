@@ -12,6 +12,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @worker_secret_env_names ~w(
+    LINEAR_API_KEY
+    LINEAR_WEBHOOK_SECRET
+    LINEAR_KEYCHAIN_SERVICE
+    LINEAR_KEYCHAIN_PATH
+    LINEAR_KEYCHAIN_ACCOUNT
+    LINEAR_WEBHOOK_KEYCHAIN_SERVICE
+  )
 
   @type session :: %{
           port: port(),
@@ -286,6 +294,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
+      command = worker_launch_command(Config.settings!().codex.command)
+
       port =
         Port.open(
           {:spawn_executable, String.to_charlist(executable)},
@@ -293,8 +303,9 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
+            args: [~c"-lc", String.to_charlist("exec " <> command)],
             cd: String.to_charlist(workspace),
+            env: scrubbed_worker_port_env(),
             line: @port_line_bytes
           ]
         )
@@ -305,15 +316,28 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp start_port(workspace, worker_host) when is_binary(worker_host) do
     remote_command = remote_launch_command(workspace)
-    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+
+    SSH.start_port(worker_host, remote_command,
+      line: @port_line_bytes,
+      env: scrubbed_worker_port_env()
+    )
   end
 
   defp remote_launch_command(workspace) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
-      "exec #{Config.settings!().codex.command}"
+      "exec #{worker_launch_command(Config.settings!().codex.command)}"
     ]
     |> Enum.join(" && ")
+  end
+
+  defp worker_launch_command(command) when is_binary(command) do
+    unset_args = Enum.map_join(@worker_secret_env_names, " ", &"-u #{&1}")
+    "env #{unset_args} #{command}"
+  end
+
+  defp scrubbed_worker_port_env do
+    Enum.map(@worker_secret_env_names, &{String.to_charlist(&1), false})
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do

@@ -3,9 +3,126 @@ defmodule SymphonyElixir.AppServerTest do
 
   alias SymphonyElixir.Codex.AppServer, as: RealAppServer
 
+  @tracker_secret_env_names ~w(
+    LINEAR_API_KEY
+    LINEAR_WEBHOOK_SECRET
+    LINEAR_KEYCHAIN_SERVICE
+    LINEAR_KEYCHAIN_PATH
+    LINEAR_KEYCHAIN_ACCOUNT
+    LINEAR_WEBHOOK_KEYCHAIN_SERVICE
+  )
+
   test "app server rejects a missing tracker context before workspace or port setup" do
     assert {:error, :tracker_context_required} =
              RealAppServer.start_session("/missing/workspace")
+  end
+
+  test "local app server subprocess cannot inherit tracker credentials or selectors" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-secret-env-#{System.unique_integer([:positive])}"
+      )
+
+    previous_env = Map.new(@tracker_secret_env_names, &{&1, System.get_env(&1)})
+    previous_trace = System.get_env("SYMP_TEST_APP_ENV_TRACE")
+
+    on_exit(fn ->
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+      restore_env("SYMP_TEST_APP_ENV_TRACE", previous_trace)
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-SECRET-ENV")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "app-server.env")
+
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_APP_ENV_TRACE", trace_file)
+
+      Enum.each(@tracker_secret_env_names, fn name ->
+        System.put_env(name, "test-only-#{String.downcase(name)}")
+      end)
+
+      env_probe =
+        Enum.map_join(@tracker_secret_env_names, "\n", fn name ->
+          "printf 'START:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> \"$trace_file\""
+        end)
+
+      turn_env_probe =
+        Enum.map_join(@tracker_secret_env_names, "\n", fn name ->
+          "printf 'TURN:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> \"$trace_file\""
+        end)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file=#{trace_file}
+      #{env_probe}
+
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-secret-env"}}}' ;;
+          3) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-secret-env"}}}' ;;
+          4)
+            #{turn_env_probe}
+            printf '%s\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        tracker_api_token: "test-workflow-token-before"
+      )
+
+      issue = %Issue{
+        id: "issue-secret-env",
+        identifier: "MT-SECRET-ENV",
+        title: "Keep tracker credentials outside worker environment",
+        state: "In Progress"
+      }
+
+      tracker_context = Tracker.current_poll_context()
+
+      assert {:ok, session} =
+               RealAppServer.start_session(workspace, tracker_context: tracker_context)
+
+      try do
+        workflow_path = Workflow.workflow_file_path()
+
+        workflow_path
+        |> File.read!()
+        |> String.replace("test-workflow-token-before", "test-workflow-token-after")
+        |> then(&File.write!(workflow_path, &1))
+
+        assert {:ok, _result} =
+                 RealAppServer.run_turn(
+                   session,
+                   "Check worker environment after authority drift",
+                   issue
+                 )
+      after
+        RealAppServer.stop_session(session)
+      end
+
+      trace = File.read!(trace_file)
+
+      Enum.each(@tracker_secret_env_names, fn name ->
+        assert trace =~ "START:#{name}=__ABSENT__"
+        assert trace =~ "TURN:#{name}=__ABSENT__"
+      end)
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "app server rejects the workspace root and paths outside workspace root" do
@@ -1748,10 +1865,12 @@ defmodule SymphonyElixir.AppServerTest do
 
     previous_path = System.get_env("PATH")
     previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_env = Map.new(@tracker_secret_env_names, &{&1, System.get_env(&1)})
 
     on_exit(fn ->
       restore_env("PATH", previous_path)
       restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
     end)
 
     try do
@@ -1763,11 +1882,21 @@ defmodule SymphonyElixir.AppServerTest do
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
       System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
 
+      Enum.each(@tracker_secret_env_names, fn name ->
+        System.put_env(name, "test-only-#{String.downcase(name)}")
+      end)
+
+      env_probe =
+        Enum.map_join(@tracker_secret_env_names, "\n", fn name ->
+          "printf 'ENV:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> \"$trace_file\""
+        end)
+
       File.write!(fake_ssh, """
       #!/bin/sh
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
       count=0
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+      #{env_probe}
 
       while IFS= read -r line; do
         count=$((count + 1))
@@ -1827,7 +1956,13 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
       assert argv_line =~ "exec "
+      assert argv_line =~ "env -u LINEAR_API_KEY"
       assert argv_line =~ "fake-remote-codex app-server"
+
+      Enum.each(@tracker_secret_env_names, fn name ->
+        assert "ENV:#{name}=__ABSENT__" in lines
+        assert argv_line =~ "-u #{name}"
+      end)
 
       expected_turn_policy = %{
         "type" => "workspaceWrite",
