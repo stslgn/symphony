@@ -87,7 +87,7 @@ defmodule SymphonyElixir.Tracker do
   def adapter(%PollContext{}), do: SymphonyElixir.Linear.Adapter
 
   @spec poll_context(map(), term()) :: PollContext.t()
-  def poll_context(tracker, authority_generation \\ nil) when is_map(tracker) do
+  def poll_context(tracker, authority_generation) when is_map(tracker) do
     %PollContext{
       kind: Map.get(tracker, :kind),
       endpoint: Map.get(tracker, :endpoint),
