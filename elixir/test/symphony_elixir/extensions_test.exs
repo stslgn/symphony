@@ -5,7 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
-  alias SymphonyElixir.{ParkedProjection, RunLedger, StartupAttestation}
+  alias SymphonyElixir.{ParkedProjection, RunLedger, RuntimeReadiness, StartupAttestation}
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -313,15 +313,19 @@ defmodule SymphonyElixir.ExtensionsTest do
     workflow_path = Workflow.workflow_file_path()
     attestation_path = Path.join(Path.dirname(workflow_path), "startup-attestation")
     workflow_digest = WorkflowStore.startup_digest()
+    runtime_digest = String.duplicate("a", 64)
     previous_digest = System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    previous_runtime_digest = System.get_env("SYMPHONY_EXPECTED_RUNTIME_SHA256")
     previous_attestation_path = System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
 
     on_exit(fn ->
       restore_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", previous_digest)
+      restore_env("SYMPHONY_EXPECTED_RUNTIME_SHA256", previous_runtime_digest)
       restore_env("SYMPHONY_STARTUP_ATTESTATION_PATH", previous_attestation_path)
     end)
 
     System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest)
+    System.put_env("SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest)
     System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", attestation_path)
 
     assert {:ok, attestation_pid} = StartupAttestation.start_link([])
@@ -334,10 +338,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       |> String.split("\n", trim: true)
       |> Map.new(fn line -> List.to_tuple(String.split(line, "=", parts: 2)) end)
 
-    assert attestation["protocol"] == "1"
+    assert attestation["protocol"] == "2"
     assert attestation["pid"] == System.pid()
     assert attestation["process_start"] != ""
     assert attestation["workflow_sha256"] == workflow_digest
+    assert attestation["runtime_sha256"] == runtime_digest
     assert System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256") == workflow_digest
     assert System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH") == attestation_path
 
@@ -357,6 +362,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     poll_guard_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.PollGuardSupervisor))
     orchestrator_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.Orchestrator))
     http_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.HttpServer))
+    status_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.StatusDashboard))
+    readiness_index = Enum.find_index(child_ids, &(&1 == RuntimeReadiness))
 
     assert SymphonyElixir.Application.supervisor_strategy() == :rest_for_one
     assert Supervisor.child_spec(StartupAttestation, []).restart == :permanent
@@ -367,12 +374,38 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert poll_guard_index < orchestrator_index
     assert attestation_index < orchestrator_index
     assert attestation_index < http_index
+    assert http_index < readiness_index
+    assert status_index < readiness_index
+
+    workflow_digest = WorkflowStore.startup_digest()
+    runtime_digest = String.duplicate("b", 64)
+    state_dir = Path.dirname(Workflow.workflow_file_path())
+    admission_path = Path.join(state_dir, "restart-startup-admission")
+    readiness_path = Path.join(state_dir, "restart-runtime-readiness")
+
+    managed_env = [
+      {"SYMPHONY_MANAGED_PROJECT", "managed-restart-test"},
+      {"SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest},
+      {"SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest},
+      {"SYMPHONY_STARTUP_ATTESTATION_PATH", admission_path},
+      {"SYMPHONY_RUNTIME_READINESS_PATH", readiness_path}
+    ]
+
+    previous_env = Map.new(managed_env, fn {name, _value} -> {name, System.get_env(name)} end)
+
+    on_exit(fn ->
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+    end)
+
+    Enum.each(managed_env, fn {name, value} -> System.put_env(name, value) end)
+    File.write!(readiness_path, "stale readiness")
 
     old_workflow_store = Process.whereis(WorkflowStore)
     old_attestation = supervisor_child_pid(StartupAttestation)
     old_task_supervisor = Process.whereis(SymphonyElixir.TaskSupervisor)
     old_poll_guard = Process.whereis(SymphonyElixir.PollGuardSupervisor)
     old_orchestrator = Process.whereis(SymphonyElixir.Orchestrator)
+    old_readiness = supervisor_child_pid(RuntimeReadiness)
 
     task = fn -> Process.sleep(:infinity) end
     {:ok, task_pid} = Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, task)
@@ -391,6 +424,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       new_task_supervisor = Process.whereis(SymphonyElixir.TaskSupervisor)
       new_poll_guard = Process.whereis(SymphonyElixir.PollGuardSupervisor)
       new_orchestrator = Process.whereis(SymphonyElixir.Orchestrator)
+      new_readiness = supervisor_child_pid(RuntimeReadiness)
 
       Enum.all?(
         [
@@ -398,11 +432,103 @@ defmodule SymphonyElixir.ExtensionsTest do
           {new_attestation, old_attestation},
           {new_task_supervisor, old_task_supervisor},
           {new_poll_guard, old_poll_guard},
-          {new_orchestrator, old_orchestrator}
+          {new_orchestrator, old_orchestrator},
+          {new_readiness, old_readiness}
         ],
         fn {new_pid, old_pid} -> is_pid(new_pid) and new_pid != old_pid and Process.alive?(new_pid) end
       )
     end)
+
+    assert File.read!(admission_path) =~ "protocol=2\n"
+    assert File.read!(readiness_path) =~ "protocol=2\n"
+    assert File.read!(readiness_path) =~ "runtime_sha256=#{runtime_digest}\n"
+  end
+
+  test "runtime readiness is distinct from pre-IO startup admission" do
+    ensure_workflow_store_running()
+    workflow_digest = WorkflowStore.startup_digest()
+    runtime_digest = String.duplicate("c", 64)
+    state_dir = Path.dirname(Workflow.workflow_file_path())
+    admission_path = Path.join(state_dir, "startup-admission")
+    readiness_path = Path.join(state_dir, "runtime-readiness")
+
+    env = [
+      {"SYMPHONY_MANAGED_PROJECT", "managed-readiness-test"},
+      {"SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest},
+      {"SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest},
+      {"SYMPHONY_STARTUP_ATTESTATION_PATH", admission_path},
+      {"SYMPHONY_RUNTIME_READINESS_PATH", readiness_path}
+    ]
+
+    previous_env = Map.new(env, fn {name, _value} -> {name, System.get_env(name)} end)
+
+    on_exit(fn ->
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+    end)
+
+    Enum.each(env, fn {name, value} -> System.put_env(name, value) end)
+
+    assert {:ok, admission} =
+             StartupAttestation.admit(process_start_result: {"Fri Aug 14 12:00:00 2026\n", 0})
+
+    assert File.exists?(admission_path)
+    refute File.exists?(readiness_path)
+    assert {:ok, %{path: ^readiness_path}} = RuntimeReadiness.attest(admission: admission)
+
+    readiness = File.read!(readiness_path)
+    assert readiness =~ "protocol=2\n"
+    assert readiness =~ "workflow_sha256=#{workflow_digest}\n"
+    assert readiness =~ "runtime_sha256=#{runtime_digest}\n"
+  end
+
+  test "orchestrator cannot replace admitted authority during an A-B-A startup race" do
+    ensure_workflow_store_running()
+    workflow_path = Workflow.workflow_file_path()
+    run_ledger_path = Path.join(Path.dirname(workflow_path), "startup-race-ledger.jsonl")
+
+    write_workflow_file!(workflow_path,
+      tracker_kind: "memory",
+      tracker_api_token: "authority-a-token",
+      prompt: "Authority A"
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+    assert {:ok, admission} = StartupAttestation.admit()
+
+    pinned_settings =
+      {admission.settings, admission.authority_generation, admission.tracker_authority_generation}
+
+    write_workflow_file!(workflow_path,
+      tracker_kind: "memory",
+      tracker_api_token: "authority-b-token",
+      prompt: "Authority B"
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+
+    orchestrator_name = :"startup_race_orchestrator_#{System.unique_integer([:positive])}"
+
+    assert {:ok, orchestrator_pid} =
+             Orchestrator.start_link(
+               name: orchestrator_name,
+               run_ledger_path: run_ledger_path,
+               startup_settings_fn: fn -> pinned_settings end
+             )
+
+    pinned_context = :sys.get_state(orchestrator_pid).operator_commands.tracker_context
+    refute Tracker.authority_valid?(pinned_context)
+    assert {:error, :tracker_authority_invalidated} = Tracker.fetch_candidate_issues(pinned_context)
+
+    write_workflow_file!(workflow_path,
+      tracker_kind: "memory",
+      tracker_api_token: "authority-a-token",
+      prompt: "Authority A"
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+    refute Tracker.authority_valid?(pinned_context)
+    assert {:error, :tracker_authority_invalidated} = Tracker.fetch_candidate_issues(pinned_context)
+    GenServer.stop(orchestrator_pid)
   end
 
   test "startup attestation fails closed when its managed path is missing or unwritable" do

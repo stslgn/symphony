@@ -41,7 +41,8 @@ defmodule SymphonyElixir.Application do
       {DynamicSupervisor, strategy: :one_for_one, name: SymphonyElixir.PollGuardSupervisor},
       {SymphonyElixir.Orchestrator, startup_settings_fn: &SymphonyElixir.StartupAttestation.settings_with_authority!/0},
       SymphonyElixir.HttpServer,
-      SymphonyElixir.StatusDashboard
+      SymphonyElixir.StatusDashboard,
+      SymphonyElixir.RuntimeReadiness
     ]
   end
 

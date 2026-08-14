@@ -355,16 +355,21 @@ defmodule SymphonyElixir.WorkflowStore do
 
   defp invalidate_managed_startup_attestation do
     managed_project = System.get_env("SYMPHONY_MANAGED_PROJECT")
-    attestation_path = System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
 
-    if managed_project not in [nil, ""] and attestation_path not in [nil, ""] do
-      case File.lstat(attestation_path) do
-        {:ok, %File.Stat{type: :regular}} ->
-          _ = File.rm(attestation_path)
-
-        _other ->
-          :ok
+    if managed_project not in [nil, ""] do
+      for env_name <- ["SYMPHONY_STARTUP_ATTESTATION_PATH", "SYMPHONY_RUNTIME_READINESS_PATH"] do
+        case System.get_env(env_name) do
+          path when path in [nil, ""] -> :ok
+          path -> remove_regular_attestation(path)
+        end
       end
+    end
+  end
+
+  defp remove_regular_attestation(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular}} -> File.rm(path)
+      _other -> :ok
     end
   end
 

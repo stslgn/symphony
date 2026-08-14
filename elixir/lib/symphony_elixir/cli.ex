@@ -6,7 +6,7 @@ defmodule SymphonyElixir.CLI do
   alias SymphonyElixir.LogFile
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
-  @startup_protocol "1"
+  @startup_protocol "2"
   @switches [{@acknowledgement_switch, :boolean}, logs_root: :string, port: :integer]
 
   @type ensure_started_result :: {:ok, [atom()]} | {:error, term()}

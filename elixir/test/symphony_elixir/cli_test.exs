@@ -8,8 +8,8 @@ defmodule SymphonyElixir.CLITest do
   @ack_flag "--i-understand-that-this-will-be-running-without-the-usual-guardrails"
 
   test "reports startup protocol without starting the application" do
-    assert CLI.startup_protocol() == "1"
-    assert capture_io(fn -> assert :ok = CLI.main(["--startup-protocol"]) end) == "1\n"
+    assert CLI.startup_protocol() == "2"
+    assert capture_io(fn -> assert :ok = CLI.main(["--startup-protocol"]) end) == "2\n"
   end
 
   test "returns the guardrails acknowledgement banner when the flag is missing" do
