@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   require Logger
   alias SymphonyElixir.Codex.{CapabilityPolicy, DynamicTool, ModelCatalog}
-  alias SymphonyElixir.{Config, ObservabilitySanitizer, PathSafety, SSH}
+  alias SymphonyElixir.{Config, ObservabilitySanitizer, PathSafety, SSH, Tracker}
 
   @initialize_id 1
   @thread_start_id 2
@@ -26,6 +26,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           reasoning_effort: String.t() | nil,
           model_catalog: ModelCatalog.t(),
           session_title: String.t(),
+          tracker_context: Tracker.PollContext.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil
         }
@@ -68,6 +69,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
     session_title = opts |> Keyword.get(:session_title, "Symphony worker") |> normalize_session_title()
+    tracker_context = Keyword.get_lazy(opts, :tracker_context, &Tracker.current_poll_context/0)
 
     with :ok <- Config.validate_runtime_capabilities(),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
@@ -100,6 +102,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            reasoning_effort: thread.reasoning_effort,
            model_catalog: thread.model_catalog,
            session_title: session_title,
+           tracker_context: tracker_context,
            workspace: expanded_workspace,
            worker_host: worker_host
          }}
@@ -125,6 +128,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           reasoning_effort: reasoning_effort,
           model_catalog: model_catalog,
           session_title: session_title,
+          tracker_context: tracker_context,
           workspace: workspace
         },
         prompt,
@@ -133,9 +137,13 @@ defmodule SymphonyElixir.Codex.AppServer do
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
 
+    dynamic_tool_opts =
+      [tracker_context: tracker_context]
+      |> maybe_put_dynamic_tool_client(Keyword.get(opts, :linear_client))
+
     raw_tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments)
+        DynamicTool.execute(tool, arguments, dynamic_tool_opts)
       end)
 
     tool_executor = capability_checked_tool_executor(raw_tool_executor, capability_policy)
@@ -254,6 +262,11 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:ok, workspace}
     end
   end
+
+  defp maybe_put_dynamic_tool_client(opts, linear_client) when is_function(linear_client, 3),
+    do: Keyword.put(opts, :linear_client, linear_client)
+
+  defp maybe_put_dynamic_tool_client(opts, _linear_client), do: opts
 
   defp start_port(workspace, nil) do
     executable = System.find_executable("bash")

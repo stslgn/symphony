@@ -1112,29 +1112,20 @@ defmodule SymphonyElixir.AppServerTest do
       }
 
       test_pid = self()
+      tracker_context = Tracker.current_poll_context()
 
-      tool_executor = fn tool, arguments ->
-        send(test_pid, {:tool_called, tool, arguments})
-
-        %{
-          "success" => true,
-          "contentItems" => [
-            %{
-              "type" => "inputText",
-              "text" => ~s({"data":{"viewer":{"id":"usr_123"}}})
-            }
-          ]
-        }
+      linear_client = fn query, variables, opts ->
+        send(test_pid, {:linear_client_called, query, variables, opts})
+        {:ok, %{"data" => %{"viewer" => %{"id" => "usr_123"}}}}
       end
 
       assert {:ok, _result} =
-               AppServer.run(workspace, "Handle supported tool calls", issue, tool_executor: tool_executor)
+               AppServer.run(workspace, "Handle supported tool calls", issue,
+                 linear_client: linear_client,
+                 tracker_context: tracker_context
+               )
 
-      assert_received {:tool_called, "linear_graphql",
-                       %{
-                         "query" => "query Viewer { viewer { id } }",
-                         "variables" => %{"includeTeams" => false}
-                       }}
+      assert_received {:linear_client_called, "query Viewer { viewer { id } }", %{"includeTeams" => false}, tracker_context: ^tracker_context}
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
@@ -1148,8 +1139,8 @@ defmodule SymphonyElixir.AppServerTest do
 
                  payload["id"] == 102 and
                    get_in(payload, ["result", "success"]) == true and
-                   get_in(payload, ["result", "output"]) ==
-                     ~s({"data":{"viewer":{"id":"usr_123"}}})
+                   Jason.decode!(get_in(payload, ["result", "output"])) ==
+                     %{"data" => %{"viewer" => %{"id" => "usr_123"}}}
                else
                  false
                end

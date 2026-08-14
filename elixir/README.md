@@ -237,9 +237,12 @@ Notes:
   runner generation at startup. Every observed change advances a monotonic authority generation.
   Operator-ID-only drift disables comment commands; tracker identity/scope drift blocks every tracker
   request and discards in-flight poll results until restart, even if the file is later restored.
-  Admitted polls and in-flight worker state checks use the immutable startup snapshot for the
-  adapter, credential, endpoint, project, routing assignee, and active states; the network client
-  never re-reads those fields from a hot-reloaded config.
+  Admitted polls, in-flight worker state checks, and worker-facing `linear_graphql` calls use the
+  immutable startup authority snapshot for the adapter, credential, endpoint, and project. Routing
+  assignee and active/terminal state sets are frozen per poll or worker session, so safe reloads
+  affect future work without changing an admitted decision. Every worker-side tracker call rechecks
+  the monotonic authority generation before I/O, and the network client never re-reads those fields
+  from hot-reloaded config.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the

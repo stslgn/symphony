@@ -434,10 +434,14 @@ Fields:
   - Operator-ID-only drift disables comment commands. Drift in tracker kind, endpoint, API-key
     selector, or project slug MUST block all tracker I/O and discard in-flight poll results until
     restart.
-  - Every admitted tracker request and in-flight worker state check MUST use one immutable
-    startup-pinned snapshot for adapter selection, credential, endpoint, project scope, routing
-    assignee, and active states. Tracker clients MUST NOT re-read those fields from live config
-    between authority validation and network I/O.
+  - The adapter, resolved credential, endpoint, and project scope MUST come from an immutable
+    startup-pinned snapshot. Each admitted poll or worker session MUST also freeze its routing
+    assignee and active/terminal state sets for the duration of that request or session. Tracker
+    clients and worker-facing tracker tools MUST NOT re-read those fields from live config between
+    authority validation, network I/O, and result classification.
+  - Polls, in-flight worker state checks, and worker-facing tracker tools MUST compare their pinned
+    generation with the current monotonic tracker-authority generation before network I/O and fail
+    closed after drift.
   - The identity associated with `tracker.api_key` MUST remain rejected even if listed, because a
     worker can publish comments through the same credential.
 - `project_slug` (string)
@@ -670,8 +674,10 @@ Dynamic reload is REQUIRED:
   `operator_user_ids` MUST fail closed on change and MAY require restart before the new value becomes
   effective. A poll result MUST be revalidated against the current authority generation before it is
   applied; tracker-identity drift invalidates the whole result. Network collection and worker state
-  checks MUST remain bound to the startup-approved tracker snapshot so a concurrent reload cannot
-  redirect an already admitted credential.
+  checks and worker-facing tracker tools MUST remain bound to the startup-approved authority
+  snapshot so a concurrent reload cannot redirect an already admitted credential. Behavioral
+  routing/state settings are captured per admitted request or worker session, allowing a safe reload
+  to affect future work without changing an in-flight decision.
 - Implementations SHOULD also re-validate/reload defensively during runtime operations (for example
   before dispatch) in case filesystem watch events are missed.
 - Invalid reloads MUST NOT crash the service; keep operating with the last known good effective

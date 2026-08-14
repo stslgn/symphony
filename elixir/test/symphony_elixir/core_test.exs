@@ -3374,7 +3374,7 @@ defmodule SymphonyElixir.CoreTest do
       do: Process.cancel_timer(blocked_poll_state.tick_timer_ref)
   end
 
-  test "tracker poll collection keeps the startup-approved network authority snapshot" do
+  test "tracker poll collection rejects authority drift before network I/O" do
     previous_client = Application.get_env(:symphony_elixir, :linear_client_module)
 
     on_exit(fn ->
@@ -3394,7 +3394,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_project_slug: "approved-project"
     )
 
-    approved_context = Tracker.poll_context(Config.settings!().tracker)
+    approved_context = Tracker.current_poll_context()
     comment_cursor = ~U[2026-08-14 09:00:00Z]
 
     request = %{
@@ -3416,13 +3416,11 @@ defmodule SymphonyElixir.CoreTest do
     )
 
     result = Orchestrator.collect_tracker_poll_for_test(request)
-    assert result.running == {:ok, []}
-    assert result.dispatch == {:ok, []}
-
-    assert_receive {:snapshot_state_fetch, ["issue-running"], ^approved_context}
-    assert_receive {:snapshot_candidate_fetch, ^approved_context}
-
-    assert_receive {:snapshot_comment_fetch, "issue-comments", ^comment_cursor, ^approved_context}
+    assert result.running == {:skip, :tracker_authority_invalidated}
+    assert result.dispatch == {:skip, :tracker_authority_invalidated}
+    refute_receive {:snapshot_state_fetch, _, _}
+    refute_receive {:snapshot_candidate_fetch, _}
+    refute_receive {:snapshot_comment_fetch, _, _, _}
 
     inspected = inspect(approved_context)
     refute inspected =~ "approved-token"
@@ -5304,6 +5302,12 @@ defmodule SymphonyElixir.CoreTest do
         attempt = Process.get(:agent_turn_fetch_count, 0) + 1
         Process.put(:agent_turn_fetch_count, attempt)
         send(parent, {:issue_state_fetch, attempt})
+
+        if attempt == 1 do
+          write_workflow_file!(Workflow.workflow_file_path(),
+            tracker_active_states: ["Done"]
+          )
+        end
 
         state =
           if attempt == 1 do

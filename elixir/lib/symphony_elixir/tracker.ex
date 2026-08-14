@@ -3,13 +3,22 @@ defmodule SymphonyElixir.Tracker do
   Adapter boundary for issue tracker reads and writes.
   """
 
-  alias SymphonyElixir.Config
+  alias SymphonyElixir.{Config, WorkflowStore}
 
   defmodule PollContext do
     @moduledoc false
 
     @derive {Inspect, except: [:api_key]}
-    defstruct [:kind, :endpoint, :api_key, :project_slug, :assignee, active_states: []]
+    defstruct [
+      :kind,
+      :endpoint,
+      :api_key,
+      :project_slug,
+      :assignee,
+      :authority_generation,
+      active_states: [],
+      terminal_states: []
+    ]
 
     @type t :: %__MODULE__{
             kind: String.t() | nil,
@@ -17,7 +26,9 @@ defmodule SymphonyElixir.Tracker do
             api_key: String.t() | nil,
             project_slug: String.t() | nil,
             assignee: String.t() | nil,
-            active_states: [String.t()]
+            authority_generation: term(),
+            active_states: [String.t()],
+            terminal_states: [String.t()]
           }
   end
 
@@ -94,15 +105,30 @@ defmodule SymphonyElixir.Tracker do
   def adapter(%PollContext{kind: "memory"}), do: SymphonyElixir.Tracker.Memory
   def adapter(%PollContext{}), do: SymphonyElixir.Linear.Adapter
 
-  @spec poll_context(map()) :: PollContext.t()
-  def poll_context(tracker) when is_map(tracker) do
+  @spec poll_context(map(), term()) :: PollContext.t()
+  def poll_context(tracker, authority_generation \\ nil) when is_map(tracker) do
     %PollContext{
       kind: Map.get(tracker, :kind),
       endpoint: Map.get(tracker, :endpoint),
       api_key: Map.get(tracker, :api_key),
       project_slug: Map.get(tracker, :project_slug),
       assignee: Map.get(tracker, :assignee),
-      active_states: Map.get(tracker, :active_states, [])
+      authority_generation: authority_generation,
+      active_states: Map.get(tracker, :active_states, []),
+      terminal_states: Map.get(tracker, :terminal_states, [])
     }
+  end
+
+  @spec current_poll_context() :: PollContext.t()
+  def current_poll_context do
+    authority_generation = WorkflowStore.tracker_authority_generation()
+    poll_context(Config.settings!().tracker, authority_generation)
+  end
+
+  @spec authority_valid?(PollContext.t()) :: boolean()
+  def authority_valid?(%PollContext{authority_generation: nil}), do: false
+
+  def authority_valid?(%PollContext{authority_generation: authority_generation}) do
+    authority_generation == WorkflowStore.tracker_authority_generation()
   end
 end

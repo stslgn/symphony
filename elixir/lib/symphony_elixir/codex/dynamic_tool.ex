@@ -4,6 +4,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   """
 
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Tracker
 
   @linear_graphql_tool "linear_graphql"
   @linear_graphql_description """
@@ -77,15 +78,24 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp execute_linear_graphql(arguments, opts) do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
+    tracker_context = Keyword.get_lazy(opts, :tracker_context, &Tracker.current_poll_context/0)
 
     with {:ok, query, variables} <- normalize_linear_graphql_arguments(arguments),
          :ok <- validate_linear_graphql_query(query),
-         {:ok, response} <- linear_client.(query, variables, []) do
+         :ok <- validate_tracker_authority(tracker_context),
+         {:ok, response} <-
+           linear_client.(query, variables, tracker_context: tracker_context) do
       graphql_response(response)
     else
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
     end
+  end
+
+  defp validate_tracker_authority(tracker_context) do
+    if Tracker.authority_valid?(tracker_context),
+      do: :ok,
+      else: {:error, :tracker_authority_invalidated}
   end
 
   defp normalize_linear_graphql_arguments(arguments) when is_binary(arguments) do
@@ -238,6 +248,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       "error" => %{
         "message" => "Symphony is missing Linear auth. Set `linear.api_key` in `WORKFLOW.md` or export `LINEAR_API_KEY`."
       }
+    }
+  end
+
+  defp tool_error_payload(:tracker_authority_invalidated) do
+    %{
+      "error" => %{
+        "message" => "Linear access is disabled because tracker authority changed after runner startup. Restart the managed runner before retrying."
+      },
+      "symphonyBoundary" => "tracker_authority_generation"
     }
   end
 
