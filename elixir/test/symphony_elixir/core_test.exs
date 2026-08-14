@@ -3337,11 +3337,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_operator_user_ids: ["operator-1"]
     )
 
-    blocked_poll_state = Orchestrator.run_poll_cycle_for_test(state)
-    assert blocked_poll_state.operator_commands.tracker_authority_invalidated
-    assert blocked_poll_state.running[running_issue_id].issue.state == "In Progress"
-
-    applied_state = Orchestrator.apply_poll_result_for_test(blocked_poll_state, poll_result)
+    applied_state = Orchestrator.apply_poll_result_for_test(state, poll_result)
     assert applied_state.operator_commands.operator_authority_invalidated
     assert applied_state.operator_commands.tracker_authority_invalidated
     assert applied_state.parked[issue_id].wait_id == wait.wait_id
@@ -3351,6 +3347,11 @@ defmodule SymphonyElixir.CoreTest do
              applied_state.operator_commands.processed_comment_ids,
              "inflight-generation-drift-retry"
            )
+
+    blocked_poll_state = Orchestrator.run_poll_cycle_for_test(state)
+    assert blocked_poll_state.operator_commands.tracker_authority_invalidated
+    assert blocked_poll_state.parked[issue_id].wait_id == wait.wait_id
+    assert blocked_poll_state.running[running_issue_id].issue.state == "In Progress"
 
     if is_reference(blocked_poll_state.tick_timer_ref),
       do: Process.cancel_timer(blocked_poll_state.tick_timer_ref)
