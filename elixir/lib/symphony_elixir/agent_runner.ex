@@ -11,6 +11,20 @@ defmodule SymphonyElixir.AgentRunner do
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
+    case fetch_tracker_context(opts) do
+      {:ok, tracker_context} ->
+        run_with_tracker_context(
+          issue,
+          codex_update_recipient,
+          Keyword.put(opts, :tracker_context, tracker_context)
+        )
+
+      {:error, reason} ->
+        raise_run_error(issue, reason)
+    end
+  end
+
+  defp run_with_tracker_context(issue, codex_update_recipient, opts) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
 
@@ -21,10 +35,26 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, reason} ->
-        error_code = ObservabilitySanitizer.error_code(reason, "agent_run_failed")
-        Logger.error("Agent run failed for #{issue_context(issue)} error_code=#{error_code}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)} error_code=#{error_code}"
+        raise_run_error(issue, reason)
     end
+  end
+
+  defp fetch_tracker_context(opts) do
+    case Keyword.fetch(opts, :tracker_context) do
+      {:ok, %Tracker.PollContext{} = context} ->
+        if Tracker.authority_valid?(context),
+          do: {:ok, context},
+          else: {:error, :tracker_authority_invalidated}
+
+      _ ->
+        {:error, :tracker_context_required}
+    end
+  end
+
+  defp raise_run_error(issue, reason) do
+    error_code = ObservabilitySanitizer.error_code(reason, "agent_run_failed")
+    Logger.error("Agent run failed for #{issue_context(issue)} error_code=#{error_code}")
+    raise RuntimeError, "Agent run failed for #{issue_context(issue)} error_code=#{error_code}"
   end
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
@@ -105,8 +135,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
-    tracker_context = Keyword.get_lazy(opts, :tracker_context, &Tracker.current_poll_context/0)
-    opts = Keyword.put(opts, :tracker_context, tracker_context)
+    tracker_context = Keyword.fetch!(opts, :tracker_context)
 
     issue_state_fetcher =
       Keyword.get(opts, :issue_state_fetcher, fn issue_ids ->

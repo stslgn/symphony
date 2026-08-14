@@ -69,9 +69,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
     session_title = opts |> Keyword.get(:session_title, "Symphony worker") |> normalize_session_title()
-    tracker_context = Keyword.get_lazy(opts, :tracker_context, &Tracker.current_poll_context/0)
 
-    with :ok <- Config.validate_runtime_capabilities(),
+    with {:ok, tracker_context} <- fetch_tracker_context(opts),
+         :ok <- Config.validate_runtime_capabilities(),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port |> port_metadata(worker_host) |> Map.put(:session_title, session_title)
@@ -111,6 +111,18 @@ defmodule SymphonyElixir.Codex.AppServer do
           stop_port(port)
           {:error, reason}
       end
+    end
+  end
+
+  defp fetch_tracker_context(opts) do
+    case Keyword.fetch(opts, :tracker_context) do
+      {:ok, %Tracker.PollContext{} = context} ->
+        if Tracker.authority_valid?(context),
+          do: {:ok, context},
+          else: {:error, :tracker_authority_invalidated}
+
+      _ ->
+        {:error, :tracker_context_required}
     end
   end
 

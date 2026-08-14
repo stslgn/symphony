@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Codex.DynamicToolTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.TestDynamicTool, as: DynamicTool
 
   test "tool_specs advertises the linear_graphql input contract" do
     assert [
@@ -58,6 +58,26 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "text" => response["output"]
              }
            ]
+  end
+
+  test "linear_graphql rejects a missing tracker context before client I/O" do
+    response =
+      SymphonyElixir.Codex.DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        linear_client: fn _query, _variables, _opts ->
+          flunk("linear client must not run without an admitted tracker context")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert %{
+             "error" => %{"message" => message},
+             "symphonyBoundary" => "tracker_context"
+           } = Jason.decode!(response["output"])
+
+    assert message =~ "tracker context"
   end
 
   test "linear_graphql returns successful GraphQL responses as tool text" do

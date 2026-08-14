@@ -298,6 +298,19 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
   end
 
+  test "agent runner rejects a missing tracker context before workspace preparation" do
+    issue = %Issue{
+      id: "issue-missing-tracker-context",
+      identifier: "MT-MISSING-TRACKER-CONTEXT",
+      title: "Reject missing tracker context",
+      state: "Todo"
+    }
+
+    assert_raise RuntimeError, ~r/tracker_context_required/, fn ->
+      SymphonyElixir.AgentRunner.run(issue, nil, prepared_workspace: %{path: "/missing/workspace"})
+    end
+  end
+
   test "current WORKFLOW.md file is valid and complete" do
     original_workflow_path = Workflow.workflow_file_path()
     on_exit(fn -> Workflow.set_workflow_file_path(original_workflow_path) end)

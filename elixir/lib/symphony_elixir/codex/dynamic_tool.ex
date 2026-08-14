@@ -78,9 +78,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp execute_linear_graphql(arguments, opts) do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
-    tracker_context = Keyword.get_lazy(opts, :tracker_context, &Tracker.current_poll_context/0)
 
-    with {:ok, query, variables} <- normalize_linear_graphql_arguments(arguments),
+    with {:ok, tracker_context} <- fetch_tracker_context(opts),
+         {:ok, query, variables} <- normalize_linear_graphql_arguments(arguments),
          :ok <- validate_linear_graphql_query(query),
          :ok <- validate_tracker_authority(tracker_context),
          {:ok, response} <-
@@ -89,6 +89,13 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     else
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp fetch_tracker_context(opts) do
+    case Keyword.fetch(opts, :tracker_context) do
+      {:ok, %Tracker.PollContext{} = context} -> {:ok, context}
+      _ -> {:error, :tracker_context_required}
     end
   end
 
@@ -257,6 +264,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "message" => "Linear access is disabled because tracker authority changed after runner startup. Restart the managed runner before retrying."
       },
       "symphonyBoundary" => "tracker_authority_generation"
+    }
+  end
+
+  defp tool_error_payload(:tracker_context_required) do
+    %{
+      "error" => %{
+        "message" => "Linear access requires the tracker context admitted when the worker session started."
+      },
+      "symphonyBoundary" => "tracker_context"
     }
   end
 
