@@ -253,11 +253,13 @@ Notes:
   generation-specific runtime image it admitted, and identifies that image with
   `SYMPHONY_RUNTIME_IMAGE_PATH`. The launcher also pins
   `SYMPHONY_EXPECTED_EXECUTION_SHA256`, a deterministic fingerprint of the loaded BEAM identities
-  for Symphony and the recursive graph of bundled application dependencies. The side-effect-free
-  identity probe reports both its own image SHA-256 and that loaded-code fingerprint; the launcher
-  accepts the pair only when the reported image digest equals the generation digest it captured
-  before the probe. Before application startup, Symphony computes the execution fingerprint from
-  loaded code and refuses an image/path A-B-A substitution even if the pathname bytes are restored.
+  for Symphony and the recursive graph of bundled application dependencies. `mix build` writes a
+  mode-0600 `bin/symphony.runtime-identity` manifest that binds the completed escript image digest
+  to that execution fingerprint. The side-effect-free identity probe reports both its own image
+  SHA-256 and its loaded-code fingerprint; the launcher accepts it only when the snapshot digest,
+  build manifest, and live probe all agree. Before application startup, Symphony computes the
+  execution fingerprint from loaded code and refuses an image/path A-B-A substitution even if the
+  pathname bytes are restored.
   It also compares the workflow value with its single initial
   snapshot and measures the named image bytes. With `SYMPHONY_MANAGED_PROJECT`,
   `SYMPHONY_STARTUP_ATTESTATION_PATH` and
