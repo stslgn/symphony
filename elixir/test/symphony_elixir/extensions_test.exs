@@ -158,6 +158,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     File.write!(Workflow.workflow_file_path(), "---\ntracker: [\n---\nBroken prompt\n")
+
+    workflow_store_pid = Process.whereis(WorkflowStore)
+    snapshot = WorkflowStore.current_with_authority()
+
+    assert {:ok, %{prompt: "Second prompt"}, authority, tracker_authority} = snapshot
+
+    assert {^workflow_store_pid, _authority_epoch} = authority
+    assert {^workflow_store_pid, _tracker_authority_epoch} = tracker_authority
+
     assert {:error, _reason} = WorkflowStore.force_reload()
     assert {:ok, %{prompt: "Second prompt"}} = Workflow.current()
 
@@ -165,8 +174,6 @@ defmodule SymphonyElixir.ExtensionsTest do
     write_workflow_file!(third_workflow, prompt: "Third prompt")
     Workflow.set_workflow_file_path(third_workflow)
     assert {:ok, %{prompt: "Third prompt"}} = Workflow.current()
-
-    workflow_store_pid = Process.whereis(WorkflowStore)
 
     assert {:ok, %{prompt: "Third prompt"}, authority_generation, tracker_authority_generation} =
              WorkflowStore.current_with_authority()
