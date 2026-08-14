@@ -87,32 +87,56 @@ defmodule SymphonyElixir.RuntimeIdentity do
     if MapSet.member?(seen, application) do
       collect_application_modules(remaining, seen, modules, load_fn, spec_fn)
     else
-      case normalize_application_load(load_fn.(application), application, optional?) do
-        :skip ->
-          collect_application_modules(
-            remaining,
-            MapSet.put(seen, application),
-            modules,
-            load_fn,
-            spec_fn
-          )
+      collect_unseen_application(
+        application,
+        optional?,
+        remaining,
+        seen,
+        modules,
+        load_fn,
+        spec_fn
+      )
+    end
+  end
 
-        :ok ->
-          with {:ok, application_modules} <-
-                 application_spec_list(spec_fn, application, :modules, false),
-               {:ok, dependencies} <- application_dependencies(spec_fn, application) do
-            collect_application_modules(
-              dependencies ++ remaining,
-              MapSet.put(seen, application),
-              application_modules ++ modules,
-              load_fn,
-              spec_fn
-            )
-          end
+  defp collect_unseen_application(
+         application,
+         optional?,
+         remaining,
+         seen,
+         modules,
+         load_fn,
+         spec_fn
+       ) do
+    case normalize_application_load(load_fn.(application), application, optional?) do
+      :skip ->
+        collect_application_modules(
+          remaining,
+          MapSet.put(seen, application),
+          modules,
+          load_fn,
+          spec_fn
+        )
 
-        {:error, _reason} = error ->
-          error
-      end
+      :ok ->
+        collect_loaded_application(application, remaining, seen, modules, load_fn, spec_fn)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp collect_loaded_application(application, remaining, seen, modules, load_fn, spec_fn) do
+    with {:ok, application_modules} <-
+           application_spec_list(spec_fn, application, :modules, false),
+         {:ok, dependencies} <- application_dependencies(spec_fn, application) do
+      collect_application_modules(
+        dependencies ++ remaining,
+        MapSet.put(seen, application),
+        application_modules ++ modules,
+        load_fn,
+        spec_fn
+      )
     end
   end
 
