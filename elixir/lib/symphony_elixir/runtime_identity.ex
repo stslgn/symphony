@@ -43,23 +43,87 @@ defmodule SymphonyElixir.RuntimeIdentity do
   end
 
   defp application_modules(opts) do
-    load_fn = Keyword.get(opts, :application_load_fn, fn -> Application.load(@application) end)
-    modules_fn = Keyword.get(opts, :application_modules_fn, fn -> Application.spec(@application, :modules) end)
+    load_fn = Keyword.get(opts, :application_load_fn, &Application.load/1)
+    spec_fn = Keyword.get(opts, :application_spec_fn, &Application.spec/2)
 
-    with :ok <- normalize_application_load(load_fn.()),
-         modules when is_list(modules) <- modules_fn.() do
-      {:ok, modules}
+    collect_application_modules([{@application, false}], MapSet.new(), [], load_fn, spec_fn)
+  end
+
+  defp collect_application_modules([], _seen, modules, _load_fn, _spec_fn),
+    do: {:ok, Enum.uniq(modules)}
+
+  defp collect_application_modules(
+         [{application, optional?} | remaining],
+         seen,
+         modules,
+         load_fn,
+         spec_fn
+       ) do
+    if MapSet.member?(seen, application) do
+      collect_application_modules(remaining, seen, modules, load_fn, spec_fn)
     else
-      {:error, _reason} = error -> error
-      _invalid -> {:error, :runtime_identity_modules_unavailable}
+      case normalize_application_load(load_fn.(application), application, optional?) do
+        :skip ->
+          collect_application_modules(
+            remaining,
+            MapSet.put(seen, application),
+            modules,
+            load_fn,
+            spec_fn
+          )
+
+        :ok ->
+          with {:ok, application_modules} <-
+                 application_spec_list(spec_fn, application, :modules, false),
+               {:ok, dependencies} <- application_dependencies(spec_fn, application) do
+            collect_application_modules(
+              dependencies ++ remaining,
+              MapSet.put(seen, application),
+              application_modules ++ modules,
+              load_fn,
+              spec_fn
+            )
+          end
+
+        {:error, _reason} = error ->
+          error
+      end
     end
   end
 
-  defp normalize_application_load(:ok), do: :ok
-  defp normalize_application_load({:error, {:already_loaded, @application}}), do: :ok
+  defp application_dependencies(spec_fn, application) do
+    with {:ok, applications} <- application_spec_list(spec_fn, application, :applications, true),
+         {:ok, included} <-
+           application_spec_list(spec_fn, application, :included_applications, true),
+         {:ok, optional} <-
+           application_spec_list(spec_fn, application, :optional_applications, true) do
+      optional = MapSet.new(optional)
+      {:ok, Enum.map(applications ++ included, &{&1, MapSet.member?(optional, &1)})}
+    end
+  end
 
-  defp normalize_application_load({:error, reason}),
-    do: {:error, {:runtime_identity_application_load_failed, reason}}
+  defp application_spec_list(spec_fn, application, key, nil_is_empty?) do
+    case spec_fn.(application, key) do
+      value when is_list(value) -> {:ok, value}
+      nil when nil_is_empty? -> {:ok, []}
+      _invalid -> {:error, {:runtime_identity_application_spec_invalid, application, key}}
+    end
+  end
+
+  defp normalize_application_load(:ok, _application, _optional?), do: :ok
+
+  defp normalize_application_load({:error, {:already_loaded, application}}, application, _optional?),
+    do: :ok
+
+  defp normalize_application_load(
+         {:error, {~c"no such file or directory", _application_file}},
+         _application,
+         true
+       ),
+       do: :skip
+
+  defp normalize_application_load({:error, reason}, application, _optional?),
+    do: {:error, {:runtime_identity_application_load_failed, application, reason}}
 
   defp module_identities(modules, opts) do
     identity_fn = Keyword.get(opts, :module_identity_fn, &module_identity/1)

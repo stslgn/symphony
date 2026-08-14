@@ -21,25 +21,51 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
 
   test "loads the application manifest and rejects incomplete runtime identity evidence" do
     loaded_opts = [
-      application_load_fn: fn -> :ok end,
-      application_modules_fn: fn -> [__MODULE__] end
+      application_load_fn: fn _application -> :ok end,
+      application_spec_fn: fn
+        :symphony_elixir, :modules -> [__MODULE__]
+        :symphony_elixir, :applications -> []
+        :symphony_elixir, :included_applications -> []
+        :symphony_elixir, :optional_applications -> []
+      end
     ]
 
     assert {:ok, digest} = RuntimeIdentity.fingerprint(loaded_opts)
     assert digest =~ ~r/\A[0-9a-f]{64}\z/
 
     already_loaded_opts =
-      Keyword.put(loaded_opts, :application_load_fn, fn -> {:error, {:already_loaded, :symphony_elixir}} end)
+      Keyword.put(loaded_opts, :application_load_fn, fn application ->
+        {:error, {:already_loaded, application}}
+      end)
 
     assert {:ok, ^digest} = RuntimeIdentity.fingerprint(already_loaded_opts)
 
-    assert {:error, {:runtime_identity_application_load_failed, :boom}} =
-             RuntimeIdentity.fingerprint(application_load_fn: fn -> {:error, :boom} end)
+    assert {:error, {:runtime_identity_application_load_failed, :symphony_elixir, :boom}} =
+             RuntimeIdentity.fingerprint(application_load_fn: fn _application -> {:error, :boom} end)
 
-    assert {:error, :runtime_identity_modules_unavailable} =
+    missing_optional_opts = [
+      application_load_fn: fn
+        :symphony_elixir -> :ok
+        :missing_optional -> {:error, {~c"no such file or directory", ~c"missing_optional.app"}}
+      end,
+      application_spec_fn: fn
+        :symphony_elixir, :modules -> [__MODULE__]
+        :symphony_elixir, :applications -> [:missing_optional]
+        :symphony_elixir, :included_applications -> []
+        :symphony_elixir, :optional_applications -> [:missing_optional]
+        :missing_optional, :modules -> []
+        :missing_optional, :applications -> []
+        :missing_optional, :included_applications -> []
+        :missing_optional, :optional_applications -> []
+      end
+    ]
+
+    assert {:ok, ^digest} = RuntimeIdentity.fingerprint(missing_optional_opts)
+
+    assert {:error, {:runtime_identity_application_spec_invalid, :symphony_elixir, :modules}} =
              RuntimeIdentity.fingerprint(
-               application_load_fn: fn -> :ok end,
-               application_modules_fn: fn -> nil end
+               application_load_fn: fn _application -> :ok end,
+               application_spec_fn: fn _application, _key -> nil end
              )
 
     assert {:error, :runtime_identity_modules_unavailable} =
@@ -52,6 +78,55 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
              RuntimeIdentity.fingerprint(
                modules: [String],
                module_identity_fn: fn _module -> {:ok, :invalid} end
+             )
+  end
+
+  test "fingerprints bundled dependency modules as part of the execution identity" do
+    root_identity = <<1::128>>
+    dependency_a = <<2::128>>
+    dependency_b = <<3::128>>
+
+    graph_opts = [
+      application_load_fn: fn _application -> :ok end,
+      application_spec_fn: fn
+        :symphony_elixir, :modules -> [String]
+        :symphony_elixir, :applications -> [:runtime_dependency]
+        :symphony_elixir, :included_applications -> []
+        :symphony_elixir, :optional_applications -> []
+        :runtime_dependency, :modules -> [Enum]
+        :runtime_dependency, :applications -> [:symphony_elixir]
+        :runtime_dependency, :included_applications -> nil
+        :runtime_dependency, :optional_applications -> nil
+      end
+    ]
+
+    identity_fn = fn dependency_identity ->
+      fn
+        String -> {:ok, root_identity}
+        Enum -> {:ok, dependency_identity}
+      end
+    end
+
+    assert {:ok, fingerprint_a} =
+             RuntimeIdentity.fingerprint(Keyword.put(graph_opts, :module_identity_fn, identity_fn.(dependency_a)))
+
+    assert {:ok, fingerprint_b} =
+             RuntimeIdentity.fingerprint(Keyword.put(graph_opts, :module_identity_fn, identity_fn.(dependency_b)))
+
+    refute fingerprint_a == fingerprint_b
+
+    assert {:error, {:runtime_identity_application_spec_invalid, :runtime_dependency, :applications}} =
+             RuntimeIdentity.fingerprint(
+               Keyword.put(graph_opts, :application_spec_fn, fn
+                 :symphony_elixir, :modules -> [String]
+                 :symphony_elixir, :applications -> [:runtime_dependency]
+                 :symphony_elixir, :included_applications -> []
+                 :symphony_elixir, :optional_applications -> []
+                 :runtime_dependency, :modules -> [Enum]
+                 :runtime_dependency, :applications -> :invalid
+                 :runtime_dependency, :included_applications -> []
+                 :runtime_dependency, :optional_applications -> []
+               end)
              )
   end
 
