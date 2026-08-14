@@ -324,7 +324,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest)
     System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", attestation_path)
 
-    assert :ignore = StartupAttestation.start_link([])
+    assert {:ok, attestation_pid} = StartupAttestation.start_link([])
+    GenServer.stop(attestation_pid)
     assert File.stat!(attestation_path).mode == 0o100600
 
     attestation =
@@ -350,13 +351,58 @@ defmodule SymphonyElixir.ExtensionsTest do
       SymphonyElixir.Application.child_specs()
       |> Enum.map(&Supervisor.child_spec(&1, []).id)
 
+    workflow_index = Enum.find_index(child_ids, &(&1 == WorkflowStore))
     attestation_index = Enum.find_index(child_ids, &(&1 == StartupAttestation))
+    task_supervisor_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.TaskSupervisor))
+    poll_guard_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.PollGuardSupervisor))
     orchestrator_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.Orchestrator))
     http_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.HttpServer))
 
     assert SymphonyElixir.Application.supervisor_strategy() == :rest_for_one
+    assert Supervisor.child_spec(StartupAttestation, []).restart == :permanent
+    assert workflow_index < attestation_index
+    assert attestation_index < task_supervisor_index
+    assert attestation_index < poll_guard_index
+    assert task_supervisor_index < orchestrator_index
+    assert poll_guard_index < orchestrator_index
     assert attestation_index < orchestrator_index
     assert attestation_index < http_index
+
+    old_workflow_store = Process.whereis(WorkflowStore)
+    old_attestation = supervisor_child_pid(StartupAttestation)
+    old_task_supervisor = Process.whereis(SymphonyElixir.TaskSupervisor)
+    old_poll_guard = Process.whereis(SymphonyElixir.PollGuardSupervisor)
+    old_orchestrator = Process.whereis(SymphonyElixir.Orchestrator)
+
+    task = fn -> Process.sleep(:infinity) end
+    {:ok, task_pid} = Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, task)
+    {:ok, guard_pid} = DynamicSupervisor.start_child(SymphonyElixir.PollGuardSupervisor, {Task, task})
+    task_ref = Process.monitor(task_pid)
+    guard_ref = Process.monitor(guard_pid)
+
+    Process.exit(old_workflow_store, :kill)
+
+    assert_receive {:DOWN, ^task_ref, :process, ^task_pid, _reason}, 1_000
+    assert_receive {:DOWN, ^guard_ref, :process, ^guard_pid, _reason}, 1_000
+
+    assert_eventually(fn ->
+      new_workflow_store = Process.whereis(WorkflowStore)
+      new_attestation = supervisor_child_pid(StartupAttestation)
+      new_task_supervisor = Process.whereis(SymphonyElixir.TaskSupervisor)
+      new_poll_guard = Process.whereis(SymphonyElixir.PollGuardSupervisor)
+      new_orchestrator = Process.whereis(SymphonyElixir.Orchestrator)
+
+      Enum.all?(
+        [
+          {new_workflow_store, old_workflow_store},
+          {new_attestation, old_attestation},
+          {new_task_supervisor, old_task_supervisor},
+          {new_poll_guard, old_poll_guard},
+          {new_orchestrator, old_orchestrator}
+        ],
+        fn {new_pid, old_pid} -> is_pid(new_pid) and new_pid != old_pid and Process.alive?(new_pid) end
+      )
+    end)
   end
 
   test "startup attestation fails closed when its managed path is missing or unwritable" do
@@ -375,17 +421,18 @@ defmodule SymphonyElixir.ExtensionsTest do
     System.delete_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
     System.delete_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
     System.delete_env("SYMPHONY_MANAGED_PROJECT")
-    assert :ignore = StartupAttestation.start_link()
+    assert {:ok, unmanaged_attestation_pid} = StartupAttestation.start_link()
+    GenServer.stop(unmanaged_attestation_pid)
 
     System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-test")
-    assert {:error, :missing_managed_startup_digest} = StartupAttestation.start_link([])
+    assert {:error, :missing_managed_startup_digest} = StartupAttestation.admit([])
     System.delete_env("SYMPHONY_MANAGED_PROJECT")
 
     System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest)
-    assert {:error, :missing_startup_attestation_path} = StartupAttestation.start_link([])
+    assert {:error, :missing_startup_attestation_path} = StartupAttestation.admit([])
 
     System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", Path.dirname(Workflow.workflow_file_path()))
-    assert {:error, {:startup_attestation_write_failed, _reason}} = StartupAttestation.start_link([])
+    assert {:error, {:startup_attestation_write_failed, _reason}} = StartupAttestation.admit([])
 
     missing_parent_path =
       Workflow.workflow_file_path()
@@ -393,22 +440,22 @@ defmodule SymphonyElixir.ExtensionsTest do
       |> Path.join("missing-parent/startup-attestation")
 
     System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", missing_parent_path)
-    assert {:error, {:startup_attestation_write_failed, :enoent}} = StartupAttestation.start_link([])
+    assert {:error, {:startup_attestation_write_failed, :enoent}} = StartupAttestation.admit([])
 
     valid_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "failed-startup-attestation")
     System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", valid_path)
 
     assert {:error, :empty_process_start} =
-             StartupAttestation.start_link(process_start_result: {"\n", 0})
+             StartupAttestation.admit(process_start_result: {"\n", 0})
 
     assert {:error, {:process_start_failed, 1, "ps failed"}} =
-             StartupAttestation.start_link(process_start_result: {"ps failed\n", 1})
+             StartupAttestation.admit(process_start_result: {"ps failed\n", 1})
 
     mismatched_digest = String.duplicate("0", 64)
     System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", mismatched_digest)
 
     assert {:error, {:startup_attestation_digest_mismatch, ^mismatched_digest, ^workflow_digest}} =
-             StartupAttestation.start_link([])
+             StartupAttestation.admit([])
   end
 
   test "workflow store keeps last good authority across schema-invalid YAML reloads" do
@@ -2300,5 +2347,14 @@ defmodule SymphonyElixir.ExtensionsTest do
         {:error, {:already_started, _pid}} -> :ok
       end
     end
+  end
+
+  defp supervisor_child_pid(child_id) do
+    SymphonyElixir.Supervisor
+    |> Supervisor.which_children()
+    |> Enum.find_value(fn
+      {^child_id, pid, _type, _modules} when is_pid(pid) -> pid
+      _child -> nil
+    end)
   end
 end

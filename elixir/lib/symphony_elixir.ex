@@ -35,11 +35,11 @@ defmodule SymphonyElixir.Application do
     [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
       {Registry, keys: :unique, name: SymphonyElixir.PollTaskRegistry},
-      {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
-      {DynamicSupervisor, strategy: :one_for_one, name: SymphonyElixir.PollGuardSupervisor},
       SymphonyElixir.WorkflowStore,
       SymphonyElixir.StartupAttestation,
-      SymphonyElixir.Orchestrator,
+      {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
+      {DynamicSupervisor, strategy: :one_for_one, name: SymphonyElixir.PollGuardSupervisor},
+      {SymphonyElixir.Orchestrator, startup_settings_fn: &SymphonyElixir.StartupAttestation.settings_with_authority!/0},
       SymphonyElixir.HttpServer,
       SymphonyElixir.StatusDashboard
     ]

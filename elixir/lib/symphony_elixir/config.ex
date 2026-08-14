@@ -55,15 +55,20 @@ defmodule SymphonyElixir.Config do
   @spec settings_with_authority!() :: {Schema.t(), term(), term()}
   def settings_with_authority! do
     case WorkflowStore.current_with_authority() do
-      {:ok, %{config: config}, authority_generation, tracker_authority_generation}
-      when is_map(config) ->
-        case Schema.parse(config) do
-          {:ok, settings} ->
-            {settings, authority_generation, tracker_authority_generation}
+      {:ok, workflow, authority_generation, tracker_authority_generation} ->
+        {settings_for_workflow!(workflow), authority_generation, tracker_authority_generation}
 
-          {:error, reason} ->
-            raise ArgumentError, message: format_config_error(reason)
-        end
+      {:error, reason} ->
+        raise ArgumentError, message: format_config_error(reason)
+    end
+  end
+
+  @doc false
+  @spec settings_for_workflow!(Workflow.loaded_workflow()) :: Schema.t()
+  def settings_for_workflow!(%{config: config}) when is_map(config) do
+    case Schema.parse(config) do
+      {:ok, settings} ->
+        settings
 
       {:error, reason} ->
         raise ArgumentError, message: format_config_error(reason)

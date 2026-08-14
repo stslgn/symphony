@@ -104,8 +104,10 @@ defmodule SymphonyElixir.Orchestrator do
   def init(opts) do
     now_ms = System.monotonic_time(:millisecond)
 
-    {config, authority_generation, tracker_authority_generation} =
-      Config.settings_with_authority!()
+    startup_settings_fn =
+      Keyword.get(opts, :startup_settings_fn, &Config.settings_with_authority!/0)
+
+    {config, authority_generation, tracker_authority_generation} = startup_settings_fn.()
 
     run_ledger_path = Keyword.get(opts, :run_ledger_path, RunLedger.default_path())
     run_ledger_append_fn = Keyword.get(opts, :run_ledger_append_fn, &RunLedger.append/2)

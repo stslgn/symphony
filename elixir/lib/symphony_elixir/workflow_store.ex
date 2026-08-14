@@ -81,6 +81,12 @@ defmodule SymphonyElixir.WorkflowStore do
     GenServer.call(__MODULE__, :startup_digest)
   end
 
+  @spec startup_snapshot_with_authority() ::
+          {:ok, Workflow.loaded_workflow(), term(), term(), String.t()}
+  def startup_snapshot_with_authority do
+    GenServer.call(__MODULE__, :startup_snapshot_with_authority)
+  end
+
   @spec authority_generation() :: {pid(), non_neg_integer()} | {:standalone, term()}
   def authority_generation do
     case Process.whereis(__MODULE__) do
@@ -138,6 +144,13 @@ defmodule SymphonyElixir.WorkflowStore do
 
   def handle_call(:startup_digest, _from, %State{stamp: stamp} = state) do
     {:reply, Base.encode16(stamp, case: :lower), state}
+  end
+
+  def handle_call(:startup_snapshot_with_authority, _from, %State{} = state) do
+    {:ok, workflow, authority_generation, tracker_authority_generation} = authority_snapshot(state)
+    digest = Base.encode16(state.stamp, case: :lower)
+
+    {:reply, {:ok, workflow, authority_generation, tracker_authority_generation, digest}, state}
   end
 
   def handle_call(:current_with_authority, _from, %State{} = state) do
