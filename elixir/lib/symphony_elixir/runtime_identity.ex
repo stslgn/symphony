@@ -2,6 +2,7 @@ defmodule SymphonyElixir.RuntimeIdentity do
   @moduledoc false
 
   @application :symphony_elixir
+  @loader_env ~w(ERL_AFLAGS ERL_ZFLAGS ERL_FLAGS ERL_LIBS ELIXIR_ERL_OPTIONS)
 
   @type evidence :: %{
           image_sha256: String.t(),
@@ -26,6 +27,31 @@ defmodule SymphonyElixir.RuntimeIdentity do
          execution_sha256: execution_sha256
        }}
     end
+  end
+
+  @spec write_manifest!(Path.t(), Path.t()) :: :ok
+  def write_manifest!(image_path, manifest_path) do
+    {output, 0} =
+      System.cmd(Path.expand(image_path), ["--runtime-identity"],
+        stderr_to_stdout: true,
+        env: Enum.map(@loader_env, &{&1, nil})
+      )
+
+    ["image_sha256=" <> image_sha256, "execution_sha256=" <> execution_sha256] =
+      String.split(output, "\n", trim: true)
+
+    true = valid_sha256?(image_sha256)
+    true = valid_sha256?(execution_sha256)
+    {:ok, image_bytes} = File.read(image_path)
+    ^image_sha256 = sha256(image_bytes)
+
+    manifest =
+      "image_sha256=#{image_sha256}\nexecution_sha256=#{execution_sha256}\n"
+
+    temp_path = "#{manifest_path}.tmp.#{System.unique_integer([:positive])}"
+    :ok = File.write(temp_path, manifest)
+    :ok = File.chmod(temp_path, 0o600)
+    :ok = File.rename(temp_path, manifest_path)
   end
 
   @spec fingerprint(keyword()) :: {:ok, String.t()} | {:error, term()}

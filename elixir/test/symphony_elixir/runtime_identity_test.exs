@@ -208,4 +208,40 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
     assert {:error, :runtime_identity_probe_failed} =
              RuntimeIdentity.evidence(Keyword.put(base_opts, :fingerprint_fn, fn -> {:error, :runtime_identity_probe_failed} end))
   end
+
+  test "writes a build-time manifest bound to the exact runtime image" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-runtime-manifest-#{System.unique_integer([:positive])}")
+
+    runtime_path = Path.join(test_root, "symphony")
+    manifest_path = Path.join(test_root, "symphony.runtime-identity")
+    execution_sha256 = String.duplicate("a", 64)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+    File.mkdir_p!(test_root)
+
+    File.write!(
+      runtime_path,
+      """
+      #!/bin/sh
+      image_sha256="$(/usr/bin/shasum -a 256 "$0" | /usr/bin/awk '{print $1}')"
+      printf 'image_sha256=%s\nexecution_sha256=#{execution_sha256}\n' "$image_sha256"
+      """
+    )
+
+    File.chmod!(runtime_path, 0o700)
+
+    assert :ok = RuntimeIdentity.write_manifest!(runtime_path, manifest_path)
+
+    runtime_sha256 =
+      runtime_path
+      |> File.read!()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    assert File.read!(manifest_path) ==
+             "image_sha256=#{runtime_sha256}\nexecution_sha256=#{execution_sha256}\n"
+
+    assert File.stat!(manifest_path).mode |> Bitwise.band(0o777) == 0o600
+  end
 end
