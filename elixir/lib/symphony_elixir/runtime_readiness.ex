@@ -7,7 +7,7 @@ defmodule SymphonyElixir.RuntimeReadiness do
 
   @readiness_path_env "SYMPHONY_RUNTIME_READINESS_PATH"
   @managed_project_env "SYMPHONY_MANAGED_PROJECT"
-  @protocol "2"
+  @protocol "3"
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -64,12 +64,14 @@ defmodule SymphonyElixir.RuntimeReadiness do
   defp validate_path(_path), do: :ok
 
   defp validate_admission(%{
+         execution_sha256: execution_sha256,
          process_start: process_start,
          runtime_sha256: runtime_sha256,
          workflow_sha256: workflow_sha256
        })
        when is_binary(process_start) and process_start != "" do
-    if valid_sha256?(runtime_sha256) and valid_sha256?(workflow_sha256) do
+    if valid_sha256?(execution_sha256) and valid_sha256?(runtime_sha256) and
+         valid_sha256?(workflow_sha256) do
       :ok
     else
       {:error, :invalid_startup_admission_evidence}
@@ -88,7 +90,8 @@ defmodule SymphonyElixir.RuntimeReadiness do
           "pid=#{System.pid()}",
           "process_start=#{admission.process_start}",
           "workflow_sha256=#{admission.workflow_sha256}",
-          "runtime_sha256=#{admission.runtime_sha256}"
+          "runtime_sha256=#{admission.runtime_sha256}",
+          "execution_sha256=#{admission.execution_sha256}"
         ],
         "\n"
       ) <> "\n"

@@ -3,10 +3,13 @@ defmodule SymphonyElixir.CLI do
   Escript entrypoint for running Symphony with an explicit WORKFLOW.md path.
   """
 
-  alias SymphonyElixir.LogFile
+  alias SymphonyElixir.{LogFile, RuntimeIdentity}
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
-  @startup_protocol "2"
+  @startup_protocol "3"
+  @managed_project_env "SYMPHONY_MANAGED_PROJECT"
+  @expected_runtime_identity_env "SYMPHONY_EXPECTED_EXECUTION_SHA256"
+  @verified_runtime_identity_env "SYMPHONY_VERIFIED_EXECUTION_SHA256"
   @switches [{@acknowledgement_switch, :boolean}, logs_root: :string, port: :integer]
 
   @type ensure_started_result :: {:ok, [atom()]} | {:error, term()}
@@ -23,19 +26,48 @@ defmodule SymphonyElixir.CLI do
     IO.puts(startup_protocol())
   end
 
-  def main(args) do
-    case evaluate(args) do
-      :ok ->
-        wait_for_shutdown()
+  def main(["--runtime-identity"]) do
+    case RuntimeIdentity.fingerprint() do
+      {:ok, digest} -> IO.puts(digest)
+      {:error, reason} -> halt_runtime_identity(reason)
+    end
+  end
 
-      {:error, message} ->
-        IO.puts(:stderr, message)
-        System.halt(1)
+  def main(args) do
+    with :ok <- admit_runtime_identity() do
+      case evaluate(args) do
+        :ok ->
+          wait_for_shutdown()
+
+        {:error, message} ->
+          IO.puts(:stderr, message)
+          System.halt(1)
+      end
+    else
+      {:error, reason} -> halt_runtime_identity(reason)
     end
   end
 
   @spec startup_protocol() :: String.t()
   def startup_protocol, do: @startup_protocol
+
+  defp admit_runtime_identity do
+    if System.get_env(@managed_project_env) in [nil, ""] do
+      System.delete_env(@verified_runtime_identity_env)
+      :ok
+    else
+      expected = System.get_env(@expected_runtime_identity_env)
+
+      with {:ok, actual} <- RuntimeIdentity.verify(expected) do
+        System.put_env(@verified_runtime_identity_env, actual)
+      end
+    end
+  end
+
+  defp halt_runtime_identity(reason) do
+    IO.puts(:stderr, "runtime_identity_unavailable: #{inspect(reason)}")
+    System.halt(78)
+  end
 
   @spec evaluate([String.t()], deps()) :: :ok | {:error, String.t()}
   def evaluate(args, deps \\ runtime_deps()) do

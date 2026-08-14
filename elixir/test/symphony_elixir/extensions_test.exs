@@ -338,11 +338,12 @@ defmodule SymphonyElixir.ExtensionsTest do
       |> String.split("\n", trim: true)
       |> Map.new(fn line -> List.to_tuple(String.split(line, "=", parts: 2)) end)
 
-    assert attestation["protocol"] == "2"
+    assert attestation["protocol"] == "3"
     assert attestation["pid"] == System.pid()
     assert attestation["process_start"] != ""
     assert attestation["workflow_sha256"] == workflow_digest
     assert attestation["runtime_sha256"] == runtime_digest
+    assert attestation["execution_sha256"] == "unmanaged"
     assert System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256") == workflow_digest
     assert System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH") == attestation_path
 
@@ -379,6 +380,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     workflow_digest = WorkflowStore.startup_digest()
     {runtime_path, runtime_digest} = executing_escript_evidence()
+    execution_digest = String.duplicate("e", 64)
     state_dir = Path.dirname(Workflow.workflow_file_path())
     admission_path = Path.join(state_dir, "restart-startup-admission")
     readiness_path = Path.join(state_dir, "restart-runtime-readiness")
@@ -387,6 +389,8 @@ defmodule SymphonyElixir.ExtensionsTest do
       {"SYMPHONY_MANAGED_PROJECT", "managed-restart-test"},
       {"SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest},
       {"SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest},
+      {"SYMPHONY_EXPECTED_EXECUTION_SHA256", execution_digest},
+      {"SYMPHONY_VERIFIED_EXECUTION_SHA256", execution_digest},
       {"SYMPHONY_RUNTIME_IMAGE_PATH", runtime_path},
       {"SYMPHONY_STARTUP_ATTESTATION_PATH", admission_path},
       {"SYMPHONY_RUNTIME_READINESS_PATH", readiness_path}
@@ -440,15 +444,17 @@ defmodule SymphonyElixir.ExtensionsTest do
       )
     end)
 
-    assert File.read!(admission_path) =~ "protocol=2\n"
-    assert File.read!(readiness_path) =~ "protocol=2\n"
+    assert File.read!(admission_path) =~ "protocol=3\n"
+    assert File.read!(readiness_path) =~ "protocol=3\n"
     assert File.read!(readiness_path) =~ "runtime_sha256=#{runtime_digest}\n"
+    assert File.read!(readiness_path) =~ "execution_sha256=#{execution_digest}\n"
   end
 
   test "runtime readiness is distinct from pre-IO startup admission" do
     ensure_workflow_store_running()
     workflow_digest = WorkflowStore.startup_digest()
     {runtime_path, runtime_digest} = executing_escript_evidence()
+    execution_digest = String.duplicate("e", 64)
     state_dir = Path.dirname(Workflow.workflow_file_path())
     admission_path = Path.join(state_dir, "startup-admission")
     readiness_path = Path.join(state_dir, "runtime-readiness")
@@ -457,6 +463,8 @@ defmodule SymphonyElixir.ExtensionsTest do
       {"SYMPHONY_MANAGED_PROJECT", "managed-readiness-test"},
       {"SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest},
       {"SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest},
+      {"SYMPHONY_EXPECTED_EXECUTION_SHA256", execution_digest},
+      {"SYMPHONY_VERIFIED_EXECUTION_SHA256", execution_digest},
       {"SYMPHONY_RUNTIME_IMAGE_PATH", runtime_path},
       {"SYMPHONY_STARTUP_ATTESTATION_PATH", admission_path},
       {"SYMPHONY_RUNTIME_READINESS_PATH", readiness_path}
@@ -478,9 +486,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, %{path: ^readiness_path}} = RuntimeReadiness.attest(admission: admission)
 
     readiness = File.read!(readiness_path)
-    assert readiness =~ "protocol=2\n"
+    assert readiness =~ "protocol=3\n"
     assert readiness =~ "workflow_sha256=#{workflow_digest}\n"
     assert readiness =~ "runtime_sha256=#{runtime_digest}\n"
+    assert readiness =~ "execution_sha256=#{execution_digest}\n"
   end
 
   test "startup admission fails closed on unsafe or unreadable prior readiness" do
@@ -534,6 +543,8 @@ defmodule SymphonyElixir.ExtensionsTest do
       "SYMPHONY_MANAGED_PROJECT",
       "SYMPHONY_EXPECTED_WORKFLOW_SHA256",
       "SYMPHONY_EXPECTED_RUNTIME_SHA256",
+      "SYMPHONY_EXPECTED_EXECUTION_SHA256",
+      "SYMPHONY_VERIFIED_EXECUTION_SHA256",
       "SYMPHONY_RUNTIME_IMAGE_PATH",
       "SYMPHONY_STARTUP_ATTESTATION_PATH"
     ]
@@ -551,6 +562,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-runtime-measurement-test")
     System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest)
     System.put_env("SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest)
+    execution_digest = String.duplicate("e", 64)
+    System.put_env("SYMPHONY_EXPECTED_EXECUTION_SHA256", execution_digest)
+    System.put_env("SYMPHONY_VERIFIED_EXECUTION_SHA256", execution_digest)
     System.put_env("SYMPHONY_RUNTIME_IMAGE_PATH", runtime_image)
     System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", admission_path)
 
@@ -559,7 +573,21 @@ defmodule SymphonyElixir.ExtensionsTest do
       script_name_result: {:ok, runtime_image}
     ]
 
-    assert {:ok, %{runtime_sha256: ^runtime_digest}} = StartupAttestation.admit(opts)
+    assert {:ok, %{runtime_sha256: ^runtime_digest, execution_sha256: ^execution_digest}} =
+             StartupAttestation.admit(opts)
+
+    System.delete_env("SYMPHONY_VERIFIED_EXECUTION_SHA256")
+    assert {:error, :missing_verified_runtime_identity} = StartupAttestation.admit(opts)
+
+    System.put_env("SYMPHONY_VERIFIED_EXECUTION_SHA256", String.duplicate("f", 64))
+
+    assert {:error, {:verified_runtime_identity_mismatch, ^execution_digest, _actual}} =
+             StartupAttestation.admit(opts)
+
+    System.put_env("SYMPHONY_VERIFIED_EXECUTION_SHA256", execution_digest)
+    System.delete_env("SYMPHONY_EXPECTED_EXECUTION_SHA256")
+    assert {:error, :missing_managed_runtime_identity} = StartupAttestation.admit(opts)
+    System.put_env("SYMPHONY_EXPECTED_EXECUTION_SHA256", execution_digest)
 
     File.chmod!(runtime_image, 0o600)
     File.write!(runtime_image, "runtime-b")
@@ -602,11 +630,13 @@ defmodule SymphonyElixir.ExtensionsTest do
     readiness_path = Path.join(state_dir, "runtime-readiness-lifecycle")
     symlink_target = Path.join(state_dir, "runtime-readiness-target")
     runtime_digest = String.duplicate("d", 64)
+    execution_digest = String.duplicate("e", 64)
     workflow_digest = WorkflowStore.startup_digest()
 
     admission = %{
       process_start: "Fri Aug 14 12:00:00 2026",
       runtime_sha256: runtime_digest,
+      execution_sha256: execution_digest,
       workflow_sha256: workflow_digest
     }
 

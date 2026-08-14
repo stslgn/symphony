@@ -9,9 +9,11 @@ defmodule SymphonyElixir.StartupAttestation do
   @attestation_path_env "SYMPHONY_STARTUP_ATTESTATION_PATH"
   @runtime_readiness_path_env "SYMPHONY_RUNTIME_READINESS_PATH"
   @expected_runtime_digest_env "SYMPHONY_EXPECTED_RUNTIME_SHA256"
+  @expected_execution_digest_env "SYMPHONY_EXPECTED_EXECUTION_SHA256"
+  @verified_execution_digest_env "SYMPHONY_VERIFIED_EXECUTION_SHA256"
   @runtime_image_path_env "SYMPHONY_RUNTIME_IMAGE_PATH"
   @managed_project_env "SYMPHONY_MANAGED_PROJECT"
-  @protocol "2"
+  @protocol "3"
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -69,7 +71,15 @@ defmodule SymphonyElixir.StartupAttestation do
   end
 
   def handle_call(:evidence, _from, admission) do
-    {:reply, Map.take(admission, [:process_start, :runtime_sha256, :workflow_sha256]), admission}
+    evidence =
+      Map.take(admission, [
+        :execution_sha256,
+        :process_start,
+        :runtime_sha256,
+        :workflow_sha256
+      ])
+
+    {:reply, evidence, admission}
   end
 
   defp build_admission(opts) do
@@ -78,7 +88,8 @@ defmodule SymphonyElixir.StartupAttestation do
     with {:ok, workflow, authority_generation, tracker_authority_generation, actual} <-
            WorkflowStore.startup_snapshot_with_authority(),
          settings = Config.settings_for_workflow!(workflow),
-         {:ok, process_start, runtime_sha256} <- attest_if_required(expected, actual, opts) do
+         {:ok, process_start, runtime_sha256, execution_sha256} <-
+           attest_if_required(expected, actual, opts) do
       {:ok,
        %{
          settings: settings,
@@ -86,6 +97,7 @@ defmodule SymphonyElixir.StartupAttestation do
          tracker_authority_generation: tracker_authority_generation,
          workflow_sha256: actual,
          runtime_sha256: runtime_sha256,
+         execution_sha256: execution_sha256,
          process_start: process_start
        }}
     end
@@ -97,7 +109,7 @@ defmodule SymphonyElixir.StartupAttestation do
         {:error, :missing_managed_startup_digest}
 
       {false, expected} when expected in [nil, ""] ->
-        {:ok, nil, nil}
+        {:ok, nil, nil, nil}
 
       {_managed, expected} ->
         attest(expected, actual, opts)
@@ -119,11 +131,46 @@ defmodule SymphonyElixir.StartupAttestation do
         {:error, :missing_managed_runtime_digest}
 
       true ->
-        with {:ok, verified_runtime_sha256} <- verify_runtime_digest(runtime_sha256, opts),
+        with {:ok, execution_sha256} <- verify_execution_identity(opts),
+             {:ok, verified_runtime_sha256} <- verify_runtime_digest(runtime_sha256, opts),
              {:ok, process_start} <- process_start(opts),
-             :ok <- write_attestation(path, actual, verified_runtime_sha256, process_start) do
-          {:ok, process_start, verified_runtime_sha256}
+             :ok <-
+               write_attestation(
+                 path,
+                 actual,
+                 verified_runtime_sha256,
+                 execution_sha256,
+                 process_start
+               ) do
+          {:ok, process_start, verified_runtime_sha256, execution_sha256}
         end
+    end
+  end
+
+  defp verify_execution_identity(opts) do
+    if managed?() do
+      expected = System.get_env(@expected_execution_digest_env)
+
+      verified =
+        Keyword.get_lazy(opts, :verified_execution_sha256, fn ->
+          System.get_env(@verified_execution_digest_env)
+        end)
+
+      cond do
+        not valid_sha256?(expected) ->
+          {:error, :missing_managed_runtime_identity}
+
+        not valid_sha256?(verified) ->
+          {:error, :missing_verified_runtime_identity}
+
+        String.downcase(expected) != String.downcase(verified) ->
+          {:error, {:verified_runtime_identity_mismatch, expected, verified}}
+
+        true ->
+          {:ok, String.downcase(verified)}
+      end
+    else
+      {:ok, nil}
     end
   end
 
@@ -221,7 +268,7 @@ defmodule SymphonyElixir.StartupAttestation do
     end
   end
 
-  defp write_attestation(path, digest, runtime_sha256, process_start) do
+  defp write_attestation(path, digest, runtime_sha256, execution_sha256, process_start) do
     temporary_path = "#{path}.tmp.#{System.unique_integer([:positive])}"
 
     content =
@@ -231,7 +278,8 @@ defmodule SymphonyElixir.StartupAttestation do
           "pid=#{System.pid()}",
           "process_start=#{process_start}",
           "workflow_sha256=#{digest}",
-          "runtime_sha256=#{runtime_sha256 || "unmanaged"}"
+          "runtime_sha256=#{runtime_sha256 || "unmanaged"}",
+          "execution_sha256=#{execution_sha256 || "unmanaged"}"
         ],
         "\n"
       ) <> "\n"
