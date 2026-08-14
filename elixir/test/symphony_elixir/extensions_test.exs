@@ -481,6 +481,123 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert readiness =~ "runtime_sha256=#{runtime_digest}\n"
   end
 
+  test "startup admission fails closed on unsafe or unreadable prior readiness" do
+    state_dir = Path.dirname(Workflow.workflow_file_path())
+    symlink_target = Path.join(state_dir, "readiness-target")
+    readiness_path = Path.join(state_dir, "unsafe-readiness")
+    previous_path = System.get_env("SYMPHONY_RUNTIME_READINESS_PATH")
+    previous_managed_project = System.get_env("SYMPHONY_MANAGED_PROJECT")
+    previous_digest = System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_RUNTIME_READINESS_PATH", previous_path)
+      restore_env("SYMPHONY_MANAGED_PROJECT", previous_managed_project)
+      restore_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", previous_digest)
+      Process.flag(:trap_exit, previous_trap_exit)
+    end)
+
+    File.write!(symlink_target, "preserve")
+    File.ln_s!(symlink_target, readiness_path)
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", readiness_path)
+
+    assert {:error, :unsafe_runtime_readiness_path} = StartupAttestation.start_link()
+    assert File.read!(symlink_target) == "preserve"
+
+    File.rm!(readiness_path)
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", Path.join(state_dir, "missing-readiness"))
+    assert {:ok, missing_path_pid} = StartupAttestation.start_link()
+    GenServer.stop(missing_path_pid)
+
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", String.duplicate("x", 5_000))
+
+    assert {:error, {:runtime_readiness_invalidation_failed, _reason}} =
+             StartupAttestation.start_link()
+
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", Path.join(state_dir, "missing-again"))
+    System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-admission-error-test")
+    System.delete_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    assert {:error, :missing_managed_startup_digest} = StartupAttestation.start_link()
+  end
+
+  test "runtime readiness fails closed and removes only its own regular evidence" do
+    ensure_workflow_store_running()
+    state_dir = Path.dirname(Workflow.workflow_file_path())
+    readiness_path = Path.join(state_dir, "runtime-readiness-lifecycle")
+    symlink_target = Path.join(state_dir, "runtime-readiness-target")
+    runtime_digest = String.duplicate("d", 64)
+    workflow_digest = WorkflowStore.startup_digest()
+
+    admission = %{
+      process_start: "Fri Aug 14 12:00:00 2026",
+      runtime_sha256: runtime_digest,
+      workflow_sha256: workflow_digest
+    }
+
+    env = [
+      {"SYMPHONY_MANAGED_PROJECT", "managed-runtime-readiness-test"},
+      {"SYMPHONY_RUNTIME_READINESS_PATH", readiness_path}
+    ]
+
+    previous_env = Map.new(env, fn {name, _value} -> {name, System.get_env(name)} end)
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    on_exit(fn ->
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+      Process.flag(:trap_exit, previous_trap_exit)
+    end)
+
+    Enum.each(env, fn {name, value} -> System.put_env(name, value) end)
+
+    System.delete_env("SYMPHONY_RUNTIME_READINESS_PATH")
+    assert {:error, :missing_runtime_readiness_path} = RuntimeReadiness.attest()
+
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", readiness_path)
+
+    assert {:error, :invalid_startup_admission_evidence} =
+             RuntimeReadiness.attest(admission: %{})
+
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", state_dir)
+
+    assert {:error, {:runtime_readiness_write_failed, _reason}} =
+             RuntimeReadiness.attest(admission: admission)
+
+    missing_parent_path = Path.join(state_dir, "missing-readiness-parent/runtime-readiness")
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", missing_parent_path)
+
+    assert {:error, {:runtime_readiness_write_failed, :enoent}} =
+             RuntimeReadiness.attest(admission: admission)
+
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", readiness_path)
+    assert {:ok, readiness_pid} = RuntimeReadiness.start_link(admission: admission)
+    assert File.exists?(readiness_path)
+    GenServer.stop(readiness_pid)
+    refute File.exists?(readiness_path)
+
+    assert {:ok, missing_file_pid} = RuntimeReadiness.start_link(admission: admission)
+    File.rm!(readiness_path)
+    GenServer.stop(missing_file_pid)
+
+    assert {:ok, symlink_pid} = RuntimeReadiness.start_link(admission: admission)
+    File.rm!(readiness_path)
+    File.write!(symlink_target, "preserve")
+    File.ln_s!(symlink_target, readiness_path)
+    GenServer.stop(symlink_pid)
+    assert File.lstat!(readiness_path).type == :symlink
+    assert File.read!(symlink_target) == "preserve"
+
+    assert :ok =
+             RuntimeReadiness.terminate(:normal, %{path: String.duplicate("x", 5_000)})
+
+    System.delete_env("SYMPHONY_MANAGED_PROJECT")
+    assert {:ok, unmanaged_pid} = RuntimeReadiness.start_link()
+    GenServer.stop(unmanaged_pid)
+
+    System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-runtime-readiness-test")
+    System.delete_env("SYMPHONY_RUNTIME_READINESS_PATH")
+    assert {:error, :missing_runtime_readiness_path} = RuntimeReadiness.start_link()
+  end
+
   test "orchestrator cannot replace admitted authority during an A-B-A startup race" do
     ensure_workflow_store_running()
     workflow_path = Workflow.workflow_file_path()
