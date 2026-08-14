@@ -255,7 +255,10 @@ Notes:
   `SYMPHONY_EXPECTED_EXECUTION_SHA256`, a deterministic fingerprint of the loaded BEAM identities
   for Symphony and the recursive graph of bundled application dependencies. `mix build` writes a
   mode-0600 `bin/symphony.runtime-identity` manifest that binds the completed escript image digest
-  to that execution fingerprint. The side-effect-free identity probe reports both its own image
+  to that execution fingerprint. Manifest generation invokes the exact escript probe through an
+  explicit `env -i` allowlist, so inherited escript-emulator, Erlang-root, BEAM-loader, or
+  version-specific VM selectors cannot fabricate build evidence. The side-effect-free identity
+  probe reports both its own image
   SHA-256 and its loaded-code fingerprint; the launcher accepts it only when the snapshot digest,
   build manifest, and live probe all agree. Before application startup, Symphony computes the
   execution fingerprint from loaded code and refuses an image/path A-B-A substitution even if the
