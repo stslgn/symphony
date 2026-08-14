@@ -426,6 +426,8 @@ Fields:
 - `operator_user_ids` (list of strings, default `[]`)
   - Exact Linear user IDs authorized to submit bounded operator comment commands.
   - Empty disables comment commands.
+  - The effective allowlist MUST be pinned to the runner generation. A runtime change MUST disable
+    comment commands until restart; it MUST NOT grant or retain authority through hot reload.
   - The identity associated with `tracker.api_key` MUST remain rejected even if listed, because a
     worker can publish comments through the same credential.
 - `project_slug` (string)
@@ -654,6 +656,8 @@ Dynamic reload is REQUIRED:
   changes.
 - Extensions that manage their own listeners/resources (for example an HTTP server port change) MAY
   require restart unless the implementation explicitly supports live rebind.
+- Security authority such as `tracker.operator_user_ids` MUST fail closed on change and MAY require
+  restart before the new value becomes effective.
 - Implementations SHOULD also re-validate/reload defensively during runtime operations (for example
   before dispatch) in case filesystem watch events are missed.
 - Invalid reloads MUST NOT crash the service; keep operating with the last known good effective
@@ -1014,6 +1018,8 @@ Operator comment input is untrusted. Implementations that support comment comman
 
 - inspect only comments belonging to currently running or parked issues;
 - accept only native comments from exact `tracker.operator_user_ids` actors;
+- pin that allowlist to the runner generation and disable comment commands until restart whenever
+  the reloaded configuration differs;
 - reject comments authored by the `tracker.api_key` identity even when it appears in the allowlist;
 - reject comments with an external-thread marker;
 - recognize commands only at the beginning of a bounded-size body;

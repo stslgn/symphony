@@ -3134,6 +3134,64 @@ defmodule SymphonyElixir.CoreTest do
       do: Process.cancel_timer(reconciled_state.tick_timer_ref)
   end
 
+  test "operator allowlist changes disable commands until runner restart" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"]
+    )
+
+    issue_id = "issue-operator-generation-drift"
+    cursor_at = ~U[2026-08-03 10:00:00Z]
+
+    assert {:ok, wait} =
+             SymphonyElixir.OperatorWait.new("waiting_secret", %{
+               issue_id: issue_id,
+               identifier: "MT-OPERATOR-GENERATION-DRIFT",
+               run_id: "run-operator-generation-drift",
+               parked_at: cursor_at
+             })
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue_id => [
+        %SymphonyElixir.Linear.Comment{
+          id: "generation-drift-retry",
+          body: "$retry",
+          created_at: DateTime.add(cursor_at, 1, :second),
+          author_id: "operator-2"
+        }
+      ]
+    })
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: nil,
+      dispatch_paused: true,
+      parked: %{issue_id => wait},
+      operator_user_ids_generation: ["operator-1"],
+      operator_comment_cursors: %{
+        issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-2"]
+    )
+
+    reconciled_state = Orchestrator.run_poll_cycle_for_test(state)
+    assert reconciled_state.parked[issue_id].wait_id == wait.wait_id
+
+    refute MapSet.member?(
+             reconciled_state.operator_commands.processed_comment_ids,
+             "generation-drift-retry"
+           )
+
+    if is_reference(reconciled_state.tick_timer_ref),
+      do: Process.cancel_timer(reconciled_state.tick_timer_ref)
+  end
+
   test "Linear retry command resumes a matching wait exactly once while globally paused" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -3176,6 +3234,7 @@ defmodule SymphonyElixir.CoreTest do
       max_concurrent_agents: 1,
       run_ledger_path: ledger_path,
       runner_generation: "runner-operator-retry",
+      operator_user_ids_generation: ["operator-1"],
       dispatch_paused: true,
       parked: %{issue_id => wait},
       operator_comment_cursors: %{

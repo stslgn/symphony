@@ -67,6 +67,7 @@ defmodule SymphonyElixir.Orchestrator do
       :run_ledger_append_fn,
       :task_start_fn,
       :runner_generation,
+      :operator_user_ids_generation,
       poll_generation: 0,
       poll_dirty: false,
       poll_failure_count: 0,
@@ -120,6 +121,7 @@ defmodule SymphonyElixir.Orchestrator do
             run_ledger_path: run_ledger_path,
             run_ledger_append_fn: run_ledger_append_fn,
             runner_generation: runner_generation,
+            operator_user_ids_generation: config.tracker.operator_user_ids || [],
             dispatch_paused: recovery.dispatch_paused,
             recovered_attempts: recovery.recovered_attempts,
             recovered_dispatches: recovery.recovered_dispatches,
@@ -561,7 +563,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp ensure_operator_cursors_for_poll(%State{} = state) do
-    case operator_user_ids() do
+    case operator_user_ids(state) do
       [] ->
         state
 
@@ -575,7 +577,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp poll_request(%State{} = state) do
-    operator_user_ids = operator_user_ids()
+    operator_user_ids = operator_user_ids(state)
 
     running_ids =
       state.running
@@ -3973,8 +3975,14 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp operator_user_ids do
+  defp operator_user_ids(%State{operator_user_ids_generation: nil}) do
     Config.settings!().tracker.operator_user_ids || []
+  end
+
+  defp operator_user_ids(%State{operator_user_ids_generation: generation}) do
+    configured = Config.settings!().tracker.operator_user_ids || []
+
+    if Enum.sort(configured) == Enum.sort(generation), do: generation, else: []
   end
 
   defp apply_operator_comment(state, issue_id, comment, "stop") do
