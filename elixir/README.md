@@ -251,12 +251,14 @@ Notes:
 - A managed launcher can set `SYMPHONY_EXPECTED_WORKFLOW_SHA256` to the lowercase SHA-256 of the exact
   workflow bytes it admitted. Symphony compares that value with its single initial workflow snapshot
   and stops before Orchestrator or HTTP startup when the value is malformed or does not match. When
-  that digest is managed, the launcher must also set `SYMPHONY_STARTUP_ATTESTATION_PATH`. After all
-  supervised runtime components start, Symphony atomically writes a mode-0600 protocol-1 attestation
-  containing its OS PID, locale-independent process start time, and the verified workflow digest.
-  Missing or unwritable attestation state fails startup. A successful attestation consumes both
-  one-shot environment variables so normal workflow reloads and supervised `WorkflowStore` restarts
-  are not incorrectly rechecked against the boot snapshot.
+  `SYMPHONY_MANAGED_PROJECT` is set, both that digest and `SYMPHONY_STARTUP_ATTESTATION_PATH` are
+  mandatory. Immediately after `WorkflowStore` verification and before Orchestrator or HTTP starts,
+  Symphony atomically writes a mode-0600 protocol-1 attestation containing its OS PID,
+  locale-independent process start time, and the verified workflow digest. Missing or unwritable
+  attestation state fails before external side effects. The boot authority remains available to the
+  `:rest_for_one` supervisor: a `WorkflowStore` failure restarts the attestation and every dependent
+  side-effectful child together; digest drift during that restart removes stale evidence and fails
+  closed. Ordinary in-process hot reload remains supported.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
