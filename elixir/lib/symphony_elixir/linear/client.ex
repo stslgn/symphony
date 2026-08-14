@@ -4,8 +4,8 @@ defmodule SymphonyElixir.Linear.Client do
   """
 
   require Logger
-  alias SymphonyElixir.Config
   alias SymphonyElixir.Linear.{Comment, Issue}
+  alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.PollContext
 
   @issue_page_size 50
@@ -137,8 +137,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
-    Config.settings!().tracker
-    |> SymphonyElixir.Tracker.poll_context()
+    Tracker.current_poll_context()
     |> fetch_candidate_issues()
   end
 
@@ -167,8 +166,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(state_names) when is_list(state_names) do
-    context = Config.settings!().tracker |> SymphonyElixir.Tracker.poll_context()
-    fetch_issues_by_states(state_names, context)
+    fetch_issues_by_states(state_names, Tracker.current_poll_context())
   end
 
   @spec fetch_issues_by_states([String.t()], PollContext.t()) ::
@@ -196,8 +194,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids) when is_list(issue_ids) do
-    context = Config.settings!().tracker |> SymphonyElixir.Tracker.poll_context()
-    fetch_issue_states_by_ids(issue_ids, context)
+    fetch_issue_states_by_ids(issue_ids, Tracker.current_poll_context())
   end
 
   @spec fetch_issue_states_by_ids([String.t()], PollContext.t()) ::
@@ -220,8 +217,7 @@ defmodule SymphonyElixir.Linear.Client do
           {:ok, [Comment.t()]} | {:error, term()}
   def fetch_comments_since(issue_id, %DateTime{} = created_after)
       when is_binary(issue_id) do
-    context = Config.settings!().tracker |> SymphonyElixir.Tracker.poll_context()
-    fetch_comments_since(issue_id, created_after, context)
+    fetch_comments_since(issue_id, created_after, Tracker.current_poll_context())
   end
 
   @spec fetch_comments_since(String.t(), DateTime.t(), PollContext.t()) ::
@@ -240,7 +236,7 @@ defmodule SymphonyElixir.Linear.Client do
       when is_binary(query) and is_map(variables) and is_list(opts) do
     context =
       Keyword.get_lazy(opts, :tracker_context, fn ->
-        Config.settings!().tracker |> SymphonyElixir.Tracker.poll_context()
+        Tracker.current_poll_context()
       end)
 
     payload = build_graphql_payload(query, variables, Keyword.get(opts, :operation_name))
@@ -253,6 +249,7 @@ defmodule SymphonyElixir.Linear.Client do
       end)
 
     with {:ok, headers} <- graphql_headers(context),
+         :ok <- validate_tracker_authority(context),
          {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
       {:ok, body}
     else
@@ -263,6 +260,9 @@ defmodule SymphonyElixir.Linear.Client do
         )
 
         {:error, {:linear_api_status, response.status}}
+
+      {:error, :tracker_authority_invalidated} = error ->
+        error
 
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
@@ -544,6 +544,12 @@ defmodule SymphonyElixir.Linear.Client do
            {"Content-Type", "application/json"}
          ]}
     end
+  end
+
+  defp validate_tracker_authority(%PollContext{} = context) do
+    if Tracker.authority_valid?(context),
+      do: :ok,
+      else: {:error, :tracker_authority_invalidated}
   end
 
   defp post_graphql_request(endpoint, payload, headers) do
