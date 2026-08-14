@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Tracker do
   defmodule PollContext do
     @moduledoc false
 
-    @derive {Inspect, except: [:api_key]}
+    @derive {Inspect, except: [:api_key, :authority_generation]}
     defstruct [
       :kind,
       :endpoint,
