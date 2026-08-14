@@ -23,24 +23,30 @@ defmodule SymphonyElixir.Application do
   def start(_type, _args) do
     :ok = SymphonyElixir.LogFile.configure()
 
-    children = [
+    Supervisor.start_link(
+      child_specs(),
+      strategy: supervisor_strategy(),
+      name: SymphonyElixir.Supervisor
+    )
+  end
+
+  @spec child_specs() :: [Supervisor.child_spec() | {module(), term()} | module()]
+  def child_specs do
+    [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
       {Registry, keys: :unique, name: SymphonyElixir.PollTaskRegistry},
       {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
       {DynamicSupervisor, strategy: :one_for_one, name: SymphonyElixir.PollGuardSupervisor},
       SymphonyElixir.WorkflowStore,
+      SymphonyElixir.StartupAttestation,
       SymphonyElixir.Orchestrator,
       SymphonyElixir.HttpServer,
-      SymphonyElixir.StatusDashboard,
-      SymphonyElixir.StartupAttestation
+      SymphonyElixir.StatusDashboard
     ]
-
-    Supervisor.start_link(
-      children,
-      strategy: :one_for_one,
-      name: SymphonyElixir.Supervisor
-    )
   end
+
+  @spec supervisor_strategy() :: :rest_for_one
+  def supervisor_strategy, do: :rest_for_one
 
   @impl true
   def stop(_state) do

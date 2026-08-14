@@ -120,6 +120,7 @@ defmodule SymphonyElixir.WorkflowStore do
       {:ok, state}
     else
       {:error, reason} ->
+        invalidate_managed_startup_attestation()
         {:stop, reason}
     end
   end
@@ -336,6 +337,21 @@ defmodule SymphonyElixir.WorkflowStore do
           true ->
             {:error, {:workflow_digest_mismatch, expected, actual}}
         end
+    end
+  end
+
+  defp invalidate_managed_startup_attestation do
+    managed_project = System.get_env("SYMPHONY_MANAGED_PROJECT")
+    attestation_path = System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+
+    if managed_project not in [nil, ""] and attestation_path not in [nil, ""] do
+      case File.lstat(attestation_path) do
+        {:ok, %File.Stat{type: :regular}} ->
+          _ = File.rm(attestation_path)
+
+        _other ->
+          :ok
+      end
     end
   end
 

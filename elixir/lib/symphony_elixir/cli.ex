@@ -6,6 +6,7 @@ defmodule SymphonyElixir.CLI do
   alias SymphonyElixir.LogFile
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
+  @startup_protocol "1"
   @switches [{@acknowledgement_switch, :boolean}, logs_root: :string, port: :integer]
 
   @type ensure_started_result :: {:ok, [atom()]} | {:error, term()}
@@ -17,7 +18,11 @@ defmodule SymphonyElixir.CLI do
           ensure_all_started: (-> ensure_started_result())
         }
 
-  @spec main([String.t()]) :: no_return()
+  @spec main([String.t()]) :: :ok | no_return()
+  def main(["--startup-protocol"]) do
+    IO.puts(startup_protocol())
+  end
+
   def main(args) do
     case evaluate(args) do
       :ok ->
@@ -28,6 +33,9 @@ defmodule SymphonyElixir.CLI do
         System.halt(1)
     end
   end
+
+  @spec startup_protocol() :: String.t()
+  def startup_protocol, do: @startup_protocol
 
   @spec evaluate([String.t()], deps()) :: :ok | {:error, String.t()}
   def evaluate(args, deps \\ runtime_deps()) do

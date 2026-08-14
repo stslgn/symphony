@@ -5,6 +5,7 @@ defmodule SymphonyElixir.StartupAttestation do
 
   @expected_digest_env "SYMPHONY_EXPECTED_WORKFLOW_SHA256"
   @attestation_path_env "SYMPHONY_STARTUP_ATTESTATION_PATH"
+  @managed_project_env "SYMPHONY_MANAGED_PROJECT"
   @protocol "1"
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
@@ -18,12 +19,16 @@ defmodule SymphonyElixir.StartupAttestation do
 
   @spec start_link(keyword()) :: :ignore | {:error, term()}
   def start_link(opts \\ []) do
-    case System.get_env(@expected_digest_env) do
-      expected when expected in [nil, ""] ->
-        clear_boot_environment()
+    expected = System.get_env(@expected_digest_env)
+
+    case {managed?(), expected} do
+      {true, expected} when expected in [nil, ""] ->
+        {:error, :missing_managed_startup_digest}
+
+      {false, expected} when expected in [nil, ""] ->
         :ignore
 
-      expected ->
+      {_managed, expected} ->
         attest(expected, opts)
     end
   end
@@ -42,7 +47,6 @@ defmodule SymphonyElixir.StartupAttestation do
       true ->
         with {:ok, process_start} <- process_start(opts),
              :ok <- write_attestation(path, actual, process_start) do
-          clear_boot_environment()
           :ignore
         end
     end
@@ -101,8 +105,5 @@ defmodule SymphonyElixir.StartupAttestation do
     end
   end
 
-  defp clear_boot_environment do
-    System.delete_env(@expected_digest_env)
-    System.delete_env(@attestation_path_env)
-  end
+  defp managed?, do: System.get_env(@managed_project_env) not in [nil, ""]
 end

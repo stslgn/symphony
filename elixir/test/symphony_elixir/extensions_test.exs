@@ -275,23 +275,40 @@ defmodule SymphonyElixir.ExtensionsTest do
     actual_digest = :sha256 |> :crypto.hash(content) |> Base.encode16(case: :lower)
     expected_digest = String.duplicate("0", 64)
     previous_digest = System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    previous_attestation_path = System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+    previous_managed_project = System.get_env("SYMPHONY_MANAGED_PROJECT")
+    attestation_path = Path.join(Path.dirname(workflow_path), "restart-attestation")
+    symlink_target = Path.join(Path.dirname(workflow_path), "restart-attestation-target")
 
-    on_exit(fn -> restore_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", previous_digest) end)
+    on_exit(fn ->
+      restore_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", previous_digest)
+      restore_env("SYMPHONY_STARTUP_ATTESTATION_PATH", previous_attestation_path)
+      restore_env("SYMPHONY_MANAGED_PROJECT", previous_managed_project)
+    end)
 
     System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", actual_digest)
     assert {:ok, state} = WorkflowStore.init([])
     assert state.stamp == :crypto.hash(:sha256, content)
 
     System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", expected_digest)
+    System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", attestation_path)
+    System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-test")
+    File.write!(attestation_path, "stale runtime evidence")
 
     assert {:stop, {:workflow_digest_mismatch, ^expected_digest, ^actual_digest}} =
              WorkflowStore.init([])
 
+    refute File.exists?(attestation_path)
+
+    File.write!(symlink_target, "do not remove")
+    File.ln_s!(symlink_target, attestation_path)
     System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", "not-a-sha256")
     assert {:stop, {:invalid_expected_workflow_sha256, "not-a-sha256"}} = WorkflowStore.init([])
+    assert File.lstat!(attestation_path).type == :symlink
+    assert File.read!(symlink_target) == "do not remove"
   end
 
-  test "startup attestation proves the verified digest and consumes its boot environment" do
+  test "startup attestation proves the verified digest and retains restart authority" do
     ensure_workflow_store_running()
     workflow_path = Workflow.workflow_file_path()
     attestation_path = Path.join(Path.dirname(workflow_path), "startup-attestation")
@@ -320,13 +337,26 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert attestation["pid"] == System.pid()
     assert attestation["process_start"] != ""
     assert attestation["workflow_sha256"] == workflow_digest
-    refute System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
-    refute System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+    assert System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256") == workflow_digest
+    assert System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH") == attestation_path
 
     write_workflow_file!(workflow_path, prompt: "Post-attestation hot reload")
-    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
-    assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
+    assert :ok = WorkflowStore.force_reload()
     assert {:ok, %{prompt: "Post-attestation hot reload"}} = WorkflowStore.current()
+  end
+
+  test "application admits the runtime before side effects and restarts dependent authority together" do
+    child_ids =
+      SymphonyElixir.Application.child_specs()
+      |> Enum.map(&Supervisor.child_spec(&1, []).id)
+
+    attestation_index = Enum.find_index(child_ids, &(&1 == StartupAttestation))
+    orchestrator_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.Orchestrator))
+    http_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.HttpServer))
+
+    assert SymphonyElixir.Application.supervisor_strategy() == :rest_for_one
+    assert attestation_index < orchestrator_index
+    assert attestation_index < http_index
   end
 
   test "startup attestation fails closed when its managed path is missing or unwritable" do
@@ -334,15 +364,22 @@ defmodule SymphonyElixir.ExtensionsTest do
     workflow_digest = WorkflowStore.startup_digest()
     previous_digest = System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
     previous_attestation_path = System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+    previous_managed_project = System.get_env("SYMPHONY_MANAGED_PROJECT")
 
     on_exit(fn ->
       restore_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", previous_digest)
       restore_env("SYMPHONY_STARTUP_ATTESTATION_PATH", previous_attestation_path)
+      restore_env("SYMPHONY_MANAGED_PROJECT", previous_managed_project)
     end)
 
     System.delete_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
     System.delete_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+    System.delete_env("SYMPHONY_MANAGED_PROJECT")
     assert :ignore = StartupAttestation.start_link()
+
+    System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-test")
+    assert {:error, :missing_managed_startup_digest} = StartupAttestation.start_link([])
+    System.delete_env("SYMPHONY_MANAGED_PROJECT")
 
     System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest)
     assert {:error, :missing_startup_attestation_path} = StartupAttestation.start_link([])
