@@ -115,7 +115,8 @@ defmodule SymphonyElixir.Config do
 
   @spec validate!() :: :ok | {:error, term()}
   def validate! do
-    with {:ok, settings} <- settings() do
+    with {:ok, %{config: config}} <- Workflow.load(),
+         {:ok, settings} <- Schema.parse(config) do
       validate_semantics(settings)
     end
   end
