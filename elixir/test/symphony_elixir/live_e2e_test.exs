@@ -248,7 +248,7 @@ defmodule SymphonyElixir.LiveE2ETest do
   defp issue_has_comment?(_issue, _expected_body), do: false
 
   defp update_entity(mutation, variables, mutation_name, entity_name) do
-    case Client.graphql(mutation, variables) do
+    case Client.graphql(mutation, variables, tracker_context: Tracker.current_poll_context()) do
       {:ok, %{"data" => %{^mutation_name => %{"success" => true}}}} ->
         :ok
 
@@ -267,7 +267,7 @@ defmodule SymphonyElixir.LiveE2ETest do
   end
 
   defp graphql_data!(query, variables) when is_binary(query) and is_map(variables) do
-    case Client.graphql(query, variables) do
+    case Client.graphql(query, variables, tracker_context: Tracker.current_poll_context()) do
       {:ok, %{"data" => data, "errors" => errors}} when is_map(data) and is_list(errors) ->
         flunk("Linear GraphQL returned partial errors: #{inspect(errors)}")
 

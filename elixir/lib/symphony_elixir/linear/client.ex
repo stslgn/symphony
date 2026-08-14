@@ -135,12 +135,6 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
-  @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_candidate_issues do
-    Tracker.current_poll_context()
-    |> fetch_candidate_issues()
-  end
-
   @spec fetch_candidate_issues(PollContext.t()) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues(%PollContext{} = context) do
     project_slug = context.project_slug
@@ -162,11 +156,6 @@ defmodule SymphonyElixir.Linear.Client do
           )
         end
     end
-  end
-
-  @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issues_by_states(state_names) when is_list(state_names) do
-    fetch_issues_by_states(state_names, Tracker.current_poll_context())
   end
 
   @spec fetch_issues_by_states([String.t()], PollContext.t()) ::
@@ -192,11 +181,6 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
-  @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issue_states_by_ids(issue_ids) when is_list(issue_ids) do
-    fetch_issue_states_by_ids(issue_ids, Tracker.current_poll_context())
-  end
-
   @spec fetch_issue_states_by_ids([String.t()], PollContext.t()) ::
           {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids, %PollContext{} = context) when is_list(issue_ids) do
@@ -213,13 +197,6 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
-  @spec fetch_comments_since(String.t(), DateTime.t()) ::
-          {:ok, [Comment.t()]} | {:error, term()}
-  def fetch_comments_since(issue_id, %DateTime{} = created_after)
-      when is_binary(issue_id) do
-    fetch_comments_since(issue_id, created_after, Tracker.current_poll_context())
-  end
-
   @spec fetch_comments_since(String.t(), DateTime.t(), PollContext.t()) ::
           {:ok, [Comment.t()]} | {:error, term()}
   def fetch_comments_since(
@@ -232,23 +209,13 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   @spec graphql(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
-  def graphql(query, variables \\ %{}, opts \\ [])
+  def graphql(query, variables, opts)
       when is_binary(query) and is_map(variables) and is_list(opts) do
-    context =
-      Keyword.get_lazy(opts, :tracker_context, fn ->
-        Tracker.current_poll_context()
-      end)
-
     payload = build_graphql_payload(query, variables, Keyword.get(opts, :operation_name))
 
-    request_fun =
-      Keyword.get_lazy(opts, :request_fun, fn ->
-        fn request_payload, headers ->
-          post_graphql_request(context.endpoint, request_payload, headers)
-        end
-      end)
-
-    with {:ok, headers} <- graphql_headers(context),
+    with {:ok, context} <- fetch_tracker_context(opts),
+         request_fun <- graphql_request_fun(opts, context),
+         {:ok, headers} <- graphql_headers(context),
          :ok <- validate_tracker_authority(context),
          {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
       {:ok, body}
@@ -261,7 +228,7 @@ defmodule SymphonyElixir.Linear.Client do
 
         {:error, {:linear_api_status, response.status}}
 
-      {:error, :tracker_authority_invalidated} = error ->
+      {:error, reason} = error when reason in [:tracker_context_required, :tracker_authority_invalidated] ->
         error
 
       {:error, reason} ->
@@ -546,6 +513,21 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
+  defp fetch_tracker_context(opts) do
+    case Keyword.fetch(opts, :tracker_context) do
+      {:ok, %PollContext{} = context} -> {:ok, context}
+      _ -> {:error, :tracker_context_required}
+    end
+  end
+
+  defp graphql_request_fun(opts, context) do
+    Keyword.get_lazy(opts, :request_fun, fn ->
+      fn request_payload, headers ->
+        post_graphql_request(context.endpoint, request_payload, headers)
+      end
+    end)
+  end
+
   defp validate_tracker_authority(%PollContext{} = context) do
     if Tracker.authority_valid?(context),
       do: :ok,
@@ -699,7 +681,13 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
-  defp build_assignee_filter(assignee, graphql_fun \\ &graphql/2) when is_binary(assignee) do
+  defp build_assignee_filter(assignee) when is_binary(assignee) do
+    build_assignee_filter(assignee, fn _query, _variables ->
+      {:error, :tracker_context_required}
+    end)
+  end
+
+  defp build_assignee_filter(assignee, graphql_fun) when is_binary(assignee) do
     case normalize_assignee_match_value(assignee) do
       nil ->
         {:ok, nil}

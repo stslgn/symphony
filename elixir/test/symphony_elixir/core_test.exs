@@ -565,7 +565,8 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
-    assert {:ok, []} = Client.fetch_issue_states_by_ids([])
+    assert {:ok, []} =
+             Client.fetch_issue_states_by_ids([], Tracker.current_poll_context())
   end
 
   test "orchestrator startup aborts when a parked wait cannot be restored" do
@@ -4753,7 +4754,8 @@ defmodule SymphonyElixir.CoreTest do
   defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
 
   test "fetch issues by states with empty state set is a no-op" do
-    assert {:ok, []} = Client.fetch_issues_by_states([])
+    assert {:ok, []} =
+             Client.fetch_issues_by_states([], Tracker.current_poll_context())
   end
 
   test "candidate revalidation rejects invalid tracker collections" do

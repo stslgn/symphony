@@ -1072,6 +1072,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute_receive {:authority_request, 2}
   end
 
+  test "linear client rejects a missing tracker context before network I/O" do
+    assert {:error, :tracker_context_required} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               request_fun: fn _payload, _headers ->
+                 flunk("request must not run without an admitted tracker context")
+               end
+             )
+  end
+
   test "linear client logs response bodies for non-200 graphql responses" do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
@@ -1079,6 +1090,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                  Client.graphql(
                    "query Viewer { viewer { id } }",
                    %{},
+                   tracker_context: SymphonyElixir.Tracker.current_poll_context(),
                    request_fun: fn _payload, _headers ->
                      {:ok,
                       %{
