@@ -585,6 +585,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:error, :runtime_script_name_unavailable} =
              StartupAttestation.admit(Keyword.put(opts, :script_name_result, :invalid))
 
+    assert {:error, {:runtime_image_read_failed, :eacces}} =
+             StartupAttestation.admit(Keyword.put(opts, :runtime_read_result, {:error, :eacces}))
+
     File.rm!(runtime_image)
     File.ln_s!(other_runtime, runtime_image)
     assert {:error, :unsafe_managed_runtime_image} = StartupAttestation.admit(opts)

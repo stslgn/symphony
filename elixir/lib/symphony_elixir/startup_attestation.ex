@@ -140,7 +140,7 @@ defmodule SymphonyElixir.StartupAttestation do
          {:ok, script_path} <- executing_script_path(opts),
          :ok <- compare_runtime_paths(expected_path, script_path),
          :ok <- validate_runtime_image(expected_path),
-         {:ok, content} <- read_runtime_image(expected_path) do
+         {:ok, content} <- read_runtime_image(expected_path, opts) do
       actual = :sha256 |> :crypto.hash(content) |> Base.encode16(case: :lower)
       compare_runtime_digests(expected, actual)
     end
@@ -187,8 +187,10 @@ defmodule SymphonyElixir.StartupAttestation do
     end
   end
 
-  defp read_runtime_image(path) do
-    case File.read(path) do
+  defp read_runtime_image(path, opts) do
+    result = Keyword.get_lazy(opts, :runtime_read_result, fn -> File.read(path) end)
+
+    case result do
       {:ok, content} -> {:ok, content}
       {:error, reason} -> {:error, {:runtime_image_read_failed, reason}}
     end
