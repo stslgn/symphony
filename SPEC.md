@@ -428,6 +428,9 @@ Fields:
   - Empty disables comment commands.
   - The effective allowlist MUST be pinned to the runner generation. A runtime change MUST disable
     comment commands until restart; it MUST NOT grant or retain authority through hot reload.
+  - The pinned authority generation MUST also cover the raw tracker kind, endpoint, and API-key
+    selector. Every successfully observed authority change advances a monotonic runtime generation,
+    so changing a value and later restoring it MUST remain disabled until restart.
   - The identity associated with `tracker.api_key` MUST remain rejected even if listed, because a
     worker can publish comments through the same credential.
 - `project_slug` (string)
@@ -656,8 +659,9 @@ Dynamic reload is REQUIRED:
   changes.
 - Extensions that manage their own listeners/resources (for example an HTTP server port change) MAY
   require restart unless the implementation explicitly supports live rebind.
-- Security authority such as `tracker.operator_user_ids` MUST fail closed on change and MAY require
-  restart before the new value becomes effective.
+- Security authority such as tracker kind, endpoint, API-key selector, and `operator_user_ids` MUST
+  fail closed on change and MAY require restart before the new value becomes effective. A poll result
+  MUST be revalidated against the current authority generation before operator comments are applied.
 - Implementations SHOULD also re-validate/reload defensively during runtime operations (for example
   before dispatch) in case filesystem watch events are missed.
 - Invalid reloads MUST NOT crash the service; keep operating with the last known good effective
@@ -1020,6 +1024,8 @@ Operator comment input is untrusted. Implementations that support comment comman
 - accept only native comments from exact `tracker.operator_user_ids` actors;
 - pin that allowlist to the runner generation and disable comment commands until restart whenever
   the reloaded configuration differs;
+- reject an in-flight comment result when the workflow authority generation changed after the poll
+  request was created, including change-then-restore sequences;
 - reject comments authored by the `tracker.api_key` identity even when it appears in the allowlist;
 - reject comments with an external-thread marker;
 - recognize commands only at the beginning of a bounded-size body;

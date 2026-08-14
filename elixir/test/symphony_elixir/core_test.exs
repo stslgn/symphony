@@ -3169,7 +3169,8 @@ defmodule SymphonyElixir.CoreTest do
       dispatch_paused: true,
       parked: %{issue_id => wait},
       operator_commands: %Orchestrator.OperatorCommandState{
-        operator_user_ids_generation: ["operator-1"]
+        operator_user_ids_generation: ["operator-1"],
+        operator_authority_generation: WorkflowStore.authority_generation()
       },
       operator_comment_cursors: %{
         issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
@@ -3220,6 +3221,104 @@ defmodule SymphonyElixir.CoreTest do
 
     if is_reference(reverted_state.tick_timer_ref),
       do: Process.cancel_timer(reverted_state.tick_timer_ref)
+  end
+
+  test "orchestrator startup pins the current operator authority generation" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"]
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :OperatorAuthorityGenerationOrchestrator)
+    assert {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    operator_commands = :sys.get_state(pid).operator_commands
+    assert operator_commands.operator_user_ids_generation == ["operator-1"]
+    assert operator_commands.operator_authority_generation == WorkflowStore.authority_generation()
+    refute operator_commands.operator_authority_invalidated
+  end
+
+  test "operator allowlist drift invalidates an already collected poll result" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"]
+    )
+
+    issue_id = "issue-operator-inflight-generation-drift"
+    cursor_at = ~U[2026-08-03 10:00:00Z]
+
+    assert {:ok, wait} =
+             SymphonyElixir.OperatorWait.new("waiting_secret", %{
+               issue_id: issue_id,
+               identifier: "MT-OPERATOR-INFLIGHT-GENERATION-DRIFT",
+               run_id: "run-operator-inflight-generation-drift",
+               parked_at: cursor_at
+             })
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: nil,
+      dispatch_paused: true,
+      parked: %{issue_id => wait},
+      operator_commands: %Orchestrator.OperatorCommandState{
+        operator_user_ids_generation: ["operator-1"],
+        operator_authority_generation: WorkflowStore.authority_generation()
+      },
+      operator_comment_cursors: %{
+        issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    poll_result = %{
+      request: %{
+        running_ids: [],
+        retry_issue_ids: [],
+        operator_user_ids: ["operator-1"],
+        dispatch_paused: true
+      },
+      running: {:ok, []},
+      parked: {:ok, []},
+      comments: %{
+        issue_id =>
+          {:ok,
+           [
+             %SymphonyElixir.Linear.Comment{
+               id: "inflight-generation-drift-retry",
+               body: "$retry",
+               created_at: DateTime.add(cursor_at, 1, :second),
+               author_id: "operator-1"
+             }
+           ]}
+      },
+      dispatch: {:skip, :paused}
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: "other-token",
+      tracker_operator_user_ids: ["operator-1"]
+    )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: "token",
+      tracker_operator_user_ids: ["operator-1"]
+    )
+
+    applied_state = Orchestrator.apply_poll_result_for_test(state, poll_result)
+    assert applied_state.operator_commands.operator_authority_invalidated
+    assert applied_state.parked[issue_id].wait_id == wait.wait_id
+
+    refute MapSet.member?(
+             applied_state.operator_commands.processed_comment_ids,
+             "inflight-generation-drift-retry"
+           )
   end
 
   test "Linear retry command resumes a matching wait exactly once while globally paused" do

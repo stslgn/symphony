@@ -13,7 +13,7 @@ defmodule SymphonyElixir.WorkflowStore do
   defmodule State do
     @moduledoc false
 
-    defstruct [:path, :stamp, :workflow]
+    defstruct [:path, :stamp, :workflow, authority_epoch: 0, authority_contract: nil]
   end
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -42,6 +42,20 @@ defmodule SymphonyElixir.WorkflowStore do
         case Workflow.load() do
           {:ok, _workflow} -> :ok
           {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  @spec authority_generation() :: {pid(), non_neg_integer()} | {:standalone, term()}
+  def authority_generation do
+    case Process.whereis(__MODULE__) do
+      pid when is_pid(pid) ->
+        {pid, GenServer.call(pid, :authority_epoch)}
+
+      _ ->
+        case Workflow.load() do
+          {:ok, workflow} -> {:standalone, authority_contract(workflow)}
+          {:error, reason} -> {:standalone, {:unavailable, reason}}
         end
     end
   end
@@ -79,6 +93,9 @@ defmodule SymphonyElixir.WorkflowStore do
     end
   end
 
+  def handle_call(:authority_epoch, _from, %State{} = state),
+    do: {:reply, state.authority_epoch, state}
+
   @impl true
   def handle_info(:poll, %State{} = state) do
     schedule_poll()
@@ -105,8 +122,15 @@ defmodule SymphonyElixir.WorkflowStore do
 
   defp reload_path(path, state) do
     case load_state(path) do
-      {:ok, new_state} ->
-        {:ok, new_state}
+      {:ok, loaded_state} ->
+        authority_changed =
+          loaded_state.path != state.path or
+            loaded_state.authority_contract != state.authority_contract
+
+        authority_epoch =
+          if authority_changed, do: state.authority_epoch + 1, else: state.authority_epoch
+
+        {:ok, %{loaded_state | authority_epoch: authority_epoch}}
 
       {:error, reason} ->
         log_reload_error(path, reason)
@@ -131,12 +155,37 @@ defmodule SymphonyElixir.WorkflowStore do
   defp load_state(path) do
     with {:ok, workflow} <- Workflow.load(path),
          {:ok, stamp} <- current_stamp(path) do
-      {:ok, %State{path: path, stamp: stamp, workflow: workflow}}
+      {:ok,
+       %State{
+         path: path,
+         stamp: stamp,
+         workflow: workflow,
+         authority_contract: authority_contract(workflow)
+       }}
     else
       {:error, reason} ->
         {:error, reason}
     end
   end
+
+  defp authority_contract(%{config: config}) when is_map(config) do
+    tracker = Map.get(config, "tracker", %{})
+
+    if is_map(tracker) do
+      operator_user_ids = Map.get(tracker, "operator_user_ids", [])
+
+      %{
+        kind: Map.get(tracker, "kind"),
+        endpoint: Map.get(tracker, "endpoint", "https://api.linear.app/graphql"),
+        api_key_selector: Map.get(tracker, "api_key"),
+        operator_user_ids: if(is_list(operator_user_ids), do: Enum.sort(operator_user_ids), else: operator_user_ids)
+      }
+    else
+      {:invalid_tracker, tracker}
+    end
+  end
+
+  defp authority_contract(workflow), do: {:invalid_workflow, workflow}
 
   defp current_stamp(path) when is_binary(path) do
     with {:ok, stat} <- File.stat(path, time: :posix),

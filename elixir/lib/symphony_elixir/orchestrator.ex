@@ -19,6 +19,7 @@ defmodule SymphonyElixir.Orchestrator do
     RunLedger,
     StatusDashboard,
     Tracker,
+    WorkflowStore,
     Workspace
   }
 
@@ -47,6 +48,7 @@ defmodule SymphonyElixir.Orchestrator do
     defstruct processed_comment_ids: MapSet.new(),
               pending_outcomes: %{},
               operator_user_ids_generation: nil,
+              operator_authority_generation: nil,
               operator_authority_invalidated: false
   end
 
@@ -133,7 +135,8 @@ defmodule SymphonyElixir.Orchestrator do
             operator_commands: %OperatorCommandState{
               processed_comment_ids: recovery.processed_operator_comment_ids,
               pending_outcomes: restore_pending_operator_outcomes(recovery.pending_operator_outcomes),
-              operator_user_ids_generation: config.tracker.operator_user_ids || []
+              operator_user_ids_generation: config.tracker.operator_user_ids || [],
+              operator_authority_generation: WorkflowStore.authority_generation()
             },
             operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
             codex_totals: @empty_codex_totals,
@@ -556,7 +559,6 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp prepare_poll_state(%State{} = state) do
     state
-    |> pin_operator_authority_generation()
     |> retry_pending_terminal_transitions()
     |> retry_pending_durable_retries()
     |> retry_pending_operator_outcomes()
@@ -568,25 +570,36 @@ defmodule SymphonyElixir.Orchestrator do
   defp pin_operator_authority_generation(
          %State{
            operator_commands: %OperatorCommandState{operator_user_ids_generation: nil}
-         } = state
+         } = state,
+         _configured,
+         _authority_generation
        ),
        do: state
 
   defp pin_operator_authority_generation(
          %State{
            operator_commands: %OperatorCommandState{operator_authority_invalidated: true}
-         } = state
+         } = state,
+         _configured,
+         _authority_generation
        ),
        do: state
 
   defp pin_operator_authority_generation(
          %State{
-           operator_commands: %OperatorCommandState{operator_user_ids_generation: generation}
-         } = state
+           operator_commands: %OperatorCommandState{
+             operator_user_ids_generation: generation,
+             operator_authority_generation: pinned_authority_generation
+           }
+         } = state,
+         configured,
+         authority_generation
        ) do
-    configured = Config.settings!().tracker.operator_user_ids || []
+    authority_generation_matches =
+      is_nil(pinned_authority_generation) or
+        pinned_authority_generation == authority_generation
 
-    if Enum.sort(configured) == Enum.sort(generation) do
+    if Enum.sort(configured) == Enum.sort(generation) and authority_generation_matches do
       state
     else
       Logger.warning("Operator command authority changed after startup; commands remain disabled until restart")
@@ -693,11 +706,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp revalidate_poll_candidates(_issues), do: {:error, :invalid_candidate_collection}
 
   defp apply_poll_result(%State{} = state, %{request: request} = result) when is_map(request) do
+    state = refresh_runtime_config(state)
+    effective_operator_user_ids = operator_user_ids(state)
+
     state
     |> apply_running_poll_result(request.running_ids, Map.get(result, :running))
     |> apply_parked_poll_result(Map.get(result, :parked))
     |> apply_operator_comment_results(
-      request.operator_user_ids,
+      effective_operator_user_ids,
       Map.get(result, :comments, %{})
     )
     |> apply_dispatch_poll_result(request, Map.get(result, :dispatch))
@@ -993,6 +1009,11 @@ defmodule SymphonyElixir.Orchestrator do
     |> apply_poll_result(collect_tracker_poll(request))
     |> finish_poll_cycle(:ok)
   end
+
+  @doc false
+  @spec apply_poll_result_for_test(term(), map()) :: term()
+  def apply_poll_result_for_test(%State{} = state, result) when is_map(result),
+    do: apply_poll_result(state, result)
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
@@ -4021,11 +4042,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp operator_user_ids(%State{
          operator_commands: %OperatorCommandState{operator_user_ids_generation: generation}
-       }) do
-    configured = Config.settings!().tracker.operator_user_ids || []
-
-    if Enum.sort(configured) == Enum.sort(generation), do: generation, else: []
-  end
+       }),
+       do: generation
 
   defp apply_operator_comment(state, issue_id, comment, "stop") do
     case Map.get(state.running, issue_id) do
@@ -4594,12 +4612,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
+    authority_generation = WorkflowStore.authority_generation()
 
-    %{
-      state
-      | poll_interval_ms: config.polling.interval_ms,
-        max_concurrent_agents: config.agent.max_concurrent_agents
-    }
+    state
+    |> Map.put(:poll_interval_ms, config.polling.interval_ms)
+    |> Map.put(:max_concurrent_agents, config.agent.max_concurrent_agents)
+    |> pin_operator_authority_generation(
+      config.tracker.operator_user_ids || [],
+      authority_generation
+    )
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do

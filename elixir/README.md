@@ -233,8 +233,10 @@ Notes:
   defaults to `[]`, which disables comment commands. The API-key identity (`user.isMe`) is always
   rejected even if listed, because workers can write comments with that same credential. Use a
   separate runner/service identity for `LINEAR_API_KEY` and allowlist only human operator user IDs.
-  The allowlist is pinned to the runner generation at startup. A live config change disables all
-  comment commands until restart instead of granting or retaining authority through hot reload.
+  The allowlist and raw tracker kind, endpoint, and API-key selector are pinned to the runner
+  generation at startup. Every observed change advances a monotonic authority generation; all
+  comment commands, including in-flight results, remain disabled until restart even if the file is
+  later restored to its original values.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -324,8 +326,9 @@ mirrored external-thread comments, and oversized bodies are ignored. Commands ar
 an action that is not valid for the issue's current run/wait is recorded as rejected and has no
 scheduling effect. The durable ledger stores only bounded command identities, outcomes, and cursors,
 never the comment body. This makes repeated delivery and restart reconciliation idempotent.
-If the configured operator allowlist changes after startup, comment command reconciliation fails
-closed until the runner restarts with the new generation.
+If the configured operator authority changes after startup, comment command reconciliation fails
+closed until the runner restarts with the new generation. Poll completion rechecks the generation
+before applying fetched comments.
 
 When an existing parked wait has no operator cursor during the first upgrade to this feature,
 Symphony initializes the cursor at upgrade time. Historical comments are not executed retroactively;
