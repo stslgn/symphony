@@ -166,6 +166,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert {^workflow_store_pid, _authority_epoch} = authority
     assert {^workflow_store_pid, _tracker_authority_epoch} = tracker_authority
+    assert ^tracker_authority = WorkflowStore.tracker_authority_generation()
 
     assert {:error, _reason} = WorkflowStore.force_reload()
     assert {:ok, %{prompt: "Second prompt"}} = Workflow.current()
