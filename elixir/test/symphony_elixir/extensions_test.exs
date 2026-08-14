@@ -269,6 +269,28 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert state.workflow.prompt == "Immutable snapshot B"
   end
 
+  test "workflow store rejects a startup snapshot that differs from the admitted digest" do
+    workflow_path = Workflow.workflow_file_path()
+    content = File.read!(workflow_path)
+    actual_digest = :sha256 |> :crypto.hash(content) |> Base.encode16(case: :lower)
+    expected_digest = String.duplicate("0", 64)
+    previous_digest = System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+
+    on_exit(fn -> restore_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", previous_digest) end)
+
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", actual_digest)
+    assert {:ok, state} = WorkflowStore.init([])
+    assert state.stamp == :crypto.hash(:sha256, content)
+
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", expected_digest)
+
+    assert {:stop, {:workflow_digest_mismatch, ^expected_digest, ^actual_digest}} =
+             WorkflowStore.init([])
+
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", "not-a-sha256")
+    assert {:stop, {:invalid_expected_workflow_sha256, "not-a-sha256"}} = WorkflowStore.init([])
+  end
+
   test "workflow store keeps last good authority across schema-invalid YAML reloads" do
     ensure_workflow_store_running()
     workflow_path = Workflow.workflow_file_path()

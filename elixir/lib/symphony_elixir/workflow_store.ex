@@ -109,11 +109,11 @@ defmodule SymphonyElixir.WorkflowStore do
 
   @impl true
   def init(_opts) do
-    case load_state(Workflow.workflow_file_path()) do
-      {:ok, state} ->
-        schedule_poll()
-        {:ok, state}
-
+    with {:ok, state} <- load_state(Workflow.workflow_file_path()),
+         :ok <- verify_expected_startup_digest(state) do
+      schedule_poll()
+      {:ok, state}
+    else
       {:error, reason} ->
         {:stop, reason}
     end
@@ -306,6 +306,27 @@ defmodule SymphonyElixir.WorkflowStore do
 
       {:error, reason} ->
         {:error, {:missing_workflow_file, path, reason}}
+    end
+  end
+
+  defp verify_expected_startup_digest(%State{stamp: stamp}) do
+    case System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256") do
+      expected when expected in [nil, ""] ->
+        :ok
+
+      expected ->
+        actual = Base.encode16(stamp, case: :lower)
+
+        cond do
+          not Regex.match?(~r/^[0-9a-f]{64}$/, expected) ->
+            {:error, {:invalid_expected_workflow_sha256, expected}}
+
+          expected == actual ->
+            :ok
+
+          true ->
+            {:error, {:workflow_digest_mismatch, expected, actual}}
+        end
     end
   end
 
