@@ -250,9 +250,11 @@ Notes:
   fields from hot-reloaded config.
 - A managed launcher sets `SYMPHONY_EXPECTED_WORKFLOW_SHA256` and
   `SYMPHONY_EXPECTED_RUNTIME_SHA256` to the lowercase SHA-256 values of the exact workflow bytes and
-  runtime image it admitted. Symphony compares the workflow value with its single initial snapshot
-  and stops before Orchestrator or HTTP startup when either required digest is malformed or does not
-  match. With `SYMPHONY_MANAGED_PROJECT`, `SYMPHONY_STARTUP_ATTESTATION_PATH` and
+  generation-specific runtime image it admitted, and identifies that image with
+  `SYMPHONY_RUNTIME_IMAGE_PATH`. Symphony compares the workflow value with its single initial
+  snapshot, requires the runtime path to be the executing escript, measures those executing bytes
+  itself, and stops before Orchestrator or HTTP startup when either required digest is malformed or
+  does not match. With `SYMPHONY_MANAGED_PROJECT`, `SYMPHONY_STARTUP_ATTESTATION_PATH` and
   `SYMPHONY_RUNTIME_READINESS_PATH` are also mandatory. Immediately after `WorkflowStore`
   verification and before Orchestrator or HTTP starts, Symphony atomically writes a mode-0600
   protocol-2 startup-admission attestation. Orchestrator receives the exact immutable settings and
