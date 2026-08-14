@@ -7,17 +7,15 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   alias SymphonyElixir.Linear.{Comment, Issue}
 
-  @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_candidate_issues do
-    {:ok, issue_entries()}
-  end
-
   @spec fetch_candidate_issues(SymphonyElixir.Tracker.PollContext.t()) ::
           {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_candidate_issues(_context), do: fetch_candidate_issues()
+  def fetch_candidate_issues(_context), do: {:ok, issue_entries()}
 
-  @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issues_by_states(state_names) do
+  @spec fetch_issues_by_states(
+          [String.t()],
+          SymphonyElixir.Tracker.PollContext.t()
+        ) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(state_names, _context) do
     normalized_states =
       state_names
       |> Enum.map(&normalize_state/1)
@@ -29,14 +27,9 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
-  @spec fetch_issues_by_states(
-          [String.t()],
-          SymphonyElixir.Tracker.PollContext.t()
-        ) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issues_by_states(state_names, _context), do: fetch_issues_by_states(state_names)
-
-  @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issue_states_by_ids(issue_ids) do
+  @spec fetch_issue_states_by_ids([String.t()], SymphonyElixir.Tracker.PollContext.t()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issue_states_by_ids(issue_ids, _context) do
     wanted_ids = MapSet.new(issue_ids)
 
     {:ok,
@@ -45,13 +38,13 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
-  @spec fetch_issue_states_by_ids([String.t()], SymphonyElixir.Tracker.PollContext.t()) ::
-          {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issue_states_by_ids(issue_ids, _context), do: fetch_issue_states_by_ids(issue_ids)
-
-  @spec fetch_comments_since(String.t(), DateTime.t()) ::
+  @spec fetch_comments_since(
+          String.t(),
+          DateTime.t(),
+          SymphonyElixir.Tracker.PollContext.t()
+        ) ::
           {:ok, [Comment.t()]} | {:error, term()}
-  def fetch_comments_since(issue_id, %DateTime{} = created_after) do
+  def fetch_comments_since(issue_id, %DateTime{} = created_after, _context) do
     comments =
       :symphony_elixir
       |> Application.get_env(:memory_tracker_comments, %{})
@@ -67,40 +60,19 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
-  @spec fetch_comments_since(
-          String.t(),
-          DateTime.t(),
-          SymphonyElixir.Tracker.PollContext.t()
-        ) :: {:ok, [Comment.t()]} | {:error, term()}
-  def fetch_comments_since(issue_id, %DateTime{} = created_after, _context),
-    do: fetch_comments_since(issue_id, created_after)
-
-  @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
-  def create_comment(issue_id, body) do
+  @spec create_comment(String.t(), String.t(), SymphonyElixir.Tracker.PollContext.t()) ::
+          :ok | {:error, term()}
+  def create_comment(issue_id, body, _context) do
     send_event({:memory_tracker_comment, issue_id, body})
     :ok
   end
 
-  @spec create_comment(
-          String.t(),
-          String.t(),
-          SymphonyElixir.Tracker.PollContext.t()
-        ) :: :ok | {:error, term()}
-  def create_comment(issue_id, body, _context), do: create_comment(issue_id, body)
-
-  @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
-  def update_issue_state(issue_id, state_name) do
+  @spec update_issue_state(String.t(), String.t(), SymphonyElixir.Tracker.PollContext.t()) ::
+          :ok | {:error, term()}
+  def update_issue_state(issue_id, state_name, _context) do
     send_event({:memory_tracker_state_update, issue_id, state_name})
     :ok
   end
-
-  @spec update_issue_state(
-          String.t(),
-          String.t(),
-          SymphonyElixir.Tracker.PollContext.t()
-        ) :: :ok | {:error, term()}
-  def update_issue_state(issue_id, state_name, _context),
-    do: update_issue_state(issue_id, state_name)
 
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])

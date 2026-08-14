@@ -323,8 +323,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
-    assert :ok = Memory.create_comment("issue-1", "quiet")
-    assert :ok = Memory.update_issue_state("issue-1", "Quiet")
+    assert :ok = Memory.create_comment("issue-1", "quiet", context)
+    assert :ok = Memory.update_issue_state("issue-1", "Quiet", context)
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert SymphonyElixir.Tracker.adapter(SymphonyElixir.Tracker.current_poll_context()) == Adapter
