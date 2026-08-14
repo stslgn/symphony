@@ -42,6 +42,9 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
                application_modules_fn: fn -> nil end
              )
 
+    assert {:error, :runtime_identity_modules_unavailable} =
+             RuntimeIdentity.fingerprint(modules: :invalid)
+
     assert {:error, {:runtime_identity_module_load_failed, MissingRuntimeIdentityModule, :nofile}} =
              RuntimeIdentity.fingerprint(modules: [MissingRuntimeIdentityModule])
 
@@ -54,6 +57,9 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
 
   test "verifies the expected loaded-code identity rather than a pathname claim" do
     expected = String.duplicate("a", 64)
+
+    assert {:ok, actual_runtime_identity} = RuntimeIdentity.fingerprint()
+    assert {:ok, ^actual_runtime_identity} = RuntimeIdentity.verify(actual_runtime_identity)
 
     assert {:ok, ^expected} =
              RuntimeIdentity.verify(expected, fingerprint_fn: fn -> {:ok, expected} end)
