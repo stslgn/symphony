@@ -353,6 +353,8 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   test "application admits the runtime before side effects and restarts dependent authority together" do
+    ensure_workflow_store_running()
+
     child_ids =
       SymphonyElixir.Application.child_specs()
       |> Enum.map(&Supervisor.child_spec(&1, []).id)
