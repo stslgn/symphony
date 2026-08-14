@@ -248,17 +248,23 @@ Notes:
   a replacement generation when it is missing. Missing or stale context fails before workspace
   preparation, app-server port startup, or network I/O, and the network client never re-reads those
   fields from hot-reloaded config.
-- A managed launcher can set `SYMPHONY_EXPECTED_WORKFLOW_SHA256` to the lowercase SHA-256 of the exact
-  workflow bytes it admitted. Symphony compares that value with its single initial workflow snapshot
-  and stops before Orchestrator or HTTP startup when the value is malformed or does not match. When
-  `SYMPHONY_MANAGED_PROJECT` is set, both that digest and `SYMPHONY_STARTUP_ATTESTATION_PATH` are
-  mandatory. Immediately after `WorkflowStore` verification and before Orchestrator or HTTP starts,
-  Symphony atomically writes a mode-0600 protocol-1 attestation containing its OS PID,
-  locale-independent process start time, and the verified workflow digest. Missing or unwritable
-  attestation state fails before external side effects. The boot authority remains available to the
-  `:rest_for_one` supervisor: a `WorkflowStore` failure restarts the attestation and every dependent
-  side-effectful child together; digest drift during that restart removes stale evidence and fails
-  closed. Ordinary in-process hot reload remains supported.
+- A managed launcher sets `SYMPHONY_EXPECTED_WORKFLOW_SHA256` and
+  `SYMPHONY_EXPECTED_RUNTIME_SHA256` to the lowercase SHA-256 values of the exact workflow bytes and
+  runtime image it admitted. Symphony compares the workflow value with its single initial snapshot
+  and stops before Orchestrator or HTTP startup when either required digest is malformed or does not
+  match. With `SYMPHONY_MANAGED_PROJECT`, `SYMPHONY_STARTUP_ATTESTATION_PATH` and
+  `SYMPHONY_RUNTIME_READINESS_PATH` are also mandatory. Immediately after `WorkflowStore`
+  verification and before Orchestrator or HTTP starts, Symphony atomically writes a mode-0600
+  protocol-2 startup-admission attestation. Orchestrator receives the exact immutable settings and
+  authority generations held by that live admission child; it cannot replace them with a later
+  workflow reload during startup. A separate mode-0600 protocol-2 runtime-readiness attestation is
+  written only after Orchestrator, HTTP, and status children initialize. Both attestations contain
+  the OS PID, locale-independent process start time, verified workflow digest, and runtime-image
+  digest. Missing or unwritable evidence fails closed. Under the `:rest_for_one` supervisor,
+  `WorkflowStore` and the admission child precede both task supervisors and all side-effectful
+  children. Losing either authority boundary therefore terminates old agent, cleanup, and polling
+  tasks before a replacement Orchestrator starts, invalidates final readiness, and re-attests the
+  replacement generation. Ordinary in-process hot reload remains supported.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
