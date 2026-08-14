@@ -3408,6 +3408,14 @@ defmodule SymphonyElixir.CoreTest do
       tracker_context: approved_context
     }
 
+    authorized_result = Orchestrator.collect_tracker_poll_for_test(request)
+    assert authorized_result.running == {:ok, []}
+    assert authorized_result.dispatch == {:ok, []}
+    assert_receive {:snapshot_state_fetch, ["issue-running"], ^approved_context}
+    assert_receive {:snapshot_candidate_fetch, ^approved_context}
+
+    assert_receive {:snapshot_comment_fetch, "issue-comments", ^comment_cursor, ^approved_context}
+
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "linear",
       tracker_endpoint: "https://unapproved.example/graphql",
