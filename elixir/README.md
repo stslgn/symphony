@@ -251,18 +251,22 @@ Notes:
 - A managed launcher sets `SYMPHONY_EXPECTED_WORKFLOW_SHA256` and
   `SYMPHONY_EXPECTED_RUNTIME_SHA256` to the lowercase SHA-256 values of the exact workflow bytes and
   generation-specific runtime image it admitted, and identifies that image with
-  `SYMPHONY_RUNTIME_IMAGE_PATH`. Symphony compares the workflow value with its single initial
-  snapshot, requires the runtime path to be the executing escript, measures those executing bytes
-  itself, and stops before Orchestrator or HTTP startup when either required digest is malformed or
-  does not match. With `SYMPHONY_MANAGED_PROJECT`, `SYMPHONY_STARTUP_ATTESTATION_PATH` and
+  `SYMPHONY_RUNTIME_IMAGE_PATH`. The launcher also pins
+  `SYMPHONY_EXPECTED_EXECUTION_SHA256`, a deterministic fingerprint of the loaded BEAM identities
+  for the complete Symphony application module manifest. Before application startup, Symphony
+  computes that fingerprint from loaded code and refuses an image/path A-B-A substitution even if
+  the pathname bytes are restored. It also compares the workflow value with its single initial
+  snapshot and measures the named image bytes. With `SYMPHONY_MANAGED_PROJECT`,
+  `SYMPHONY_STARTUP_ATTESTATION_PATH` and
   `SYMPHONY_RUNTIME_READINESS_PATH` are also mandatory. Immediately after `WorkflowStore`
   verification and before Orchestrator or HTTP starts, Symphony atomically writes a mode-0600
-  protocol-2 startup-admission attestation. Orchestrator receives the exact immutable settings and
+  protocol-3 startup-admission attestation. Orchestrator receives the exact immutable settings and
   authority generations held by that live admission child; it cannot replace them with a later
-  workflow reload during startup. A separate mode-0600 protocol-2 runtime-readiness attestation is
+  workflow reload during startup. A separate mode-0600 protocol-3 runtime-readiness attestation is
   written only after Orchestrator, HTTP, and status children initialize. Both attestations contain
-  the OS PID, locale-independent process start time, verified workflow digest, and runtime-image
-  digest. Missing or unwritable evidence fails closed. Under the `:rest_for_one` supervisor,
+  the OS PID, locale-independent process start time, verified workflow digest, runtime-image digest,
+  and loaded-code execution digest. Missing or unwritable evidence fails closed. Under the
+  `:rest_for_one` supervisor,
   `WorkflowStore` and the admission child precede both task supervisors and all side-effectful
   children. Losing either authority boundary therefore terminates old agent, cleanup, and polling
   tasks before a replacement Orchestrator starts, invalidates final readiness, and re-attests the
