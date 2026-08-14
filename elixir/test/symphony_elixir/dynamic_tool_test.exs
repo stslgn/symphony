@@ -159,9 +159,15 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     refute Tracker.authority_valid?(%Tracker.PollContext{})
     tracker_context = Tracker.current_poll_context()
 
-    write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_endpoint: "https://changed.example/graphql"
+    workflow_path = Workflow.workflow_file_path()
+
+    workflow_path
+    |> File.read!()
+    |> String.replace(
+      "https://api.linear.app/graphql",
+      "https://changed.example/graphql"
     )
+    |> then(&File.write!(workflow_path, &1))
 
     response =
       DynamicTool.execute(

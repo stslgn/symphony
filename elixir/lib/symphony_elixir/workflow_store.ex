@@ -40,6 +40,27 @@ defmodule SymphonyElixir.WorkflowStore do
     end
   end
 
+  @spec current_with_authority() ::
+          {:ok, Workflow.loaded_workflow(), term(), term()} | {:error, term()}
+  def current_with_authority do
+    case Process.whereis(__MODULE__) do
+      pid when is_pid(pid) ->
+        GenServer.call(pid, :current_with_authority)
+
+      _ ->
+        case Workflow.load() do
+          {:ok, workflow} ->
+            authority_contract = authority_contract(workflow)
+            tracker_contract = tracker_authority_contract(authority_contract)
+
+            {:ok, workflow, {:standalone, authority_contract}, {:standalone, tracker_contract}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
   @spec force_reload() :: :ok | {:error, term()}
   def force_reload do
     case Process.whereis(__MODULE__) do
@@ -72,7 +93,7 @@ defmodule SymphonyElixir.WorkflowStore do
   def tracker_authority_generation do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        {pid, GenServer.call(pid, :tracker_authority_epoch)}
+        {pid, GenServer.call(pid, :refresh_tracker_authority_epoch)}
 
       _ ->
         case Workflow.load() do
@@ -108,6 +129,16 @@ defmodule SymphonyElixir.WorkflowStore do
     end
   end
 
+  def handle_call(:current_with_authority, _from, %State{} = state) do
+    case reload_state(state) do
+      {:ok, new_state} ->
+        {:reply, authority_snapshot(new_state), new_state}
+
+      {:error, _reason, new_state} ->
+        {:reply, authority_snapshot(new_state), new_state}
+    end
+  end
+
   def handle_call(:force_reload, _from, %State{} = state) do
     case reload_state(state) do
       {:ok, new_state} ->
@@ -124,6 +155,16 @@ defmodule SymphonyElixir.WorkflowStore do
   def handle_call(:tracker_authority_epoch, _from, %State{} = state),
     do: {:reply, state.tracker_authority_epoch, state}
 
+  def handle_call(:refresh_tracker_authority_epoch, _from, %State{} = state) do
+    case reload_state(state) do
+      {:ok, new_state} ->
+        {:reply, new_state.tracker_authority_epoch, new_state}
+
+      {:error, _reason, new_state} ->
+        {:reply, new_state.tracker_authority_epoch, new_state}
+    end
+  end
+
   @impl true
   def handle_info(:poll, %State{} = state) do
     schedule_poll()
@@ -136,6 +177,12 @@ defmodule SymphonyElixir.WorkflowStore do
 
   defp schedule_poll do
     Process.send_after(self(), :poll, @poll_interval_ms)
+  end
+
+  defp authority_snapshot(%State{} = state) do
+    pid = self()
+
+    {:ok, state.workflow, {pid, state.authority_epoch}, {pid, state.tracker_authority_epoch}}
   end
 
   defp reload_state(%State{} = state) do

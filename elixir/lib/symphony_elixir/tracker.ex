@@ -52,7 +52,7 @@ defmodule SymphonyElixir.Tracker do
 
   @spec fetch_candidate_issues(PollContext.t()) :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues(%PollContext{} = context) do
-    adapter(context).fetch_candidate_issues(context)
+    with_authorized_context(context, fn -> adapter(context).fetch_candidate_issues(context) end)
   end
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
@@ -68,7 +68,9 @@ defmodule SymphonyElixir.Tracker do
   @spec fetch_issue_states_by_ids([String.t()], PollContext.t()) ::
           {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids, %PollContext{} = context) do
-    adapter(context).fetch_issue_states_by_ids(issue_ids, context)
+    with_authorized_context(context, fn ->
+      adapter(context).fetch_issue_states_by_ids(issue_ids, context)
+    end)
   end
 
   @spec fetch_comments_since(String.t(), DateTime.t()) ::
@@ -80,7 +82,9 @@ defmodule SymphonyElixir.Tracker do
   @spec fetch_comments_since(String.t(), DateTime.t(), PollContext.t()) ::
           {:ok, [term()]} | {:error, term()}
   def fetch_comments_since(issue_id, %DateTime{} = created_after, %PollContext{} = context) do
-    adapter(context).fetch_comments_since(issue_id, created_after, context)
+    with_authorized_context(context, fn ->
+      adapter(context).fetch_comments_since(issue_id, created_after, context)
+    end)
   end
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
@@ -121,8 +125,10 @@ defmodule SymphonyElixir.Tracker do
 
   @spec current_poll_context() :: PollContext.t()
   def current_poll_context do
-    authority_generation = WorkflowStore.tracker_authority_generation()
-    poll_context(Config.settings!().tracker, authority_generation)
+    {settings, _authority_generation, tracker_authority_generation} =
+      Config.settings_with_authority!()
+
+    poll_context(settings.tracker, tracker_authority_generation)
   end
 
   @spec authority_valid?(PollContext.t()) :: boolean()
@@ -130,5 +136,11 @@ defmodule SymphonyElixir.Tracker do
 
   def authority_valid?(%PollContext{authority_generation: authority_generation}) do
     authority_generation == WorkflowStore.tracker_authority_generation()
+  end
+
+  defp with_authorized_context(context, operation) when is_function(operation, 0) do
+    if authority_valid?(context),
+      do: operation.(),
+      else: {:error, :tracker_authority_invalidated}
   end
 end

@@ -241,8 +241,8 @@ Notes:
   immutable startup authority snapshot for the adapter, credential, endpoint, and project. Routing
   assignee and active/terminal state sets are frozen per poll or worker session, so safe reloads
   affect future work without changing an admitted decision. Every worker-side tracker call rechecks
-  the monotonic authority generation before I/O, and the network client never re-reads those fields
-  from hot-reloaded config.
+  the monotonic authority generation through a synchronous workflow refresh before I/O, and the
+  network client never re-reads those fields from hot-reloaded config.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the

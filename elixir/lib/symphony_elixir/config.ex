@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Config do
   """
 
   alias SymphonyElixir.Config.Schema
-  alias SymphonyElixir.Workflow
+  alias SymphonyElixir.{Workflow, WorkflowStore}
 
   @default_prompt_template """
   You are working on a Linear issue.
@@ -46,6 +46,24 @@ defmodule SymphonyElixir.Config do
     case settings() do
       {:ok, settings} ->
         settings
+
+      {:error, reason} ->
+        raise ArgumentError, message: format_config_error(reason)
+    end
+  end
+
+  @spec settings_with_authority!() :: {Schema.t(), term(), term()}
+  def settings_with_authority! do
+    case WorkflowStore.current_with_authority() do
+      {:ok, %{config: config}, authority_generation, tracker_authority_generation}
+      when is_map(config) ->
+        case Schema.parse(config) do
+          {:ok, settings} ->
+            {settings, authority_generation, tracker_authority_generation}
+
+          {:error, reason} ->
+            raise ArgumentError, message: format_config_error(reason)
+        end
 
       {:error, reason} ->
         raise ArgumentError, message: format_config_error(reason)

@@ -75,6 +75,10 @@ defmodule SymphonyElixir.CoreTest do
       Config.settings!().polling.interval_ms
     end
 
+    assert_raise ArgumentError, ~r/interval_ms/, fn ->
+      Config.settings_with_authority!()
+    end
+
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "polling.interval_ms"
 
@@ -3416,12 +3420,18 @@ defmodule SymphonyElixir.CoreTest do
 
     assert_receive {:snapshot_comment_fetch, "issue-comments", ^comment_cursor, ^approved_context}
 
-    write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_kind: "linear",
-      tracker_endpoint: "https://unapproved.example/graphql",
-      tracker_api_token: "unapproved-token",
-      tracker_project_slug: "unapproved-project"
+    workflow_path = Workflow.workflow_file_path()
+
+    workflow_path
+    |> File.read!()
+    |> String.replace(
+      "https://approved.example/graphql",
+      "https://unapproved.example/graphql"
     )
+    |> then(&File.write!(workflow_path, &1))
+
+    assert {:error, :tracker_authority_invalidated} =
+             Tracker.fetch_issue_states_by_ids(["worker-refresh"], approved_context)
 
     result = Orchestrator.collect_tracker_poll_for_test(request)
     assert result.running == {:skip, :tracker_authority_invalidated}

@@ -441,7 +441,8 @@ Fields:
     authority validation, network I/O, and result classification.
   - Polls, in-flight worker state checks, and worker-facing tracker tools MUST compare their pinned
     generation with the current monotonic tracker-authority generation before network I/O and fail
-    closed after drift.
+    closed after drift. This check MUST synchronously refresh the workflow authority snapshot; it
+    MUST NOT rely on a periodic file watcher noticing the change first.
   - The identity associated with `tracker.api_key` MUST remain rejected even if listed, because a
     worker can publish comments through the same credential.
 - `project_slug` (string)

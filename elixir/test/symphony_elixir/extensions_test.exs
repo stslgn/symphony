@@ -166,9 +166,20 @@ defmodule SymphonyElixir.ExtensionsTest do
     Workflow.set_workflow_file_path(third_workflow)
     assert {:ok, %{prompt: "Third prompt"}} = Workflow.current()
 
+    workflow_store_pid = Process.whereis(WorkflowStore)
+
+    assert {:ok, %{prompt: "Third prompt"}, authority_generation, tracker_authority_generation} =
+             WorkflowStore.current_with_authority()
+
+    assert {^workflow_store_pid, _authority_epoch} = authority_generation
+    assert {^workflow_store_pid, _tracker_authority_epoch} = tracker_authority_generation
+
     assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
     assert {:ok, %{prompt: "Third prompt"}} = WorkflowStore.current()
     assert :ok = WorkflowStore.force_reload()
+
+    assert {:ok, %{prompt: "Third prompt"}, {:standalone, _authority_contract}, {:standalone, _tracker_authority_contract}} =
+             WorkflowStore.current_with_authority()
 
     assert {:standalone,
             %{
@@ -207,6 +218,10 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert {:standalone, {:unavailable, {:missing_workflow_file, ^missing_path, :enoent}}} =
              WorkflowStore.tracker_authority_generation()
+
+    assert_raise ArgumentError, ~r/Missing WORKFLOW/, fn ->
+      Config.settings_with_authority!()
+    end
 
     Workflow.set_workflow_file_path(third_workflow)
     assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)

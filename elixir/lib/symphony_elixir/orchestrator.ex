@@ -19,7 +19,6 @@ defmodule SymphonyElixir.Orchestrator do
     RunLedger,
     StatusDashboard,
     Tracker,
-    WorkflowStore,
     Workspace
   }
 
@@ -104,8 +103,10 @@ defmodule SymphonyElixir.Orchestrator do
   @impl true
   def init(opts) do
     now_ms = System.monotonic_time(:millisecond)
-    tracker_authority_generation = WorkflowStore.tracker_authority_generation()
-    config = Config.settings!()
+
+    {config, authority_generation, tracker_authority_generation} =
+      Config.settings_with_authority!()
+
     run_ledger_path = Keyword.get(opts, :run_ledger_path, RunLedger.default_path())
     run_ledger_append_fn = Keyword.get(opts, :run_ledger_append_fn, &RunLedger.append/2)
     runner_generation = RunLedger.new_id("runner")
@@ -140,7 +141,7 @@ defmodule SymphonyElixir.Orchestrator do
               processed_comment_ids: recovery.processed_operator_comment_ids,
               pending_outcomes: restore_pending_operator_outcomes(recovery.pending_operator_outcomes),
               operator_user_ids_generation: config.tracker.operator_user_ids || [],
-              operator_authority_generation: WorkflowStore.authority_generation(),
+              operator_authority_generation: authority_generation,
               tracker_authority_generation: tracker_authority_generation,
               tracker_context: Tracker.poll_context(config.tracker, tracker_authority_generation)
             },
@@ -809,7 +810,6 @@ defmodule SymphonyElixir.Orchestrator do
       effective_operator_user_ids = operator_user_ids(state)
 
       state
-      |> adopt_poll_tracker_context(request)
       |> apply_running_poll_result(
         request.running_ids,
         Map.get(result, :running),
@@ -1114,7 +1114,10 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host,
       expected_workspace_path,
       expected_workspace_root,
-      expected_worker_host
+      %{
+        expected_worker_host: expected_worker_host,
+        tracker_context: tracker_context(state)
+      }
     )
   end
 
@@ -1543,7 +1546,8 @@ defmodule SymphonyElixir.Orchestrator do
           dispatch.worker_host,
           dispatch.workspace_path,
           dispatch.workspace_root,
-          dispatch.affinity_required
+          dispatch.affinity_required,
+          tracker_context
         )
       else
         state_acc
@@ -1704,7 +1708,8 @@ defmodule SymphonyElixir.Orchestrator do
          preferred_worker_host,
          expected_workspace_path,
          expected_workspace_root,
-         affinity_required
+         affinity_required,
+         tracker_context
        ) do
     recipient = self()
 
@@ -1730,7 +1735,10 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host,
             expected_workspace_path,
             expected_workspace_root,
-            preferred_worker_host
+            %{
+              expected_worker_host: preferred_worker_host,
+              tracker_context: tracker_context
+            }
           )
         end
     end
@@ -1744,7 +1752,7 @@ defmodule SymphonyElixir.Orchestrator do
          worker_host,
          expected_workspace_path,
          expected_workspace_root,
-         expected_worker_host
+         dispatch_context
        ) do
     case Config.validate_runtime_capabilities() do
       :ok ->
@@ -1756,7 +1764,7 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host,
           expected_workspace_path,
           expected_workspace_root,
-          expected_worker_host
+          dispatch_context
         )
 
       {:error, {:missing_required_dynamic_tools, tools}} ->
@@ -1777,8 +1785,10 @@ defmodule SymphonyElixir.Orchestrator do
          worker_host,
          expected_workspace_path,
          expected_workspace_root,
-         expected_worker_host
+         dispatch_context
        ) do
+    expected_worker_host = dispatch_context.expected_worker_host
+
     case Workspace.prepare_for_issue(issue, worker_host,
            expected_workspace_path: expected_workspace_path,
            expected_workspace_root: expected_workspace_root,
@@ -1791,7 +1801,8 @@ defmodule SymphonyElixir.Orchestrator do
           attempt,
           recipient,
           worker_host,
-          prepared_workspace
+          prepared_workspace,
+          dispatch_context.tracker_context
         )
 
       {:error, reason} ->
@@ -1806,7 +1817,8 @@ defmodule SymphonyElixir.Orchestrator do
          attempt,
          recipient,
          worker_host,
-         prepared_workspace
+         prepared_workspace,
+         tracker_context
        ) do
     run_id = RunLedger.new_id("run")
     normalized_attempt = normalize_retry_attempt(attempt)
@@ -1834,8 +1846,11 @@ defmodule SymphonyElixir.Orchestrator do
           recipient,
           worker_host,
           prepared_workspace,
-          run_id,
-          normalized_attempt
+          %{
+            run_id: run_id,
+            normalized_attempt: normalized_attempt,
+            tracker_context: tracker_context
+          }
         )
 
       {:error, reason} ->
@@ -1851,11 +1866,13 @@ defmodule SymphonyElixir.Orchestrator do
          recipient,
          worker_host,
          prepared_workspace,
-         run_id,
-         normalized_attempt
+         %{
+           run_id: run_id,
+           normalized_attempt: normalized_attempt,
+           tracker_context: tracker_context
+         }
        ) do
     run_budget = RunBudget.from_agent_config(Config.settings!().agent)
-    tracker_context = tracker_context(state)
 
     task = fn ->
       AgentRunner.run(issue, recipient,
@@ -2301,7 +2318,15 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, request_workspace_cleanup(state, issue_id, cleanup_metadata, "tracker_terminal")}
 
       retry_candidate_issue?(issue, active_states, terminal_states) ->
-        handle_active_retry(state, issue, attempt, metadata, active_states, terminal_states)
+        handle_active_retry(
+          state,
+          issue,
+          attempt,
+          metadata,
+          active_states,
+          terminal_states,
+          tracker_context
+        )
 
       true ->
         Logger.debug("Issue left active states while retry was pending issue_id=#{issue_id} issue_identifier=#{issue.identifier}; keeping bounded dispatch visibility")
@@ -2319,7 +2344,15 @@ defmodule SymphonyElixir.Orchestrator do
     StatusDashboard.notify_update()
   end
 
-  defp handle_active_retry(state, issue, attempt, metadata, active_states, terminal_states) do
+  defp handle_active_retry(
+         state,
+         issue,
+         attempt,
+         metadata,
+         active_states,
+         terminal_states,
+         tracker_context
+       ) do
     affinity_required = valid_expected_workspace_path?(metadata[:workspace_path])
 
     if retry_candidate_issue?(issue, active_states, terminal_states) and
@@ -2333,7 +2366,8 @@ defmodule SymphonyElixir.Orchestrator do
          metadata[:worker_host],
          metadata[:workspace_path],
          metadata[:workspace_root],
-         affinity_required
+         affinity_required,
+         tracker_context
        )}
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
@@ -4765,9 +4799,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp refresh_runtime_config(%State{} = state) do
-    config = Config.settings!()
-    authority_generation = WorkflowStore.authority_generation()
-    tracker_authority_generation = WorkflowStore.tracker_authority_generation()
+    {config, authority_generation, tracker_authority_generation} =
+      Config.settings_with_authority!()
 
     state
     |> Map.put(:poll_interval_ms, config.polling.interval_ms)
@@ -4810,15 +4843,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp refresh_tracker_behavior_context(%State{} = state, _tracker), do: state
-
-  defp adopt_poll_tracker_context(
-         %State{operator_commands: %OperatorCommandState{} = operator_commands} = state,
-         %{tracker_context: %Tracker.PollContext{} = tracker_context}
-       ) do
-    %{state | operator_commands: %{operator_commands | tracker_context: tracker_context}}
-  end
-
-  defp adopt_poll_tracker_context(%State{} = state, _request), do: state
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     retry_candidate_issue?(issue, active_state_set(), terminal_states)
