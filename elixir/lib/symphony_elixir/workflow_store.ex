@@ -13,7 +13,15 @@ defmodule SymphonyElixir.WorkflowStore do
   defmodule State do
     @moduledoc false
 
-    defstruct [:path, :stamp, :workflow, authority_epoch: 0, authority_contract: nil]
+    defstruct [
+      :path,
+      :stamp,
+      :workflow,
+      authority_epoch: 0,
+      authority_contract: nil,
+      tracker_authority_epoch: 0,
+      tracker_authority_contract: nil
+    ]
   end
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -60,6 +68,23 @@ defmodule SymphonyElixir.WorkflowStore do
     end
   end
 
+  @spec tracker_authority_generation() :: {pid(), non_neg_integer()} | {:standalone, term()}
+  def tracker_authority_generation do
+    case Process.whereis(__MODULE__) do
+      pid when is_pid(pid) ->
+        {pid, GenServer.call(pid, :tracker_authority_epoch)}
+
+      _ ->
+        case Workflow.load() do
+          {:ok, workflow} ->
+            {:standalone, workflow |> authority_contract() |> tracker_authority_contract()}
+
+          {:error, reason} ->
+            {:standalone, {:unavailable, reason}}
+        end
+    end
+  end
+
   @impl true
   def init(_opts) do
     case load_state(Workflow.workflow_file_path()) do
@@ -96,6 +121,9 @@ defmodule SymphonyElixir.WorkflowStore do
   def handle_call(:authority_epoch, _from, %State{} = state),
     do: {:reply, state.authority_epoch, state}
 
+  def handle_call(:tracker_authority_epoch, _from, %State{} = state),
+    do: {:reply, state.tracker_authority_epoch, state}
+
   @impl true
   def handle_info(:poll, %State{} = state) do
     schedule_poll()
@@ -130,7 +158,21 @@ defmodule SymphonyElixir.WorkflowStore do
         authority_epoch =
           if authority_changed, do: state.authority_epoch + 1, else: state.authority_epoch
 
-        {:ok, %{loaded_state | authority_epoch: authority_epoch}}
+        tracker_authority_changed =
+          loaded_state.path != state.path or
+            loaded_state.tracker_authority_contract != state.tracker_authority_contract
+
+        tracker_authority_epoch =
+          if tracker_authority_changed,
+            do: state.tracker_authority_epoch + 1,
+            else: state.tracker_authority_epoch
+
+        {:ok,
+         %{
+           loaded_state
+           | authority_epoch: authority_epoch,
+             tracker_authority_epoch: tracker_authority_epoch
+         }}
 
       {:error, reason} ->
         log_reload_error(path, reason)
@@ -155,12 +197,15 @@ defmodule SymphonyElixir.WorkflowStore do
   defp load_state(path) do
     with {:ok, workflow} <- Workflow.load(path),
          {:ok, stamp} <- current_stamp(path) do
+      authority_contract = authority_contract(workflow)
+
       {:ok,
        %State{
          path: path,
          stamp: stamp,
          workflow: workflow,
-         authority_contract: authority_contract(workflow)
+         authority_contract: authority_contract,
+         tracker_authority_contract: tracker_authority_contract(authority_contract)
        }}
     else
       {:error, reason} ->
@@ -178,12 +223,18 @@ defmodule SymphonyElixir.WorkflowStore do
         kind: Map.get(tracker, "kind"),
         endpoint: Map.get(tracker, "endpoint", "https://api.linear.app/graphql"),
         api_key_selector: Map.get(tracker, "api_key"),
+        project_slug: Map.get(tracker, "project_slug"),
         operator_user_ids: if(is_list(operator_user_ids), do: Enum.sort(operator_user_ids), else: operator_user_ids)
       }
     else
       {:invalid_tracker, tracker}
     end
   end
+
+  defp tracker_authority_contract(contract) when is_map(contract),
+    do: Map.drop(contract, [:operator_user_ids])
+
+  defp tracker_authority_contract(contract), do: contract
 
   defp current_stamp(path) when is_binary(path) do
     with {:ok, stat} <- File.stat(path, time: :posix),

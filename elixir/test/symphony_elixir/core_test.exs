@@ -3239,7 +3239,12 @@ defmodule SymphonyElixir.CoreTest do
     operator_commands = :sys.get_state(pid).operator_commands
     assert operator_commands.operator_user_ids_generation == ["operator-1"]
     assert operator_commands.operator_authority_generation == WorkflowStore.authority_generation()
+
+    assert operator_commands.tracker_authority_generation ==
+             WorkflowStore.tracker_authority_generation()
+
     refute operator_commands.operator_authority_invalidated
+    refute operator_commands.tracker_authority_invalidated
   end
 
   test "operator allowlist drift invalidates an already collected poll result" do
@@ -3249,7 +3254,20 @@ defmodule SymphonyElixir.CoreTest do
     )
 
     issue_id = "issue-operator-inflight-generation-drift"
+    running_issue_id = "issue-running-inflight-generation-drift"
     cursor_at = ~U[2026-08-03 10:00:00Z]
+
+    running_issue = %Issue{
+      id: running_issue_id,
+      identifier: "MT-RUNNING-INFLIGHT-GENERATION-DRIFT",
+      title: "Running before tracker authority drift",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %{running_issue | state: "Todo"}
+    ])
 
     assert {:ok, wait} =
              SymphonyElixir.OperatorWait.new("waiting_secret", %{
@@ -3264,10 +3282,18 @@ defmodule SymphonyElixir.CoreTest do
       max_concurrent_agents: 1,
       run_ledger_path: nil,
       dispatch_paused: true,
+      running: %{
+        running_issue_id => %{
+          issue: running_issue,
+          identifier: running_issue.identifier,
+          pid: self()
+        }
+      },
       parked: %{issue_id => wait},
       operator_commands: %Orchestrator.OperatorCommandState{
         operator_user_ids_generation: ["operator-1"],
-        operator_authority_generation: WorkflowStore.authority_generation()
+        operator_authority_generation: WorkflowStore.authority_generation(),
+        tracker_authority_generation: WorkflowStore.tracker_authority_generation()
       },
       operator_comment_cursors: %{
         issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
@@ -3277,12 +3303,12 @@ defmodule SymphonyElixir.CoreTest do
 
     poll_result = %{
       request: %{
-        running_ids: [],
+        running_ids: [running_issue_id],
         retry_issue_ids: [],
         operator_user_ids: ["operator-1"],
         dispatch_paused: true
       },
-      running: {:ok, []},
+      running: {:ok, [%{running_issue | state: "Todo"}]},
       parked: {:ok, []},
       comments: %{
         issue_id =>
@@ -3311,14 +3337,23 @@ defmodule SymphonyElixir.CoreTest do
       tracker_operator_user_ids: ["operator-1"]
     )
 
-    applied_state = Orchestrator.apply_poll_result_for_test(state, poll_result)
+    blocked_poll_state = Orchestrator.run_poll_cycle_for_test(state)
+    assert blocked_poll_state.operator_commands.tracker_authority_invalidated
+    assert blocked_poll_state.running[running_issue_id].issue.state == "In Progress"
+
+    applied_state = Orchestrator.apply_poll_result_for_test(blocked_poll_state, poll_result)
     assert applied_state.operator_commands.operator_authority_invalidated
+    assert applied_state.operator_commands.tracker_authority_invalidated
     assert applied_state.parked[issue_id].wait_id == wait.wait_id
+    assert applied_state.running[running_issue_id].issue.state == "In Progress"
 
     refute MapSet.member?(
              applied_state.operator_commands.processed_comment_ids,
              "inflight-generation-drift-retry"
            )
+
+    if is_reference(blocked_poll_state.tick_timer_ref),
+      do: Process.cancel_timer(blocked_poll_state.tick_timer_ref)
   end
 
   test "Linear retry command resumes a matching wait exactly once while globally paused" do

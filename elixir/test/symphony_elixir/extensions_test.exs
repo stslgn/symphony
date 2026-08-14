@@ -175,14 +175,26 @@ defmodule SymphonyElixir.ExtensionsTest do
               kind: "linear",
               endpoint: "https://api.linear.app/graphql",
               api_key_selector: "token",
+              project_slug: "project",
               operator_user_ids: []
             }} = WorkflowStore.authority_generation()
+
+    assert {:standalone,
+            %{
+              kind: "linear",
+              endpoint: "https://api.linear.app/graphql",
+              api_key_selector: "token",
+              project_slug: "project"
+            }} = WorkflowStore.tracker_authority_generation()
 
     missing_path = Path.join(Path.dirname(third_workflow), "MISSING_AUTHORITY_WORKFLOW.md")
     Workflow.set_workflow_file_path(missing_path)
 
     assert {:standalone, {:unavailable, {:missing_workflow_file, ^missing_path, :enoent}}} =
              WorkflowStore.authority_generation()
+
+    assert {:standalone, {:unavailable, {:missing_workflow_file, ^missing_path, :enoent}}} =
+             WorkflowStore.tracker_authority_generation()
 
     Workflow.set_workflow_file_path(third_workflow)
     assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)

@@ -49,7 +49,9 @@ defmodule SymphonyElixir.Orchestrator do
               pending_outcomes: %{},
               operator_user_ids_generation: nil,
               operator_authority_generation: nil,
-              operator_authority_invalidated: false
+              operator_authority_invalidated: false,
+              tracker_authority_generation: nil,
+              tracker_authority_invalidated: false
   end
 
   defmodule State do
@@ -136,7 +138,8 @@ defmodule SymphonyElixir.Orchestrator do
               processed_comment_ids: recovery.processed_operator_comment_ids,
               pending_outcomes: restore_pending_operator_outcomes(recovery.pending_operator_outcomes),
               operator_user_ids_generation: config.tracker.operator_user_ids || [],
-              operator_authority_generation: WorkflowStore.authority_generation()
+              operator_authority_generation: WorkflowStore.authority_generation(),
+              tracker_authority_generation: WorkflowStore.tracker_authority_generation()
             },
             operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
             codex_totals: @empty_codex_totals,
@@ -572,16 +575,8 @@ defmodule SymphonyElixir.Orchestrator do
            operator_commands: %OperatorCommandState{operator_user_ids_generation: nil}
          } = state,
          _configured,
-         _authority_generation
-       ),
-       do: state
-
-  defp pin_operator_authority_generation(
-         %State{
-           operator_commands: %OperatorCommandState{operator_authority_invalidated: true}
-         } = state,
-         _configured,
-         _authority_generation
+         _authority_generation,
+         _tracker_authority_generation
        ),
        do: state
 
@@ -589,23 +584,47 @@ defmodule SymphonyElixir.Orchestrator do
          %State{
            operator_commands: %OperatorCommandState{
              operator_user_ids_generation: generation,
-             operator_authority_generation: pinned_authority_generation
+             operator_authority_generation: pinned_authority_generation,
+             operator_authority_invalidated: operator_authority_invalidated,
+             tracker_authority_generation: pinned_tracker_authority_generation,
+             tracker_authority_invalidated: tracker_authority_invalidated
            }
          } = state,
          configured,
-         authority_generation
+         authority_generation,
+         tracker_authority_generation
        ) do
     authority_generation_matches =
       is_nil(pinned_authority_generation) or
         pinned_authority_generation == authority_generation
 
-    if Enum.sort(configured) == Enum.sort(generation) and authority_generation_matches do
-      state
-    else
-      Logger.warning("Operator command authority changed after startup; commands remain disabled until restart")
+    tracker_authority_generation_matches =
+      is_nil(pinned_tracker_authority_generation) or
+        pinned_tracker_authority_generation == tracker_authority_generation
 
-      put_in(state.operator_commands.operator_authority_invalidated, true)
+    operator_authority_invalidated =
+      operator_authority_invalidated or
+        Enum.sort(configured) != Enum.sort(generation) or
+        not authority_generation_matches
+
+    tracker_authority_invalidated =
+      tracker_authority_invalidated or not tracker_authority_generation_matches
+
+    if operator_authority_invalidated and not state.operator_commands.operator_authority_invalidated do
+      Logger.warning("Operator command authority changed after startup; commands remain disabled until restart")
     end
+
+    if tracker_authority_invalidated and not state.operator_commands.tracker_authority_invalidated do
+      Logger.warning("Tracker authority changed after startup; all tracker polling remains disabled until restart")
+    end
+
+    operator_commands = %{
+      state.operator_commands
+      | operator_authority_invalidated: operator_authority_invalidated,
+        tracker_authority_invalidated: tracker_authority_invalidated
+    }
+
+    %{state | operator_commands: operator_commands}
   end
 
   defp ensure_operator_cursors_for_poll(%State{} = state) do
@@ -620,6 +639,20 @@ defmodule SymphonyElixir.Orchestrator do
           ensure_operator_cursor(state_acc, issue_id)
         end)
     end
+  end
+
+  defp poll_request(%State{
+         operator_commands: %OperatorCommandState{tracker_authority_invalidated: true}
+       }) do
+    %{
+      running_ids: [],
+      parked_ids: [],
+      retry_issue_ids: [],
+      comment_requests: [],
+      operator_user_ids: [],
+      dispatch_paused: true,
+      tracker_authority_valid: false
+    }
   end
 
   defp poll_request(%State{} = state) do
@@ -645,7 +678,8 @@ defmodule SymphonyElixir.Orchestrator do
       retry_issue_ids: retry_issue_ids,
       comment_requests: operator_comment_requests(state, operator_user_ids),
       operator_user_ids: operator_user_ids,
-      dispatch_paused: state.dispatch_paused
+      dispatch_paused: state.dispatch_paused,
+      tracker_authority_valid: true
     }
   end
 
@@ -662,6 +696,16 @@ defmodule SymphonyElixir.Orchestrator do
       %{created_at: %DateTime{} = cursor} -> [{issue_id, cursor}]
       _cursor -> []
     end
+  end
+
+  defp collect_tracker_poll(%{tracker_authority_valid: false} = request) do
+    %{
+      request: request,
+      running: {:skip, :tracker_authority_invalidated},
+      parked: {:skip, :tracker_authority_invalidated},
+      comments: %{},
+      dispatch: {:skip, :tracker_authority_invalidated}
+    }
   end
 
   defp collect_tracker_poll(request) do
@@ -707,16 +751,21 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_poll_result(%State{} = state, %{request: request} = result) when is_map(request) do
     state = refresh_runtime_config(state)
-    effective_operator_user_ids = operator_user_ids(state)
 
-    state
-    |> apply_running_poll_result(request.running_ids, Map.get(result, :running))
-    |> apply_parked_poll_result(Map.get(result, :parked))
-    |> apply_operator_comment_results(
-      effective_operator_user_ids,
-      Map.get(result, :comments, %{})
-    )
-    |> apply_dispatch_poll_result(request, Map.get(result, :dispatch))
+    if state.operator_commands.tracker_authority_invalidated do
+      state
+    else
+      effective_operator_user_ids = operator_user_ids(state)
+
+      state
+      |> apply_running_poll_result(request.running_ids, Map.get(result, :running))
+      |> apply_parked_poll_result(Map.get(result, :parked))
+      |> apply_operator_comment_results(
+        effective_operator_user_ids,
+        Map.get(result, :comments, %{})
+      )
+      |> apply_dispatch_poll_result(request, Map.get(result, :dispatch))
+    end
   end
 
   defp apply_poll_result(%State{} = state, _invalid_result), do: state
@@ -4613,13 +4662,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
     authority_generation = WorkflowStore.authority_generation()
+    tracker_authority_generation = WorkflowStore.tracker_authority_generation()
 
     state
     |> Map.put(:poll_interval_ms, config.polling.interval_ms)
     |> Map.put(:max_concurrent_agents, config.agent.max_concurrent_agents)
     |> pin_operator_authority_generation(
       config.tracker.operator_user_ids || [],
-      authority_generation
+      authority_generation,
+      tracker_authority_generation
     )
   end
 
