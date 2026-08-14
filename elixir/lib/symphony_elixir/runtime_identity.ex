@@ -71,7 +71,7 @@ defmodule SymphonyElixir.RuntimeIdentity do
     load_fn = Keyword.get(opts, :application_load_fn, &Application.load/1)
     spec_fn = Keyword.get(opts, :application_spec_fn, &Application.spec/2)
 
-    collect_application_modules([{@application, false}], MapSet.new(), [], load_fn, spec_fn)
+    collect_application_modules([{@application, false}], [], [], load_fn, spec_fn)
   end
 
   defp collect_application_modules([], _seen, modules, _load_fn, _spec_fn),
@@ -84,7 +84,7 @@ defmodule SymphonyElixir.RuntimeIdentity do
          load_fn,
          spec_fn
        ) do
-    if MapSet.member?(seen, application) do
+    if application in seen do
       collect_application_modules(remaining, seen, modules, load_fn, spec_fn)
     else
       collect_unseen_application(
@@ -112,7 +112,7 @@ defmodule SymphonyElixir.RuntimeIdentity do
       :skip ->
         collect_application_modules(
           remaining,
-          MapSet.put(seen, application),
+          [application | seen],
           modules,
           load_fn,
           spec_fn
@@ -132,7 +132,7 @@ defmodule SymphonyElixir.RuntimeIdentity do
          {:ok, dependencies} <- application_dependencies(spec_fn, application) do
       collect_application_modules(
         dependencies ++ remaining,
-        MapSet.put(seen, application),
+        [application | seen],
         application_modules ++ modules,
         load_fn,
         spec_fn
@@ -146,8 +146,7 @@ defmodule SymphonyElixir.RuntimeIdentity do
            application_spec_list(spec_fn, application, :included_applications, true),
          {:ok, optional} <-
            application_spec_list(spec_fn, application, :optional_applications, true) do
-      optional = MapSet.new(optional)
-      {:ok, Enum.map(applications ++ included, &{&1, MapSet.member?(optional, &1)})}
+      {:ok, Enum.map(applications ++ included, &{&1, &1 in optional})}
     end
   end
 
