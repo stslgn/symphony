@@ -253,6 +253,20 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:stop, {:missing_workflow_file, ^missing_path, :enoent}} = WorkflowStore.init([])
   end
 
+  test "workflow store stamp hashes the exact bytes used for its parsed snapshot" do
+    ensure_workflow_store_running()
+    workflow_path = Workflow.workflow_file_path()
+
+    write_workflow_file!(workflow_path, prompt: "Immutable snapshot B")
+    assert :ok = WorkflowStore.force_reload()
+
+    content = File.read!(workflow_path)
+    state = :sys.get_state(WorkflowStore)
+
+    assert state.stamp == :crypto.hash(:sha256, content)
+    assert state.workflow.prompt == "Immutable snapshot B"
+  end
+
   test "workflow store start_link and poll callback cover missing-file error paths" do
     ensure_workflow_store_running()
     existing_path = Workflow.workflow_file_path()

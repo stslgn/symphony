@@ -193,7 +193,18 @@ defmodule SymphonyElixir.WorkflowStore do
   end
 
   defp reload_path(path, state) do
-    case load_state(path) do
+    case read_snapshot(path) do
+      {:ok, snapshot} ->
+        reload_snapshot(path, snapshot, state)
+
+      {:error, reason} ->
+        log_reload_error(path, reason)
+        {:error, reason, state}
+    end
+  end
+
+  defp reload_snapshot(path, snapshot, state) do
+    case load_state(path, snapshot) do
       {:ok, loaded_state} ->
         authority_changed =
           loaded_state.path != state.path or
@@ -225,12 +236,12 @@ defmodule SymphonyElixir.WorkflowStore do
   end
 
   defp reload_current_path(path, state) do
-    case current_stamp(path) do
-      {:ok, stamp} when stamp == state.stamp ->
+    case read_snapshot(path) do
+      {:ok, %{stamp: stamp}} when stamp == state.stamp ->
         {:ok, state}
 
-      {:ok, _stamp} ->
-        reload_path(path, state)
+      {:ok, snapshot} ->
+        reload_snapshot(path, snapshot, state)
 
       {:error, reason} ->
         log_reload_error(path, reason)
@@ -239,8 +250,13 @@ defmodule SymphonyElixir.WorkflowStore do
   end
 
   defp load_state(path) do
-    with {:ok, workflow} <- Workflow.load(path),
-         {:ok, stamp} <- current_stamp(path) do
+    with {:ok, snapshot} <- read_snapshot(path) do
+      load_state(path, snapshot)
+    end
+  end
+
+  defp load_state(path, %{content: content, stamp: stamp}) do
+    with {:ok, workflow} <- Workflow.parse(content) do
       authority_contract = authority_contract(workflow)
 
       {:ok,
@@ -280,12 +296,13 @@ defmodule SymphonyElixir.WorkflowStore do
 
   defp tracker_authority_contract(contract), do: contract
 
-  defp current_stamp(path) when is_binary(path) do
-    with {:ok, stat} <- File.stat(path, time: :posix),
-         {:ok, content} <- File.read(path) do
-      {:ok, {stat.mtime, stat.size, :erlang.phash2(content)}}
-    else
-      {:error, reason} -> {:error, reason}
+  defp read_snapshot(path) when is_binary(path) do
+    case File.read(path) do
+      {:ok, content} ->
+        {:ok, %{content: content, stamp: :crypto.hash(:sha256, content)}}
+
+      {:error, reason} ->
+        {:error, {:missing_workflow_file, path, reason}}
     end
   end
 
