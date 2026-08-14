@@ -336,7 +336,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp worker_launch_command(command, secret_env_names) when is_binary(command) do
     unset_args = Enum.map_join(secret_env_names, " ", &"-u #{&1}")
-    "env #{unset_args} /bin/bash --noprofile --norc -c #{shell_escape(command)}"
+    "/usr/bin/env #{unset_args} /bin/bash --noprofile --norc -c #{shell_escape(command)}"
   end
 
   defp scrubbed_worker_port_env(secret_env_names) do

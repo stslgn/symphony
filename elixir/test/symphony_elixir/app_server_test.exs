@@ -2050,9 +2050,12 @@ defmodule SymphonyElixir.AppServerTest do
     try do
       remote_workspace = Path.join(test_root, "remote-workspaces/MT-REMOTE-ENV")
       fake_ssh = Path.join(test_root, "ssh")
+      fake_login_bash = Path.join(test_root, "bash")
+      hostile_env = Path.join(test_root, "env")
       fake_codex = Path.join(test_root, "fake-remote-codex")
       pipe_probe = Path.join(test_root, "pipe-probe")
       trace_file = Path.join(test_root, "remote.env")
+      hostile_env_trace = Path.join(test_root, "hostile-env.trace")
 
       File.mkdir_p!(remote_workspace)
       System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
@@ -2074,6 +2077,21 @@ defmodule SymphonyElixir.AppServerTest do
       done
       #{remote_contamination}
       exec /bin/bash -c "$remote_command"
+      """)
+
+      File.write!(hostile_env, """
+      #!/bin/sh
+      printf '%s\n' 'PATH_ENV_EXECUTED' >> #{hostile_env_trace}
+      exit 97
+      """)
+
+      File.write!(fake_login_bash, """
+      #!/bin/sh
+      if [ "${1:-}" = "-lc" ]; then
+        shift
+        exec /bin/bash -c "$1"
+      fi
+      exec /bin/bash "$@"
       """)
 
       codex_env_probe =
@@ -2111,6 +2129,8 @@ defmodule SymphonyElixir.AppServerTest do
       """)
 
       File.chmod!(fake_ssh, 0o755)
+      File.chmod!(fake_login_bash, 0o755)
+      File.chmod!(hostile_env, 0o755)
       File.chmod!(fake_codex, 0o755)
       File.chmod!(pipe_probe, 0o755)
 
@@ -2137,6 +2157,7 @@ defmodule SymphonyElixir.AppServerTest do
                )
 
       trace = File.read!(trace_file)
+      refute File.exists?(hostile_env_trace)
 
       Enum.each(secret_env_names, fn name ->
         assert trace =~ "CODEX:#{name}=__ABSENT__"
