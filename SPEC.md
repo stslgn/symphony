@@ -443,9 +443,11 @@ Fields:
     generation with the current monotonic tracker-authority generation before every low-level
     network request and fail closed after drift. This includes viewer resolution, pagination,
     batching, reads, and mutations. Public tracker adapter access MUST require the admitted
-    request/session context rather than reconstructing authority from hot-reloaded config. Each
-    check MUST synchronously refresh the workflow authority snapshot; it MUST NOT rely on a periodic
-    file watcher noticing the change first.
+    request/session context rather than reconstructing authority from hot-reloaded config. Linear
+    clients and worker entrypoints MUST reject a missing context and MUST NOT mint a new generation
+    on demand; this rejection occurs before workspace preparation, port startup, or network I/O.
+    Each check MUST synchronously refresh the workflow authority snapshot; it MUST NOT rely on a
+    periodic file watcher noticing the change first.
   - The identity associated with `tracker.api_key` MUST remain rejected even if listed, because a
     worker can publish comments through the same credential.
 - `project_slug` (string)

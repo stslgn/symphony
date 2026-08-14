@@ -243,7 +243,9 @@ Notes:
   affect future work without changing an admitted decision. Every worker-side tracker call rechecks
   the monotonic authority generation through a synchronous workflow refresh before every GraphQL
   request, including viewer lookup, pagination, batching, reads, and mutations. The public tracker
-  facade requires the admitted poll/session context, and the network client never re-reads those
+  facade, Linear client, and worker entrypoints require the admitted poll/session context; none mint
+  a replacement generation when it is missing. Missing or stale context fails before workspace
+  preparation, app-server port startup, or network I/O, and the network client never re-reads those
   fields from hot-reloaded config.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
