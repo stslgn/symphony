@@ -3274,6 +3274,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_operator_user_ids: ["operator-1"]
     )
 
+    tracker_context = Tracker.current_poll_context()
     issue_id = "issue-operator-inflight-generation-drift"
     running_issue_id = "issue-running-inflight-generation-drift"
     cursor_at = ~U[2026-08-03 10:00:00Z]
@@ -3327,7 +3328,8 @@ defmodule SymphonyElixir.CoreTest do
         running_ids: [running_issue_id],
         retry_issue_ids: [],
         operator_user_ids: ["operator-1"],
-        dispatch_paused: true
+        dispatch_paused: true,
+        tracker_context: tracker_context
       },
       running: {:ok, [%{running_issue | state: "Todo"}]},
       parked: {:ok, []},
