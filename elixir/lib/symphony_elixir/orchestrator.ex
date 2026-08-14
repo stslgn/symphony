@@ -594,29 +594,33 @@ defmodule SymphonyElixir.Orchestrator do
          authority_generation,
          tracker_authority_generation
        ) do
-    authority_generation_matches =
-      is_nil(pinned_authority_generation) or
-        pinned_authority_generation == authority_generation
-
-    tracker_authority_generation_matches =
-      is_nil(pinned_tracker_authority_generation) or
-        pinned_tracker_authority_generation == tracker_authority_generation
-
     operator_authority_invalidated =
-      operator_authority_invalidated or
-        Enum.sort(configured) != Enum.sort(generation) or
-        not authority_generation_matches
+      operator_authority_invalidated?(
+        operator_authority_invalidated,
+        generation,
+        configured,
+        pinned_authority_generation,
+        authority_generation
+      )
 
     tracker_authority_invalidated =
-      tracker_authority_invalidated or not tracker_authority_generation_matches
+      tracker_authority_invalidated?(
+        tracker_authority_invalidated,
+        pinned_tracker_authority_generation,
+        tracker_authority_generation
+      )
 
-    if operator_authority_invalidated and not state.operator_commands.operator_authority_invalidated do
-      Logger.warning("Operator command authority changed after startup; commands remain disabled until restart")
-    end
+    log_authority_transition(
+      operator_authority_invalidated,
+      state.operator_commands.operator_authority_invalidated,
+      "Operator command authority changed after startup; commands remain disabled until restart"
+    )
 
-    if tracker_authority_invalidated and not state.operator_commands.tracker_authority_invalidated do
-      Logger.warning("Tracker authority changed after startup; all tracker polling remains disabled until restart")
-    end
+    log_authority_transition(
+      tracker_authority_invalidated,
+      state.operator_commands.tracker_authority_invalidated,
+      "Tracker authority changed after startup; all tracker polling remains disabled until restart"
+    )
 
     operator_commands = %{
       state.operator_commands
@@ -626,6 +630,28 @@ defmodule SymphonyElixir.Orchestrator do
 
     %{state | operator_commands: operator_commands}
   end
+
+  defp operator_authority_invalidated?(
+         already_invalidated,
+         pinned_user_ids,
+         configured_user_ids,
+         pinned_generation,
+         current_generation
+       ) do
+    already_invalidated or
+      Enum.sort(configured_user_ids) != Enum.sort(pinned_user_ids) or
+      not authority_generation_matches?(pinned_generation, current_generation)
+  end
+
+  defp tracker_authority_invalidated?(already_invalidated, pinned_generation, current_generation) do
+    already_invalidated or not authority_generation_matches?(pinned_generation, current_generation)
+  end
+
+  defp authority_generation_matches?(nil, _current_generation), do: true
+  defp authority_generation_matches?(pinned_generation, current_generation), do: pinned_generation == current_generation
+
+  defp log_authority_transition(true, false, message), do: Logger.warning(message)
+  defp log_authority_transition(_invalidated, _was_invalidated, _message), do: :ok
 
   defp ensure_operator_cursors_for_poll(%State{} = state) do
     case operator_user_ids(state) do
