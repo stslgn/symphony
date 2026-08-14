@@ -31,7 +31,8 @@ defmodule SymphonyElixir.Application do
       SymphonyElixir.WorkflowStore,
       SymphonyElixir.Orchestrator,
       SymphonyElixir.HttpServer,
-      SymphonyElixir.StatusDashboard
+      SymphonyElixir.StatusDashboard,
+      SymphonyElixir.StartupAttestation
     ]
 
     Supervisor.start_link(

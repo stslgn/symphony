@@ -76,6 +76,11 @@ defmodule SymphonyElixir.WorkflowStore do
     end
   end
 
+  @spec startup_digest() :: String.t()
+  def startup_digest do
+    GenServer.call(__MODULE__, :startup_digest)
+  end
+
   @spec authority_generation() :: {pid(), non_neg_integer()} | {:standalone, term()}
   def authority_generation do
     case Process.whereis(__MODULE__) do
@@ -128,6 +133,10 @@ defmodule SymphonyElixir.WorkflowStore do
       {:error, _reason, new_state} ->
         {:reply, {:ok, new_state.workflow}, new_state}
     end
+  end
+
+  def handle_call(:startup_digest, _from, %State{stamp: stamp} = state) do
+    {:reply, Base.encode16(stamp, case: :lower), state}
   end
 
   def handle_call(:current_with_authority, _from, %State{} = state) do

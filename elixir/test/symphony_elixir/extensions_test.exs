@@ -5,7 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
-  alias SymphonyElixir.{ParkedProjection, RunLedger}
+  alias SymphonyElixir.{ParkedProjection, RunLedger, StartupAttestation}
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -289,6 +289,66 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", "not-a-sha256")
     assert {:stop, {:invalid_expected_workflow_sha256, "not-a-sha256"}} = WorkflowStore.init([])
+  end
+
+  test "startup attestation proves the verified digest and consumes its boot environment" do
+    ensure_workflow_store_running()
+    workflow_path = Workflow.workflow_file_path()
+    attestation_path = Path.join(Path.dirname(workflow_path), "startup-attestation")
+    workflow_digest = WorkflowStore.startup_digest()
+    previous_digest = System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    previous_attestation_path = System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", previous_digest)
+      restore_env("SYMPHONY_STARTUP_ATTESTATION_PATH", previous_attestation_path)
+    end)
+
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest)
+    System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", attestation_path)
+
+    assert :ignore = StartupAttestation.start_link([])
+    assert File.stat!(attestation_path).mode == 0o100600
+
+    attestation =
+      attestation_path
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Map.new(fn line -> List.to_tuple(String.split(line, "=", parts: 2)) end)
+
+    assert attestation["protocol"] == "1"
+    assert attestation["pid"] == System.pid()
+    assert attestation["process_start"] != ""
+    assert attestation["workflow_sha256"] == workflow_digest
+    refute System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    refute System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+
+    write_workflow_file!(workflow_path, prompt: "Post-attestation hot reload")
+    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
+    assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
+    assert {:ok, %{prompt: "Post-attestation hot reload"}} = WorkflowStore.current()
+  end
+
+  test "startup attestation fails closed when its managed path is missing or unwritable" do
+    ensure_workflow_store_running()
+    workflow_digest = WorkflowStore.startup_digest()
+    previous_digest = System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    previous_attestation_path = System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", previous_digest)
+      restore_env("SYMPHONY_STARTUP_ATTESTATION_PATH", previous_attestation_path)
+    end)
+
+    System.delete_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    System.delete_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+    assert :ignore = StartupAttestation.start_link([])
+
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest)
+    assert {:error, :missing_startup_attestation_path} = StartupAttestation.start_link([])
+
+    System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", Path.dirname(Workflow.workflow_file_path()))
+    assert {:error, {:startup_attestation_write_failed, _reason}} = StartupAttestation.start_link([])
   end
 
   test "workflow store keeps last good authority across schema-invalid YAML reloads" do
