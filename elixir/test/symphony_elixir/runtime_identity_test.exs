@@ -220,12 +220,15 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
     execution_sha256 = String.duplicate("a", 64)
     selector_names = ~w(ESCRIPT_EMULATOR ESCRIPT_NAME ERL_ROOTDIR ERL_OTP28_FLAGS)
     previous_selectors = Map.new(selector_names, &{&1, System.get_env(&1)})
+    previous_path = System.fetch_env!("PATH")
 
     on_exit(fn ->
       Enum.each(previous_selectors, fn
         {name, nil} -> System.delete_env(name)
         {name, value} -> System.put_env(name, value)
       end)
+
+      System.put_env("PATH", previous_path)
 
       File.rm_rf(test_root)
     end)
@@ -258,9 +261,9 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
 
     File.chmod!(escript_path, 0o700)
     Enum.each(selector_names, &System.put_env(&1, "hostile-selector"))
+    System.put_env("PATH", "#{test_root}:#{previous_path}")
 
-    assert :ok =
-             RuntimeIdentity.write_manifest!(runtime_path, manifest_path, escript_path: escript_path)
+    assert :ok = RuntimeIdentity.write_manifest!(runtime_path, manifest_path)
 
     refute File.exists?(selector_trace)
 
