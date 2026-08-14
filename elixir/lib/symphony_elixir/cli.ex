@@ -43,6 +43,7 @@ defmodule SymphonyElixir.CLI do
   @spec startup_protocol() :: String.t()
   def startup_protocol, do: @startup_protocol
 
+  @spec start_runtime([String.t()]) :: no_return()
   defp start_runtime(args) do
     case evaluate(args) do
       :ok ->
@@ -67,6 +68,7 @@ defmodule SymphonyElixir.CLI do
     end
   end
 
+  @spec halt_runtime_identity(term()) :: no_return()
   defp halt_runtime_identity(reason) do
     IO.puts(:stderr, "runtime_identity_unavailable: #{inspect(reason)}")
     System.halt(78)
