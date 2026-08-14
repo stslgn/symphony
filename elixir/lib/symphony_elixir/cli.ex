@@ -27,9 +27,13 @@ defmodule SymphonyElixir.CLI do
   end
 
   def main(["--runtime-identity"]) do
-    case RuntimeIdentity.fingerprint() do
-      {:ok, digest} -> IO.puts(digest)
-      {:error, reason} -> halt_runtime_identity(reason)
+    case RuntimeIdentity.evidence() do
+      {:ok, evidence} ->
+        IO.puts("image_sha256=#{evidence.image_sha256}")
+        IO.puts("execution_sha256=#{evidence.execution_sha256}")
+
+      {:error, reason} ->
+        halt_runtime_identity(reason)
     end
   end
 

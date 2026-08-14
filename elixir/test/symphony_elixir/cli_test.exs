@@ -14,7 +14,9 @@ defmodule SymphonyElixir.CLITest do
 
   test "reports a loaded-code runtime identity without starting the application" do
     output = capture_io(fn -> assert :ok = CLI.main(["--runtime-identity"]) end)
-    assert String.trim(output) =~ ~r/\A[0-9a-f]{64}\z/
+
+    assert output =~
+             ~r/\Aimage_sha256=[0-9a-f]{64}\nexecution_sha256=[0-9a-f]{64}\n\z/
   end
 
   test "returns the guardrails acknowledgement banner when the flag is missing" do

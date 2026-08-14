@@ -157,4 +157,55 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
                fingerprint_fn: fn -> {:error, :runtime_identity_probe_failed} end
              )
   end
+
+  test "reports one structured identity for the executing image and loaded code" do
+    execution_sha256 = String.duplicate("a", 64)
+
+    assert {:ok,
+            %{
+              image_sha256: image_sha256,
+              execution_sha256: ^execution_sha256
+            }} =
+             RuntimeIdentity.evidence(
+               script_name_fn: fn -> ~c"/managed/runtime-image" end,
+               lstat_fn: fn "/managed/runtime-image" -> {:ok, %File.Stat{type: :regular}} end,
+               read_fn: fn "/managed/runtime-image" -> {:ok, "exact image bytes"} end,
+               fingerprint_fn: fn -> {:ok, execution_sha256} end
+             )
+
+    assert image_sha256 ==
+             :crypto.hash(:sha256, "exact image bytes") |> Base.encode16(case: :lower)
+  end
+
+  test "rejects incomplete or unsafe executing-image evidence" do
+    execution_sha256 = String.duplicate("a", 64)
+
+    base_opts = [
+      script_name_fn: fn -> "/managed/runtime-image" end,
+      lstat_fn: fn _path -> {:ok, %File.Stat{type: :regular}} end,
+      read_fn: fn _path -> {:ok, "runtime"} end,
+      fingerprint_fn: fn -> {:ok, execution_sha256} end
+    ]
+
+    assert {:error, :runtime_identity_image_path_unavailable} =
+             RuntimeIdentity.evidence(Keyword.put(base_opts, :script_name_fn, fn -> [] end))
+
+    assert {:error, :runtime_identity_image_path_unavailable} =
+             RuntimeIdentity.evidence(Keyword.put(base_opts, :script_name_fn, fn -> :invalid end))
+
+    assert {:error, {:runtime_identity_image_stat_failed, :enoent}} =
+             RuntimeIdentity.evidence(Keyword.put(base_opts, :lstat_fn, fn _path -> {:error, :enoent} end))
+
+    assert {:error, :runtime_identity_image_not_regular} =
+             RuntimeIdentity.evidence(Keyword.put(base_opts, :lstat_fn, fn _path -> {:ok, %File.Stat{type: :symlink}} end))
+
+    assert {:error, {:runtime_identity_image_read_failed, :eacces}} =
+             RuntimeIdentity.evidence(Keyword.put(base_opts, :read_fn, fn _path -> {:error, :eacces} end))
+
+    assert {:error, :runtime_identity_execution_invalid} =
+             RuntimeIdentity.evidence(Keyword.put(base_opts, :fingerprint_fn, fn -> {:ok, "invalid"} end))
+
+    assert {:error, :runtime_identity_probe_failed} =
+             RuntimeIdentity.evidence(Keyword.put(base_opts, :fingerprint_fn, fn -> {:error, :runtime_identity_probe_failed} end))
+  end
 end

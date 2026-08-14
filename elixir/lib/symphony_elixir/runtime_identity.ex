@@ -3,6 +3,31 @@ defmodule SymphonyElixir.RuntimeIdentity do
 
   @application :symphony_elixir
 
+  @type evidence :: %{
+          image_sha256: String.t(),
+          execution_sha256: String.t()
+        }
+
+  @spec evidence(keyword()) :: {:ok, evidence()} | {:error, term()}
+  def evidence(opts \\ []) do
+    script_name_fn = Keyword.get(opts, :script_name_fn, &:escript.script_name/0)
+    lstat_fn = Keyword.get(opts, :lstat_fn, &File.lstat/1)
+    read_fn = Keyword.get(opts, :read_fn, &File.read/1)
+    fingerprint_fn = Keyword.get(opts, :fingerprint_fn, &fingerprint/0)
+
+    with {:ok, image_path} <- runtime_image_path(script_name_fn.()),
+         :ok <- regular_runtime_image(lstat_fn.(image_path)),
+         {:ok, image_bytes} <- read_runtime_image(read_fn.(image_path)),
+         {:ok, execution_sha256} <- fingerprint_fn.(),
+         :ok <- validate_execution_sha256(execution_sha256) do
+      {:ok,
+       %{
+         image_sha256: sha256(image_bytes),
+         execution_sha256: execution_sha256
+       }}
+    end
+  end
+
   @spec fingerprint(keyword()) :: {:ok, String.t()} | {:error, term()}
   def fingerprint(opts \\ []) do
     with {:ok, modules} <- runtime_modules(opts),
@@ -158,6 +183,27 @@ defmodule SymphonyElixir.RuntimeIdentity do
       {:error, {:runtime_identity_mismatch, normalized_expected, actual}}
     end
   end
+
+  defp runtime_image_path(path) when is_binary(path) and byte_size(path) > 0, do: {:ok, path}
+  defp runtime_image_path(path) when is_list(path) and path != [], do: {:ok, List.to_string(path)}
+  defp runtime_image_path(_invalid), do: {:error, :runtime_identity_image_path_unavailable}
+
+  defp regular_runtime_image({:ok, %File.Stat{type: :regular}}), do: :ok
+  defp regular_runtime_image({:ok, _stat}), do: {:error, :runtime_identity_image_not_regular}
+
+  defp regular_runtime_image({:error, reason}),
+    do: {:error, {:runtime_identity_image_stat_failed, reason}}
+
+  defp read_runtime_image({:ok, image_bytes}) when is_binary(image_bytes), do: {:ok, image_bytes}
+
+  defp read_runtime_image({:error, reason}),
+    do: {:error, {:runtime_identity_image_read_failed, reason}}
+
+  defp validate_execution_sha256(value) do
+    if valid_sha256?(value), do: :ok, else: {:error, :runtime_identity_execution_invalid}
+  end
+
+  defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 
   defp valid_sha256?(value), do: is_binary(value) and value =~ ~r/\A[0-9a-fA-F]{64}\z/
 end
