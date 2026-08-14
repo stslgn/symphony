@@ -51,7 +51,8 @@ defmodule SymphonyElixir.Orchestrator do
               operator_authority_generation: nil,
               operator_authority_invalidated: false,
               tracker_authority_generation: nil,
-              tracker_authority_invalidated: false
+              tracker_authority_invalidated: false,
+              tracker_context: nil
   end
 
   defmodule State do
@@ -74,7 +75,6 @@ defmodule SymphonyElixir.Orchestrator do
       :run_ledger_append_fn,
       :task_start_fn,
       :runner_generation,
-      :tracker_context,
       poll_generation: 0,
       poll_dirty: false,
       poll_failure_count: 0,
@@ -128,7 +128,6 @@ defmodule SymphonyElixir.Orchestrator do
             run_ledger_path: run_ledger_path,
             run_ledger_append_fn: run_ledger_append_fn,
             runner_generation: runner_generation,
-            tracker_context: Tracker.poll_context(config.tracker),
             dispatch_paused: recovery.dispatch_paused,
             recovered_attempts: recovery.recovered_attempts,
             recovered_dispatches: recovery.recovered_dispatches,
@@ -141,7 +140,8 @@ defmodule SymphonyElixir.Orchestrator do
               pending_outcomes: restore_pending_operator_outcomes(recovery.pending_operator_outcomes),
               operator_user_ids_generation: config.tracker.operator_user_ids || [],
               operator_authority_generation: WorkflowStore.authority_generation(),
-              tracker_authority_generation: WorkflowStore.tracker_authority_generation()
+              tracker_authority_generation: WorkflowStore.tracker_authority_generation(),
+              tracker_context: Tracker.poll_context(config.tracker)
             },
             operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
             codex_totals: @empty_codex_totals,
@@ -4717,8 +4717,12 @@ defmodule SymphonyElixir.Orchestrator do
     )
   end
 
-  defp tracker_context(%State{tracker_context: %Tracker.PollContext{} = context}),
-    do: context
+  defp tracker_context(%State{
+         operator_commands: %OperatorCommandState{
+           tracker_context: %Tracker.PollContext{} = context
+         }
+       }),
+       do: context
 
   defp tracker_context(%State{}),
     do: Config.settings!().tracker |> Tracker.poll_context()

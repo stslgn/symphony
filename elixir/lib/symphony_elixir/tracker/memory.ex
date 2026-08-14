@@ -12,6 +12,8 @@ defmodule SymphonyElixir.Tracker.Memory do
     {:ok, issue_entries()}
   end
 
+  @spec fetch_candidate_issues(SymphonyElixir.Tracker.PollContext.t()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues(_context), do: fetch_candidate_issues()
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
@@ -37,6 +39,8 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec fetch_issue_states_by_ids([String.t()], SymphonyElixir.Tracker.PollContext.t()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids, _context), do: fetch_issue_states_by_ids(issue_ids)
 
   @spec fetch_comments_since(String.t(), DateTime.t()) ::
@@ -57,6 +61,11 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec fetch_comments_since(
+          String.t(),
+          DateTime.t(),
+          SymphonyElixir.Tracker.PollContext.t()
+        ) :: {:ok, [Comment.t()]} | {:error, term()}
   def fetch_comments_since(issue_id, %DateTime{} = created_after, _context),
     do: fetch_comments_since(issue_id, created_after)
 
