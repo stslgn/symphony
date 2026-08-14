@@ -44,7 +44,9 @@ defmodule SymphonyElixir.Orchestrator do
   defmodule OperatorCommandState do
     @moduledoc false
 
-    defstruct processed_comment_ids: MapSet.new(), pending_outcomes: %{}
+    defstruct processed_comment_ids: MapSet.new(),
+              pending_outcomes: %{},
+              operator_user_ids_generation: nil
   end
 
   defmodule State do
@@ -67,7 +69,6 @@ defmodule SymphonyElixir.Orchestrator do
       :run_ledger_append_fn,
       :task_start_fn,
       :runner_generation,
-      :operator_user_ids_generation,
       poll_generation: 0,
       poll_dirty: false,
       poll_failure_count: 0,
@@ -121,7 +122,6 @@ defmodule SymphonyElixir.Orchestrator do
             run_ledger_path: run_ledger_path,
             run_ledger_append_fn: run_ledger_append_fn,
             runner_generation: runner_generation,
-            operator_user_ids_generation: config.tracker.operator_user_ids || [],
             dispatch_paused: recovery.dispatch_paused,
             recovered_attempts: recovery.recovered_attempts,
             recovered_dispatches: recovery.recovered_dispatches,
@@ -131,7 +131,8 @@ defmodule SymphonyElixir.Orchestrator do
             claimed: recovery.cleanup_pending |> Map.keys() |> MapSet.new(),
             operator_commands: %OperatorCommandState{
               processed_comment_ids: recovery.processed_operator_comment_ids,
-              pending_outcomes: restore_pending_operator_outcomes(recovery.pending_operator_outcomes)
+              pending_outcomes: restore_pending_operator_outcomes(recovery.pending_operator_outcomes),
+              operator_user_ids_generation: config.tracker.operator_user_ids || []
             },
             operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
             codex_totals: @empty_codex_totals,
@@ -3975,11 +3976,15 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp operator_user_ids(%State{operator_user_ids_generation: nil}) do
+  defp operator_user_ids(%State{
+         operator_commands: %OperatorCommandState{operator_user_ids_generation: nil}
+       }) do
     Config.settings!().tracker.operator_user_ids || []
   end
 
-  defp operator_user_ids(%State{operator_user_ids_generation: generation}) do
+  defp operator_user_ids(%State{
+         operator_commands: %OperatorCommandState{operator_user_ids_generation: generation}
+       }) do
     configured = Config.settings!().tracker.operator_user_ids || []
 
     if Enum.sort(configured) == Enum.sort(generation), do: generation, else: []

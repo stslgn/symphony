@@ -3168,7 +3168,9 @@ defmodule SymphonyElixir.CoreTest do
       run_ledger_path: nil,
       dispatch_paused: true,
       parked: %{issue_id => wait},
-      operator_user_ids_generation: ["operator-1"],
+      operator_commands: %Orchestrator.OperatorCommandState{
+        operator_user_ids_generation: ["operator-1"]
+      },
       operator_comment_cursors: %{
         issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
       },
@@ -3234,9 +3236,11 @@ defmodule SymphonyElixir.CoreTest do
       max_concurrent_agents: 1,
       run_ledger_path: ledger_path,
       runner_generation: "runner-operator-retry",
-      operator_user_ids_generation: ["operator-1"],
       dispatch_paused: true,
       parked: %{issue_id => wait},
+      operator_commands: %Orchestrator.OperatorCommandState{
+        operator_user_ids_generation: ["operator-1"]
+      },
       operator_comment_cursors: %{
         issue_id => %{created_at: cursor_at, comment_ids: MapSet.new()}
       },
