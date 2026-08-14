@@ -233,10 +233,11 @@ Notes:
   defaults to `[]`, which disables comment commands. The API-key identity (`user.isMe`) is always
   rejected even if listed, because workers can write comments with that same credential. Use a
   separate runner/service identity for `LINEAR_API_KEY` and allowlist only human operator user IDs.
-  The allowlist and raw tracker kind, endpoint, API-key selector, and project slug are pinned to the
-  runner generation at startup. Every observed change advances a monotonic authority generation.
-  Operator-ID-only drift disables comment commands; tracker identity/scope drift blocks every tracker
-  request and discards in-flight poll results until restart, even if the file is later restored.
+  The allowlist and raw tracker kind, endpoint, API-key selector, webhook-secret selector, and project
+  slug are pinned to the runner generation at startup. Every observed change advances a monotonic
+  authority generation. Operator-ID-only drift disables comment commands; tracker identity/scope
+  drift blocks every tracker request and discards in-flight poll results until restart, even if the
+  file is later restored.
   Admitted polls, in-flight worker state checks, and worker-facing `linear_graphql` calls use the
   immutable startup authority snapshot for the adapter, credential, endpoint, and project. Routing
   assignee and active/terminal state sets are frozen per poll or worker session, so safe reloads
@@ -247,6 +248,9 @@ Notes:
   a replacement generation when it is missing. Missing or stale context fails before workspace
   preparation, app-server port startup, or network I/O, and the network client never re-reads those
   fields from hot-reloaded config.
+- A managed launcher can set `SYMPHONY_EXPECTED_WORKFLOW_SHA256` to the lowercase SHA-256 of the exact
+  workflow bytes it admitted. Symphony compares that value with its single initial workflow snapshot
+  and stops before Orchestrator or HTTP startup when the value is malformed or does not match.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the

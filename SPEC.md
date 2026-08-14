@@ -429,11 +429,12 @@ Fields:
   - The effective allowlist MUST be pinned to the runner generation. A runtime change MUST disable
     comment commands until restart; it MUST NOT grant or retain authority through hot reload.
   - The pinned authority generation MUST also cover the raw tracker kind, endpoint, API-key selector,
-    and project slug. Every successfully observed authority change advances a monotonic runtime
-    generation, so changing a value and later restoring it MUST remain disabled until restart.
+    webhook-secret selector, and project slug. Every successfully observed authority change advances
+    a monotonic runtime generation, so changing a value and later restoring it MUST remain disabled
+    until restart.
   - Operator-ID-only drift disables comment commands. Drift in tracker kind, endpoint, API-key
-    selector, or project slug MUST block all tracker I/O and discard in-flight poll results until
-    restart.
+    selector, webhook-secret selector, or project slug MUST block all tracker I/O and discard
+    in-flight poll results until restart.
   - The adapter, resolved credential, endpoint, and project scope MUST come from an immutable
     startup-pinned snapshot. Each admitted poll or worker session MUST also freeze its routing
     assignee and active/terminal state sets for the duration of that request or session. Tracker
@@ -676,14 +677,14 @@ Dynamic reload is REQUIRED:
   changes.
 - Extensions that manage their own listeners/resources (for example an HTTP server port change) MAY
   require restart unless the implementation explicitly supports live rebind.
-- Security authority such as tracker kind, endpoint, API-key selector, project slug, and
-  `operator_user_ids` MUST fail closed on change and MAY require restart before the new value becomes
-  effective. A poll result MUST be revalidated against the current authority generation before it is
-  applied; tracker-identity drift invalidates the whole result. Network collection and worker state
-  checks and worker-facing tracker tools MUST remain bound to the startup-approved authority
-  snapshot so a concurrent reload cannot redirect an already admitted credential. Behavioral
-  routing/state settings are captured per admitted request or worker session, allowing a safe reload
-  to affect future work without changing an in-flight decision.
+- Security authority such as tracker kind, endpoint, API-key selector, webhook-secret selector,
+  project slug, and `operator_user_ids` MUST fail closed on change and MAY require restart before the
+  new value becomes effective. A poll result MUST be revalidated against the current authority
+  generation before it is applied; tracker-identity drift invalidates the whole result. Network
+  collection and worker state checks and worker-facing tracker tools MUST remain bound to the
+  startup-approved authority snapshot so a concurrent reload cannot redirect an already admitted
+  credential. Behavioral routing/state settings are captured per admitted request or worker session,
+  allowing a safe reload to affect future work without changing an in-flight decision.
 - Implementations SHOULD also re-validate/reload defensively during runtime operations (for example
   before dispatch) in case filesystem watch events are missed.
 - Invalid reloads MUST NOT crash the service; keep operating with the last known good effective
