@@ -11,10 +11,22 @@ defmodule SymphonyElixir.AppServerTest do
     LINEAR_KEYCHAIN_ACCOUNT
     LINEAR_WEBHOOK_KEYCHAIN_SERVICE
   )
+  @custom_api_key_env "SYMP_TEST_CUSTOM_LINEAR_API_KEY"
+  @custom_webhook_secret_env "SYMP_TEST_CUSTOM_LINEAR_WEBHOOK_SECRET"
 
   test "app server rejects a missing tracker context before workspace or port setup" do
     assert {:error, :tracker_context_required} =
              RealAppServer.start_session("/missing/workspace")
+  end
+
+  test "app server rejects invalid pinned tracker secret selectors before port setup" do
+    tracker_context = %{
+      Tracker.current_poll_context()
+      | api_key_env_var: "INVALID-SELECTOR"
+    }
+
+    assert {:error, :invalid_tracker_secret_selector} =
+             RealAppServer.start_session("/missing/workspace", tracker_context: tracker_context)
   end
 
   test "local app server subprocess cannot inherit tracker credentials or selectors" do
@@ -24,7 +36,10 @@ defmodule SymphonyElixir.AppServerTest do
         "symphony-elixir-app-server-secret-env-#{System.unique_integer([:positive])}"
       )
 
-    previous_env = Map.new(@tracker_secret_env_names, &{&1, System.get_env(&1)})
+    secret_env_names =
+      @tracker_secret_env_names ++ [@custom_api_key_env, @custom_webhook_secret_env]
+
+    previous_env = Map.new(secret_env_names, &{&1, System.get_env(&1)})
     previous_trace = System.get_env("SYMP_TEST_APP_ENV_TRACE")
 
     on_exit(fn ->
@@ -41,17 +56,17 @@ defmodule SymphonyElixir.AppServerTest do
       File.mkdir_p!(workspace)
       System.put_env("SYMP_TEST_APP_ENV_TRACE", trace_file)
 
-      Enum.each(@tracker_secret_env_names, fn name ->
+      Enum.each(secret_env_names, fn name ->
         System.put_env(name, "test-only-#{String.downcase(name)}")
       end)
 
       env_probe =
-        Enum.map_join(@tracker_secret_env_names, "\n", fn name ->
+        Enum.map_join(secret_env_names, "\n", fn name ->
           "printf 'START:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> \"$trace_file\""
         end)
 
       turn_env_probe =
-        Enum.map_join(@tracker_secret_env_names, "\n", fn name ->
+        Enum.map_join(secret_env_names, "\n", fn name ->
           "printf 'TURN:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> \"$trace_file\""
         end)
 
@@ -81,7 +96,8 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         codex_command: "#{codex_binary} app-server",
-        tracker_api_token: "test-workflow-token-before"
+        tracker_api_token: "$#{@custom_api_key_env}",
+        tracker_webhook_secret: "$#{@custom_webhook_secret_env}"
       )
 
       issue = %Issue{
@@ -101,7 +117,7 @@ defmodule SymphonyElixir.AppServerTest do
 
         workflow_path
         |> File.read!()
-        |> String.replace("test-workflow-token-before", "test-workflow-token-after")
+        |> String.replace(@custom_api_key_env, "#{@custom_api_key_env}_ROTATED")
         |> then(&File.write!(workflow_path, &1))
 
         assert {:ok, _result} =
@@ -116,7 +132,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       trace = File.read!(trace_file)
 
-      Enum.each(@tracker_secret_env_names, fn name ->
+      Enum.each(secret_env_names, fn name ->
         assert trace =~ "START:#{name}=__ABSENT__"
         assert trace =~ "TURN:#{name}=__ABSENT__"
       end)
@@ -1865,7 +1881,11 @@ defmodule SymphonyElixir.AppServerTest do
 
     previous_path = System.get_env("PATH")
     previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
-    previous_env = Map.new(@tracker_secret_env_names, &{&1, System.get_env(&1)})
+
+    secret_env_names =
+      @tracker_secret_env_names ++ [@custom_api_key_env, @custom_webhook_secret_env]
+
+    previous_env = Map.new(secret_env_names, &{&1, System.get_env(&1)})
 
     on_exit(fn ->
       restore_env("PATH", previous_path)
@@ -1882,12 +1902,12 @@ defmodule SymphonyElixir.AppServerTest do
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
       System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
 
-      Enum.each(@tracker_secret_env_names, fn name ->
+      Enum.each(secret_env_names, fn name ->
         System.put_env(name, "test-only-#{String.downcase(name)}")
       end)
 
       env_probe =
-        Enum.map_join(@tracker_secret_env_names, "\n", fn name ->
+        Enum.map_join(secret_env_names, "\n", fn name ->
           "printf 'ENV:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> \"$trace_file\""
         end)
 
@@ -1927,7 +1947,9 @@ defmodule SymphonyElixir.AppServerTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: "/remote/workspaces",
-        codex_command: "fake-remote-codex app-server"
+        codex_command: "fake-remote-codex app-server",
+        tracker_api_token: "$#{@custom_api_key_env}",
+        tracker_webhook_secret: "$#{@custom_webhook_secret_env}"
       )
 
       issue = %Issue{
@@ -1959,7 +1981,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "env -u LINEAR_API_KEY"
       assert argv_line =~ "fake-remote-codex app-server"
 
-      Enum.each(@tracker_secret_env_names, fn name ->
+      Enum.each(secret_env_names, fn name ->
         assert "ENV:#{name}=__ABSENT__" in lines
         assert argv_line =~ "-u #{name}"
       end)

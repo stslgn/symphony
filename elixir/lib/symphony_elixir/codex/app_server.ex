@@ -79,9 +79,10 @@ defmodule SymphonyElixir.Codex.AppServer do
     session_title = opts |> Keyword.get(:session_title, "Symphony worker") |> normalize_session_title()
 
     with {:ok, tracker_context} <- fetch_tracker_context(opts),
+         {:ok, secret_env_names} <- worker_secret_env_names(tracker_context),
          :ok <- Config.validate_runtime_capabilities(),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host) do
+         {:ok, port} <- start_port(expanded_workspace, worker_host, secret_env_names) do
       metadata = port |> port_metadata(worker_host) |> Map.put(:session_title, session_title)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
@@ -288,13 +289,13 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp maybe_put_dynamic_tool_client(opts, _linear_client), do: opts
 
-  defp start_port(workspace, nil) do
+  defp start_port(workspace, nil, secret_env_names) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
-      command = worker_launch_command(Config.settings!().codex.command)
+      command = worker_launch_command(Config.settings!().codex.command, secret_env_names)
 
       port =
         Port.open(
@@ -305,7 +306,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :stderr_to_stdout,
             args: [~c"-lc", String.to_charlist("exec " <> command)],
             cd: String.to_charlist(workspace),
-            env: scrubbed_worker_port_env(),
+            env: scrubbed_worker_port_env(secret_env_names),
             line: @port_line_bytes
           ]
         )
@@ -314,31 +315,44 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace)
+  defp start_port(workspace, worker_host, secret_env_names) when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, secret_env_names)
 
     SSH.start_port(worker_host, remote_command,
       line: @port_line_bytes,
-      env: scrubbed_worker_port_env()
+      env: scrubbed_worker_port_env(secret_env_names)
     )
   end
 
-  defp remote_launch_command(workspace) when is_binary(workspace) do
+  defp remote_launch_command(workspace, secret_env_names) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
-      "exec #{worker_launch_command(Config.settings!().codex.command)}"
+      "exec #{worker_launch_command(Config.settings!().codex.command, secret_env_names)}"
     ]
     |> Enum.join(" && ")
   end
 
-  defp worker_launch_command(command) when is_binary(command) do
-    unset_args = Enum.map_join(@worker_secret_env_names, " ", &"-u #{&1}")
+  defp worker_launch_command(command, secret_env_names) when is_binary(command) do
+    unset_args = Enum.map_join(secret_env_names, " ", &"-u #{&1}")
     "env #{unset_args} #{command}"
   end
 
-  defp scrubbed_worker_port_env do
-    Enum.map(@worker_secret_env_names, &{String.to_charlist(&1), false})
+  defp scrubbed_worker_port_env(secret_env_names) do
+    Enum.map(secret_env_names, &{String.to_charlist(&1), false})
   end
+
+  defp worker_secret_env_names(%Tracker.PollContext{} = tracker_context) do
+    selectors = [tracker_context.api_key_env_var, tracker_context.webhook_secret_env_var]
+
+    if Enum.all?(selectors, &valid_optional_env_name?/1) do
+      {:ok, Enum.uniq(@worker_secret_env_names ++ Enum.reject(selectors, &is_nil/1))}
+    else
+      {:error, :invalid_tracker_secret_selector}
+    end
+  end
+
+  defp valid_optional_env_name?(nil), do: true
+  defp valid_optional_env_name?(name), do: is_binary(name) and String.match?(name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
 
   defp port_metadata(port, worker_host) when is_port(port) do
     base_metadata =
