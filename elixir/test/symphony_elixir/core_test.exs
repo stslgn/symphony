@@ -933,7 +933,10 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     paused_state =
-      Orchestrator.run_poll_cycle_for_test(%{base_state | dispatch_paused: true})
+      Orchestrator.run_poll_cycle_for_test(
+        %{base_state | dispatch_paused: true},
+        Tracker.current_poll_context()
+      )
 
     assert paused_state.queued_resumes == queued_resumes
 
@@ -981,7 +984,8 @@ defmodule SymphonyElixir.CoreTest do
         claimed: MapSet.new([dummy_issue.id])
     }
 
-    capacity_blocked_state = Orchestrator.run_poll_cycle_for_test(capacity_state)
+    capacity_blocked_state =
+      Orchestrator.run_poll_cycle_for_test(capacity_state, Tracker.current_poll_context())
 
     assert capacity_blocked_state.queued_resumes == queued_resumes
 
@@ -993,7 +997,8 @@ defmodule SymphonyElixir.CoreTest do
       tracker_api_token: nil
     )
 
-    tracker_blocked_state = Orchestrator.run_poll_cycle_for_test(base_state)
+    tracker_blocked_state =
+      Orchestrator.run_poll_cycle_for_test(base_state, Tracker.current_poll_context())
 
     assert tracker_blocked_state.queued_resumes == queued_resumes
 
@@ -1008,7 +1013,8 @@ defmodule SymphonyElixir.CoreTest do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [resumed_issue])
 
-    affinity_blocked_state = Orchestrator.run_poll_cycle_for_test(base_state)
+    affinity_blocked_state =
+      Orchestrator.run_poll_cycle_for_test(base_state, Tracker.current_poll_context())
 
     assert affinity_blocked_state.queued_resumes == queued_resumes
     assert affinity_blocked_state.running == %{}
@@ -2556,7 +2562,8 @@ defmodule SymphonyElixir.CoreTest do
         nil,
         outside_path,
         prepare_root,
-        nil
+        nil,
+        Tracker.current_poll_context()
       )
 
     assert_pending_dispatch_visible(prepare_failed, prepare_issue.id, 2)
@@ -2580,7 +2587,8 @@ defmodule SymphonyElixir.CoreTest do
         nil,
         claim_workspace,
         claim_root,
-        nil
+        nil,
+        Tracker.current_poll_context()
       )
 
     assert_pending_dispatch_visible(claim_failed, claim_issue.id, 2)
@@ -2605,7 +2613,8 @@ defmodule SymphonyElixir.CoreTest do
         nil,
         spawn_workspace,
         spawn_root,
-        nil
+        nil,
+        Tracker.current_poll_context()
       )
 
     refute Map.has_key?(spawn_failed.running, spawn_issue.id)
@@ -2633,7 +2642,8 @@ defmodule SymphonyElixir.CoreTest do
         nil,
         start_workspace,
         start_root,
-        nil
+        nil,
+        Tracker.current_poll_context()
       )
 
     assert MapSet.member?(start_failed.claimed, start_issue.id)
@@ -3162,7 +3172,9 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    reconciled_state = Orchestrator.run_poll_cycle_for_test(state)
+    reconciled_state =
+      Orchestrator.run_poll_cycle_for_test(state, Tracker.current_poll_context())
+
     assert reconciled_state.parked[issue_id].wait_id == wait.wait_id
     assert reconciled_state.operator_comment_cursors == %{}
 
@@ -3176,6 +3188,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_operator_user_ids: ["operator-1"]
     )
 
+    tracker_context = Tracker.current_poll_context()
     issue_id = "issue-operator-generation-drift"
     cursor_at = ~U[2026-08-03 10:00:00Z]
 
@@ -3219,7 +3232,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_operator_user_ids: ["operator-2"]
     )
 
-    reconciled_state = Orchestrator.run_poll_cycle_for_test(state)
+    reconciled_state = Orchestrator.run_poll_cycle_for_test(state, tracker_context)
     assert reconciled_state.parked[issue_id].wait_id == wait.wait_id
     assert reconciled_state.operator_commands.operator_authority_invalidated
 
@@ -3244,7 +3257,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_operator_user_ids: ["operator-1"]
     )
 
-    reverted_state = Orchestrator.run_poll_cycle_for_test(reconciled_state)
+    reverted_state = Orchestrator.run_poll_cycle_for_test(reconciled_state, tracker_context)
     assert reverted_state.parked[issue_id].wait_id == wait.wait_id
 
     refute MapSet.member?(
@@ -3386,7 +3399,7 @@ defmodule SymphonyElixir.CoreTest do
              "inflight-generation-drift-retry"
            )
 
-    blocked_poll_state = Orchestrator.run_poll_cycle_for_test(state)
+    blocked_poll_state = Orchestrator.run_poll_cycle_for_test(state, tracker_context)
     assert blocked_poll_state.operator_commands.tracker_authority_invalidated
     assert blocked_poll_state.parked[issue_id].wait_id == wait.wait_id
     assert blocked_poll_state.running[running_issue_id].issue.state == "In Progress"
@@ -3501,6 +3514,35 @@ defmodule SymphonyElixir.CoreTest do
     refute_receive {:memory_tracker_state_update, "issue-authority-bound", "Done"}
   end
 
+  test "poll state without an admitted tracker context fails closed before adapter I/O" do
+    previous_client = Application.get_env(:symphony_elixir, :linear_client_module)
+
+    on_exit(fn ->
+      if previous_client do
+        Application.put_env(:symphony_elixir, :linear_client_module, previous_client)
+      else
+        Application.delete_env(:symphony_elixir, :linear_client_module)
+      end
+    end)
+
+    Application.put_env(:symphony_elixir, :linear_client_module, SnapshotLinearClient)
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      run_ledger_path: nil,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    next_state = Orchestrator.run_poll_cycle_without_tracker_context_for_test(state)
+
+    refute_receive {:snapshot_state_fetch, _, _}
+    refute_receive {:snapshot_candidate_fetch, _}
+    refute_receive {:snapshot_comment_fetch, _, _, _}
+
+    if is_reference(next_state.tick_timer_ref), do: Process.cancel_timer(next_state.tick_timer_ref)
+  end
+
   test "Linear retry command resumes a matching wait exactly once while globally paused" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -3554,11 +3596,12 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    resumed_state = Orchestrator.run_poll_cycle_for_test(state)
+    tracker_context = Tracker.current_poll_context()
+    resumed_state = Orchestrator.run_poll_cycle_for_test(state, tracker_context)
     refute Map.has_key?(resumed_state.parked, issue_id)
     assert MapSet.member?(resumed_state.operator_commands.processed_comment_ids, comment.id)
 
-    repeated_state = Orchestrator.run_poll_cycle_for_test(resumed_state)
+    repeated_state = Orchestrator.run_poll_cycle_for_test(resumed_state, tracker_context)
 
     if is_reference(repeated_state.tick_timer_ref),
       do: Process.cancel_timer(repeated_state.tick_timer_ref)
@@ -3651,11 +3694,12 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    retried_state = Orchestrator.run_poll_cycle_for_test(state)
+    tracker_context = Tracker.current_poll_context()
+    retried_state = Orchestrator.run_poll_cycle_for_test(state, tracker_context)
     assert retried_state.cleanup_pending[issue_id].status == :cleanup_pending
     refute Map.has_key?(retried_state.cleanup_pending[issue_id], :cleanup_error)
 
-    repeated_state = Orchestrator.run_poll_cycle_for_test(retried_state)
+    repeated_state = Orchestrator.run_poll_cycle_for_test(retried_state, tracker_context)
     if is_reference(repeated_state.tick_timer_ref), do: Process.cancel_timer(repeated_state.tick_timer_ref)
 
     assert {:ok, events} = RunLedger.read_events(ledger_path)
@@ -3732,7 +3776,8 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    failed_state = Orchestrator.run_poll_cycle_for_test(state)
+    failed_state =
+      Orchestrator.run_poll_cycle_for_test(state, Tracker.current_poll_context())
 
     if is_reference(failed_state.tick_timer_ref),
       do: Process.cancel_timer(failed_state.tick_timer_ref)
@@ -3843,10 +3888,11 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    first_failed = Orchestrator.run_poll_cycle_for_test(state)
+    tracker_context = Tracker.current_poll_context()
+    first_failed = Orchestrator.run_poll_cycle_for_test(state, tracker_context)
     assert Map.has_key?(first_failed.operator_commands.pending_outcomes, command.id)
 
-    second_failed = Orchestrator.run_poll_cycle_for_test(first_failed)
+    second_failed = Orchestrator.run_poll_cycle_for_test(first_failed, tracker_context)
 
     later_comment = %SymphonyElixir.Linear.Comment{
       id: "comment-after-pending-reject",
@@ -3859,7 +3905,7 @@ defmodule SymphonyElixir.CoreTest do
       issue_id => [command, later_comment]
     })
 
-    advanced_state = Orchestrator.run_poll_cycle_for_test(second_failed)
+    advanced_state = Orchestrator.run_poll_cycle_for_test(second_failed, tracker_context)
 
     if is_reference(advanced_state.tick_timer_ref),
       do: Process.cancel_timer(advanced_state.tick_timer_ref)
@@ -3998,10 +4044,11 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    first_failed = Orchestrator.run_poll_cycle_for_test(state)
+    tracker_context = Tracker.current_poll_context()
+    first_failed = Orchestrator.run_poll_cycle_for_test(state, tracker_context)
     assert Map.has_key?(first_failed.operator_commands.pending_outcomes, command.id)
 
-    second_failed = Orchestrator.run_poll_cycle_for_test(first_failed)
+    second_failed = Orchestrator.run_poll_cycle_for_test(first_failed, tracker_context)
 
     if is_reference(second_failed.tick_timer_ref),
       do: Process.cancel_timer(second_failed.tick_timer_ref)
@@ -4072,7 +4119,9 @@ defmodule SymphonyElixir.CoreTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    reconciled_state = Orchestrator.run_poll_cycle_for_test(state)
+    reconciled_state =
+      Orchestrator.run_poll_cycle_for_test(state, Tracker.current_poll_context())
+
     assert reconciled_state.parked[issue_id].wait_id == wait.wait_id
 
     assert %{created_at: cursor_at, comment_ids: comment_ids} =
@@ -4163,7 +4212,9 @@ defmodule SymphonyElixir.CoreTest do
 
     seed_running_ledger!(ledger_path, running_entry)
 
-    stopped_state = Orchestrator.run_poll_cycle_for_test(state)
+    stopped_state =
+      Orchestrator.run_poll_cycle_for_test(state, Tracker.current_poll_context())
+
     refute Map.has_key?(stopped_state.running, issue_id)
 
     assert Map.has_key?(stopped_state.parked, issue_id),
@@ -4545,7 +4596,8 @@ defmodule SymphonyElixir.CoreTest do
         "worker-a",
         nil,
         nil,
-        nil
+        nil,
+        Tracker.current_poll_context()
       )
 
     assert {:ok, [claim | _events]} = RunLedger.read_events(ledger_path)
@@ -4774,7 +4826,10 @@ defmodule SymphonyElixir.CoreTest do
 
   test "candidate revalidation rejects invalid tracker collections" do
     assert {:error, :invalid_candidate_collection} =
-             Orchestrator.revalidate_poll_candidates_for_test(%{unexpected: "shape"})
+             Orchestrator.revalidate_poll_candidates_for_test(
+               %{unexpected: "shape"},
+               Tracker.current_poll_context()
+             )
   end
 
   test "prompt builder renders issue and attempt values from workflow template" do

@@ -674,18 +674,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp poll_request(%State{
          operator_commands: %OperatorCommandState{tracker_authority_invalidated: true}
        }) do
-    %{
-      running_ids: [],
-      parked_ids: [],
-      retry_issue_ids: [],
-      comment_requests: [],
-      operator_user_ids: [],
-      dispatch_paused: true,
-      tracker_authority_valid: false
-    }
+    blocked_tracker_poll_request()
   end
 
-  defp poll_request(%State{} = state) do
+  defp poll_request(
+         %State{
+           operator_commands: %OperatorCommandState{tracker_context: context}
+         } = state
+       )
+       when is_struct(context, Tracker.PollContext) do
     operator_user_ids = operator_user_ids(state)
 
     running_ids =
@@ -710,7 +707,21 @@ defmodule SymphonyElixir.Orchestrator do
       operator_user_ids: operator_user_ids,
       dispatch_paused: state.dispatch_paused,
       tracker_authority_valid: true,
-      tracker_context: tracker_context(state)
+      tracker_context: context
+    }
+  end
+
+  defp poll_request(%State{}), do: blocked_tracker_poll_request()
+
+  defp blocked_tracker_poll_request do
+    %{
+      running_ids: [],
+      parked_ids: [],
+      retry_issue_ids: [],
+      comment_requests: [],
+      operator_user_ids: [],
+      dispatch_paused: true,
+      tracker_authority_valid: false
     }
   end
 
@@ -800,6 +811,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_poll_candidates(_issues, _tracker_context),
     do: {:error, :invalid_candidate_collection}
+
+  defp apply_poll_result(
+         %State{} = state,
+         %{request: %{tracker_authority_valid: false}}
+       ),
+       do: state
 
   defp apply_poll_result(%State{} = state, %{request: request} = result) when is_map(request) do
     state = refresh_runtime_config(state)
@@ -1042,9 +1059,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
-  @spec revalidate_poll_candidates_for_test(term()) :: {:ok, [term()]} | {:error, term()}
-  def revalidate_poll_candidates_for_test(issues) do
-    revalidate_poll_candidates(issues, tracker_context(%State{}))
+  @spec revalidate_poll_candidates_for_test(term(), Tracker.PollContext.t()) ::
+          {:ok, [term()]} | {:error, term()}
+  def revalidate_poll_candidates_for_test(issues, %Tracker.PollContext{} = tracker_context) do
+    revalidate_poll_candidates(issues, tracker_context)
   end
 
   @doc false
@@ -1095,7 +1113,8 @@ defmodule SymphonyElixir.Orchestrator do
           String.t() | nil,
           Path.t() | nil,
           Path.t() | nil,
-          String.t() | nil
+          String.t() | nil,
+          Tracker.PollContext.t()
         ) :: term()
   def claim_and_start_issue_for_test(
         %State{} = state,
@@ -1104,7 +1123,8 @@ defmodule SymphonyElixir.Orchestrator do
         worker_host,
         expected_workspace_path,
         expected_workspace_root,
-        expected_worker_host
+        expected_worker_host,
+        %Tracker.PollContext{} = tracker_context
       ) do
     claim_and_start_issue(
       state,
@@ -1116,7 +1136,7 @@ defmodule SymphonyElixir.Orchestrator do
       expected_workspace_root,
       %{
         expected_worker_host: expected_worker_host,
-        tracker_context: tracker_context(state)
+        tracker_context: tracker_context
       }
     )
   end
@@ -1129,8 +1149,34 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
-  @spec run_poll_cycle_for_test(term()) :: term()
-  def run_poll_cycle_for_test(%State{} = state) do
+  @spec run_poll_cycle_for_test(term(), Tracker.PollContext.t()) :: term()
+  def run_poll_cycle_for_test(%State{} = state, %Tracker.PollContext{} = tracker_context) do
+    state = %{
+      state
+      | operator_commands: %{
+          state.operator_commands
+          | tracker_context: tracker_context
+        }
+    }
+
+    run_test_poll_cycle(state)
+  end
+
+  @doc false
+  @spec run_poll_cycle_without_tracker_context_for_test(term()) :: term()
+  def run_poll_cycle_without_tracker_context_for_test(%State{} = state) do
+    state = %{
+      state
+      | operator_commands: %{
+          state.operator_commands
+          | tracker_context: nil
+        }
+    }
+
+    run_test_poll_cycle(state)
+  end
+
+  defp run_test_poll_cycle(%State{} = state) do
     state =
       state
       |> refresh_runtime_config()
@@ -4812,16 +4858,6 @@ defmodule SymphonyElixir.Orchestrator do
       tracker_authority_generation
     )
   end
-
-  defp tracker_context(%State{
-         operator_commands: %OperatorCommandState{
-           tracker_context: %Tracker.PollContext{} = context
-         }
-       }),
-       do: context
-
-  defp tracker_context(%State{}),
-    do: Tracker.current_poll_context()
 
   defp refresh_tracker_behavior_context(
          %State{
