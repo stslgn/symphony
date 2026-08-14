@@ -342,13 +342,36 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     System.delete_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
     System.delete_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
-    assert :ignore = StartupAttestation.start_link([])
+    assert :ignore = StartupAttestation.start_link()
 
     System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest)
     assert {:error, :missing_startup_attestation_path} = StartupAttestation.start_link([])
 
     System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", Path.dirname(Workflow.workflow_file_path()))
     assert {:error, {:startup_attestation_write_failed, _reason}} = StartupAttestation.start_link([])
+
+    missing_parent_path =
+      Workflow.workflow_file_path()
+      |> Path.dirname()
+      |> Path.join("missing-parent/startup-attestation")
+
+    System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", missing_parent_path)
+    assert {:error, {:startup_attestation_write_failed, :enoent}} = StartupAttestation.start_link([])
+
+    valid_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "failed-startup-attestation")
+    System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", valid_path)
+
+    assert {:error, :empty_process_start} =
+             StartupAttestation.start_link(process_start_result: {"\n", 0})
+
+    assert {:error, {:process_start_failed, 1, "ps failed"}} =
+             StartupAttestation.start_link(process_start_result: {"ps failed\n", 1})
+
+    mismatched_digest = String.duplicate("0", 64)
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", mismatched_digest)
+
+    assert {:error, {:startup_attestation_digest_mismatch, ^mismatched_digest, ^workflow_digest}} =
+             StartupAttestation.start_link([])
   end
 
   test "workflow store keeps last good authority across schema-invalid YAML reloads" do

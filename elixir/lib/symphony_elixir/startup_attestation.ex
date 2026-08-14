@@ -17,18 +17,18 @@ defmodule SymphonyElixir.StartupAttestation do
   end
 
   @spec start_link(keyword()) :: :ignore | {:error, term()}
-  def start_link(_opts \\ []) do
+  def start_link(opts \\ []) do
     case System.get_env(@expected_digest_env) do
       expected when expected in [nil, ""] ->
         clear_boot_environment()
         :ignore
 
       expected ->
-        attest(expected)
+        attest(expected, opts)
     end
   end
 
-  defp attest(expected) do
+  defp attest(expected, opts) do
     path = System.get_env(@attestation_path_env)
     actual = WorkflowStore.startup_digest()
 
@@ -40,7 +40,7 @@ defmodule SymphonyElixir.StartupAttestation do
         {:error, {:startup_attestation_digest_mismatch, expected, actual}}
 
       true ->
-        with {:ok, process_start} <- process_start(),
+        with {:ok, process_start} <- process_start(opts),
              :ok <- write_attestation(path, actual, process_start) do
           clear_boot_environment()
           :ignore
@@ -48,11 +48,20 @@ defmodule SymphonyElixir.StartupAttestation do
     end
   end
 
-  defp process_start do
-    case System.cmd("/bin/ps", ["-p", System.pid(), "-o", "lstart="],
-           env: [{"LC_ALL", "C"}, {"TZ", "UTC"}],
-           stderr_to_stdout: true
-         ) do
+  defp process_start(opts) do
+    command_result =
+      case Keyword.fetch(opts, :process_start_result) do
+        {:ok, result} ->
+          result
+
+        :error ->
+          System.cmd("/bin/ps", ["-p", System.pid(), "-o", "lstart="],
+            env: [{"LC_ALL", "C"}, {"TZ", "UTC"}],
+            stderr_to_stdout: true
+          )
+      end
+
+    case command_result do
       {output, 0} ->
         case String.trim(output) do
           "" -> {:error, :empty_process_start}
