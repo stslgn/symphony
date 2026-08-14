@@ -378,7 +378,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert status_index < readiness_index
 
     workflow_digest = WorkflowStore.startup_digest()
-    runtime_digest = String.duplicate("b", 64)
+    {runtime_path, runtime_digest} = executing_escript_evidence()
     state_dir = Path.dirname(Workflow.workflow_file_path())
     admission_path = Path.join(state_dir, "restart-startup-admission")
     readiness_path = Path.join(state_dir, "restart-runtime-readiness")
@@ -387,6 +387,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       {"SYMPHONY_MANAGED_PROJECT", "managed-restart-test"},
       {"SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest},
       {"SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest},
+      {"SYMPHONY_RUNTIME_IMAGE_PATH", runtime_path},
       {"SYMPHONY_STARTUP_ATTESTATION_PATH", admission_path},
       {"SYMPHONY_RUNTIME_READINESS_PATH", readiness_path}
     ]
@@ -447,7 +448,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   test "runtime readiness is distinct from pre-IO startup admission" do
     ensure_workflow_store_running()
     workflow_digest = WorkflowStore.startup_digest()
-    runtime_digest = String.duplicate("c", 64)
+    {runtime_path, runtime_digest} = executing_escript_evidence()
     state_dir = Path.dirname(Workflow.workflow_file_path())
     admission_path = Path.join(state_dir, "startup-admission")
     readiness_path = Path.join(state_dir, "runtime-readiness")
@@ -456,6 +457,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       {"SYMPHONY_MANAGED_PROJECT", "managed-readiness-test"},
       {"SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest},
       {"SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest},
+      {"SYMPHONY_RUNTIME_IMAGE_PATH", runtime_path},
       {"SYMPHONY_STARTUP_ATTESTATION_PATH", admission_path},
       {"SYMPHONY_RUNTIME_READINESS_PATH", readiness_path}
     ]
@@ -518,6 +520,76 @@ defmodule SymphonyElixir.ExtensionsTest do
     System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-admission-error-test")
     System.delete_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
     assert {:error, :missing_managed_startup_digest} = StartupAttestation.start_link()
+  end
+
+  test "managed admission measures the executing runtime image instead of trusting its claim" do
+    ensure_workflow_store_running()
+    state_dir = Path.dirname(Workflow.workflow_file_path())
+    runtime_image = Path.join(state_dir, "measured-runtime-image")
+    other_runtime = Path.join(state_dir, "other-runtime-image")
+    admission_path = Path.join(state_dir, "measured-runtime-admission")
+    workflow_digest = WorkflowStore.startup_digest()
+
+    env_names = [
+      "SYMPHONY_MANAGED_PROJECT",
+      "SYMPHONY_EXPECTED_WORKFLOW_SHA256",
+      "SYMPHONY_EXPECTED_RUNTIME_SHA256",
+      "SYMPHONY_RUNTIME_IMAGE_PATH",
+      "SYMPHONY_STARTUP_ATTESTATION_PATH"
+    ]
+
+    previous_env = Map.new(env_names, fn name -> {name, System.get_env(name)} end)
+
+    on_exit(fn ->
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+    end)
+
+    File.write!(runtime_image, "runtime-a")
+    File.chmod!(runtime_image, 0o500)
+    runtime_digest = runtime_image |> File.read!() |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
+
+    System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-runtime-measurement-test")
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest)
+    System.put_env("SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest)
+    System.put_env("SYMPHONY_RUNTIME_IMAGE_PATH", runtime_image)
+    System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", admission_path)
+
+    opts = [
+      process_start_result: {"Fri Aug 14 12:00:00 2026\n", 0},
+      script_name_result: {:ok, runtime_image}
+    ]
+
+    assert {:ok, %{runtime_sha256: ^runtime_digest}} = StartupAttestation.admit(opts)
+
+    File.write!(runtime_image, "runtime-b")
+
+    assert {:error, {:runtime_image_digest_mismatch, ^runtime_digest, actual_digest}} =
+             StartupAttestation.admit(opts)
+
+    assert actual_digest != runtime_digest
+
+    File.write!(other_runtime, "runtime-a")
+
+    assert {:error, {:runtime_image_path_mismatch, _, _}} =
+             StartupAttestation.admit(Keyword.put(opts, :script_name_result, {:ok, other_runtime}))
+
+    System.delete_env("SYMPHONY_RUNTIME_IMAGE_PATH")
+    assert {:error, :missing_managed_runtime_image_path} = StartupAttestation.admit(opts)
+
+    System.put_env("SYMPHONY_RUNTIME_IMAGE_PATH", runtime_image)
+
+    assert {:error, {:runtime_script_name_unavailable, :unavailable}} =
+             StartupAttestation.admit(Keyword.put(opts, :script_name_result, {:error, :unavailable}))
+
+    assert {:error, :runtime_script_name_unavailable} =
+             StartupAttestation.admit(Keyword.put(opts, :script_name_result, :invalid))
+
+    File.rm!(runtime_image)
+    File.ln_s!(other_runtime, runtime_image)
+    assert {:error, :unsafe_managed_runtime_image} = StartupAttestation.admit(opts)
+
+    File.rm!(runtime_image)
+    assert {:error, {:runtime_image_stat_failed, :enoent}} = StartupAttestation.admit(opts)
   end
 
   test "runtime readiness fails closed and removes only its own regular evidence" do
@@ -2599,5 +2671,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       {^child_id, pid, _type, _modules} when is_pid(pid) -> pid
       _child -> nil
     end)
+  end
+
+  defp executing_escript_evidence do
+    path = :escript.script_name() |> List.to_string() |> Path.expand()
+    digest = path |> File.read!() |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
+    {path, digest}
   end
 end

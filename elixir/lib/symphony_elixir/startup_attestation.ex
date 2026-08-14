@@ -9,6 +9,7 @@ defmodule SymphonyElixir.StartupAttestation do
   @attestation_path_env "SYMPHONY_STARTUP_ATTESTATION_PATH"
   @runtime_readiness_path_env "SYMPHONY_RUNTIME_READINESS_PATH"
   @expected_runtime_digest_env "SYMPHONY_EXPECTED_RUNTIME_SHA256"
+  @runtime_image_path_env "SYMPHONY_RUNTIME_IMAGE_PATH"
   @managed_project_env "SYMPHONY_MANAGED_PROJECT"
   @protocol "2"
 
@@ -118,10 +119,71 @@ defmodule SymphonyElixir.StartupAttestation do
         {:error, :missing_managed_runtime_digest}
 
       true ->
-        with {:ok, process_start} <- process_start(opts),
-             :ok <- write_attestation(path, actual, runtime_sha256, process_start) do
-          {:ok, process_start, runtime_sha256}
+        with {:ok, verified_runtime_sha256} <- verify_runtime_digest(runtime_sha256, opts),
+             {:ok, process_start} <- process_start(opts),
+             :ok <- write_attestation(path, actual, verified_runtime_sha256, process_start) do
+          {:ok, process_start, verified_runtime_sha256}
         end
+    end
+  end
+
+  defp verify_runtime_digest(expected, opts) do
+    if managed?() do
+      with {:ok, expected_path} <- runtime_image_path(),
+           {:ok, script_path} <- executing_script_path(opts),
+           :ok <- compare_runtime_paths(expected_path, script_path),
+           :ok <- validate_runtime_image(expected_path),
+           {:ok, content} <- read_runtime_image(expected_path) do
+        actual = :sha256 |> :crypto.hash(content) |> Base.encode16(case: :lower)
+
+        if actual == String.downcase(expected) do
+          {:ok, actual}
+        else
+          {:error, {:runtime_image_digest_mismatch, expected, actual}}
+        end
+      end
+    else
+      {:ok, expected}
+    end
+  end
+
+  defp runtime_image_path do
+    case System.get_env(@runtime_image_path_env) do
+      path when path in [nil, ""] -> {:error, :missing_managed_runtime_image_path}
+      path -> {:ok, Path.expand(path)}
+    end
+  end
+
+  defp executing_script_path(opts) do
+    result =
+      Keyword.get_lazy(opts, :script_name_result, fn ->
+        {:ok, :escript.script_name() |> List.to_string()}
+      end)
+
+    case result do
+      {:ok, path} when is_binary(path) and path != "" -> {:ok, Path.expand(path)}
+      {:error, reason} -> {:error, {:runtime_script_name_unavailable, reason}}
+      _other -> {:error, :runtime_script_name_unavailable}
+    end
+  end
+
+  defp compare_runtime_paths(path, path), do: :ok
+
+  defp compare_runtime_paths(expected, actual),
+    do: {:error, {:runtime_image_path_mismatch, expected, actual}}
+
+  defp validate_runtime_image(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular}} -> :ok
+      {:ok, _stat} -> {:error, :unsafe_managed_runtime_image}
+      {:error, reason} -> {:error, {:runtime_image_stat_failed, reason}}
+    end
+  end
+
+  defp read_runtime_image(path) do
+    case File.read(path) do
+      {:ok, content} -> {:ok, content}
+      {:error, reason} -> {:error, {:runtime_image_read_failed, reason}}
     end
   end
 
