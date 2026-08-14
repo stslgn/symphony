@@ -185,8 +185,6 @@ defmodule SymphonyElixir.WorkflowStore do
     end
   end
 
-  defp authority_contract(workflow), do: {:invalid_workflow, workflow}
-
   defp current_stamp(path) when is_binary(path) do
     with {:ok, stat} <- File.stat(path, time: :posix),
          {:ok, content} <- File.read(path) do
