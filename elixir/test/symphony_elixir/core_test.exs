@@ -3184,14 +3184,42 @@ defmodule SymphonyElixir.CoreTest do
 
     reconciled_state = Orchestrator.run_poll_cycle_for_test(state)
     assert reconciled_state.parked[issue_id].wait_id == wait.wait_id
+    assert reconciled_state.operator_commands.operator_authority_invalidated
 
     refute MapSet.member?(
              reconciled_state.operator_commands.processed_comment_ids,
              "generation-drift-retry"
            )
 
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue_id => [
+        %SymphonyElixir.Linear.Comment{
+          id: "generation-reverted-retry",
+          body: "$retry",
+          created_at: DateTime.add(cursor_at, 2, :second),
+          author_id: "operator-1"
+        }
+      ]
+    })
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"]
+    )
+
+    reverted_state = Orchestrator.run_poll_cycle_for_test(reconciled_state)
+    assert reverted_state.parked[issue_id].wait_id == wait.wait_id
+
+    refute MapSet.member?(
+             reverted_state.operator_commands.processed_comment_ids,
+             "generation-reverted-retry"
+           )
+
     if is_reference(reconciled_state.tick_timer_ref),
       do: Process.cancel_timer(reconciled_state.tick_timer_ref)
+
+    if is_reference(reverted_state.tick_timer_ref),
+      do: Process.cancel_timer(reverted_state.tick_timer_ref)
   end
 
   test "Linear retry command resumes a matching wait exactly once while globally paused" do

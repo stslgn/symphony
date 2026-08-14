@@ -46,7 +46,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     defstruct processed_comment_ids: MapSet.new(),
               pending_outcomes: %{},
-              operator_user_ids_generation: nil
+              operator_user_ids_generation: nil,
+              operator_authority_invalidated: false
   end
 
   defmodule State do
@@ -555,12 +556,43 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp prepare_poll_state(%State{} = state) do
     state
+    |> pin_operator_authority_generation()
     |> retry_pending_terminal_transitions()
     |> retry_pending_durable_retries()
     |> retry_pending_operator_outcomes()
     |> retry_pending_workspace_cleanups()
     |> reconcile_stalled_running_issues()
     |> ensure_operator_cursors_for_poll()
+  end
+
+  defp pin_operator_authority_generation(
+         %State{
+           operator_commands: %OperatorCommandState{operator_user_ids_generation: nil}
+         } = state
+       ),
+       do: state
+
+  defp pin_operator_authority_generation(
+         %State{
+           operator_commands: %OperatorCommandState{operator_authority_invalidated: true}
+         } = state
+       ),
+       do: state
+
+  defp pin_operator_authority_generation(
+         %State{
+           operator_commands: %OperatorCommandState{operator_user_ids_generation: generation}
+         } = state
+       ) do
+    configured = Config.settings!().tracker.operator_user_ids || []
+
+    if Enum.sort(configured) == Enum.sort(generation) do
+      state
+    else
+      Logger.warning("Operator command authority changed after startup; commands remain disabled until restart")
+
+      put_in(state.operator_commands.operator_authority_invalidated, true)
+    end
   end
 
   defp ensure_operator_cursors_for_poll(%State{} = state) do
@@ -3975,6 +4007,11 @@ defmodule SymphonyElixir.Orchestrator do
       :ignore -> {:ignored, state}
     end
   end
+
+  defp operator_user_ids(%State{
+         operator_commands: %OperatorCommandState{operator_authority_invalidated: true}
+       }),
+       do: []
 
   defp operator_user_ids(%State{
          operator_commands: %OperatorCommandState{operator_user_ids_generation: nil}
