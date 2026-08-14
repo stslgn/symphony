@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.AgentRunner, as: RealAgentRunner
   alias SymphonyElixir.RunLedger
 
   defmodule SnapshotLinearClient do
@@ -307,7 +308,7 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     assert_raise RuntimeError, ~r/tracker_context_required/, fn ->
-      SymphonyElixir.AgentRunner.run(issue, nil, prepared_workspace: %{path: "/missing/workspace"})
+      RealAgentRunner.run(issue, nil, prepared_workspace: %{path: "/missing/workspace"})
     end
   end
 

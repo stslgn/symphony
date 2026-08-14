@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.Codex.DynamicToolTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Codex.DynamicTool, as: RealDynamicTool
   alias SymphonyElixir.TestDynamicTool, as: DynamicTool
 
   test "tool_specs advertises the linear_graphql input contract" do
@@ -62,7 +63,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
   test "linear_graphql rejects a missing tracker context before client I/O" do
     response =
-      SymphonyElixir.Codex.DynamicTool.execute(
+      RealDynamicTool.execute(
         "linear_graphql",
         %{"query" => "query Viewer { viewer { id } }"},
         linear_client: fn _query, _variables, _opts ->

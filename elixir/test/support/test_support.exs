@@ -61,9 +61,7 @@ defmodule SymphonyElixir.TestSupport do
       use ExUnit.Case
       import ExUnit.CaptureLog
 
-      alias SymphonyElixir.TestAgentRunner, as: AgentRunner
       alias SymphonyElixir.CLI
-      alias SymphonyElixir.TestAppServer, as: AppServer
       alias SymphonyElixir.Config
       alias SymphonyElixir.HttpServer
       alias SymphonyElixir.Linear.Client
@@ -71,6 +69,8 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Orchestrator
       alias SymphonyElixir.PromptBuilder
       alias SymphonyElixir.StatusDashboard
+      alias SymphonyElixir.TestAgentRunner, as: AgentRunner
+      alias SymphonyElixir.TestAppServer, as: AppServer
       alias SymphonyElixir.Tracker
       alias SymphonyElixir.Workflow
       alias SymphonyElixir.WorkflowStore

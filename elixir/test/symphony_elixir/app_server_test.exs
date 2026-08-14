@@ -1,9 +1,11 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Codex.AppServer, as: RealAppServer
+
   test "app server rejects a missing tracker context before workspace or port setup" do
     assert {:error, :tracker_context_required} =
-             SymphonyElixir.Codex.AppServer.start_session("/missing/workspace")
+             RealAppServer.start_session("/missing/workspace")
   end
 
   test "app server rejects the workspace root and paths outside workspace root" do
