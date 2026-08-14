@@ -250,7 +250,13 @@ Notes:
   fields from hot-reloaded config.
 - A managed launcher can set `SYMPHONY_EXPECTED_WORKFLOW_SHA256` to the lowercase SHA-256 of the exact
   workflow bytes it admitted. Symphony compares that value with its single initial workflow snapshot
-  and stops before Orchestrator or HTTP startup when the value is malformed or does not match.
+  and stops before Orchestrator or HTTP startup when the value is malformed or does not match. When
+  that digest is managed, the launcher must also set `SYMPHONY_STARTUP_ATTESTATION_PATH`. After all
+  supervised runtime components start, Symphony atomically writes a mode-0600 protocol-1 attestation
+  containing its OS PID, locale-independent process start time, and the verified workflow digest.
+  Missing or unwritable attestation state fails startup. A successful attestation consumes both
+  one-shot environment variables so normal workflow reloads and supervised `WorkflowStore` restarts
+  are not incorrectly rechecked against the boot snapshot.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
