@@ -152,9 +152,6 @@ defmodule SymphonyElixir.WorkflowStore do
   def handle_call(:authority_epoch, _from, %State{} = state),
     do: {:reply, state.authority_epoch, state}
 
-  def handle_call(:tracker_authority_epoch, _from, %State{} = state),
-    do: {:reply, state.tracker_authority_epoch, state}
-
   def handle_call(:refresh_tracker_authority_epoch, _from, %State{} = state) do
     case reload_state(state) do
       {:ok, new_state} ->
