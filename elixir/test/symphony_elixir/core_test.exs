@@ -3447,6 +3447,45 @@ defmodule SymphonyElixir.CoreTest do
     assert inspected =~ ", ...>"
   end
 
+  test "tracker facade rejects drift before state reads and writes" do
+    issue = %Issue{id: "issue-authority-bound", identifier: "MT-AUTHORITY-BOUND", state: "Todo"}
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: "approved-token"
+    )
+
+    context = Tracker.current_poll_context()
+
+    assert {:ok, [^issue]} = Tracker.fetch_issues_by_states(["Todo"], context)
+    assert :ok = Tracker.create_comment(issue.id, "approved", context)
+    assert :ok = Tracker.update_issue_state(issue.id, "In Progress", context)
+    assert_receive {:memory_tracker_comment, "issue-authority-bound", "approved"}
+    assert_receive {:memory_tracker_state_update, "issue-authority-bound", "In Progress"}
+
+    workflow_path = Workflow.workflow_file_path()
+
+    workflow_path
+    |> File.read!()
+    |> String.replace("approved-token", "unapproved-token")
+    |> then(&File.write!(workflow_path, &1))
+
+    assert {:error, :tracker_authority_invalidated} =
+             Tracker.fetch_issues_by_states(["Todo"], context)
+
+    assert {:error, :tracker_authority_invalidated} =
+             Tracker.create_comment(issue.id, "blocked", context)
+
+    assert {:error, :tracker_authority_invalidated} =
+             Tracker.update_issue_state(issue.id, "Done", context)
+
+    refute_receive {:memory_tracker_comment, "issue-authority-bound", "blocked"}
+    refute_receive {:memory_tracker_state_update, "issue-authority-bound", "Done"}
+  end
+
   test "Linear retry command resumes a matching wait exactly once while globally paused" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -3765,7 +3804,9 @@ defmodule SymphonyElixir.CoreTest do
     Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue_id => [command]})
 
     assert Config.settings!().tracker.operator_user_ids == ["operator-1"]
-    assert {:ok, [^command]} = Tracker.fetch_comments_since(issue_id, cursor_at)
+
+    assert {:ok, [^command]} =
+             Tracker.fetch_comments_since(issue_id, cursor_at, Tracker.current_poll_context())
 
     append_fn = fn path, event ->
       if event.transition == "operator_command_applied",
@@ -3871,7 +3912,9 @@ defmodule SymphonyElixir.CoreTest do
     Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue_id => [command]})
 
     assert Config.settings!().tracker.operator_user_ids == ["operator-1"]
-    assert {:ok, [^command]} = Tracker.fetch_comments_since(issue_id, cursor_at)
+
+    assert {:ok, [^command]} =
+             Tracker.fetch_comments_since(issue_id, cursor_at, Tracker.current_poll_context())
 
     assert {:ok, wait} =
              SymphonyElixir.OperatorWait.new("operator_stopped", %{
@@ -4069,7 +4112,9 @@ defmodule SymphonyElixir.CoreTest do
     })
 
     assert Config.settings!().tracker.operator_user_ids == ["operator-1"]
-    assert {:ok, [^comment]} = Tracker.fetch_comments_since(issue_id, cursor_at)
+
+    assert {:ok, [^comment]} =
+             Tracker.fetch_comments_since(issue_id, cursor_at, Tracker.current_poll_context())
 
     agent_pid = spawn(fn -> Process.sleep(:infinity) end)
     on_exit(fn -> if Process.alive?(agent_pid), do: Process.exit(agent_pid, :kill) end)

@@ -29,6 +29,12 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec fetch_issues_by_states(
+          [String.t()],
+          SymphonyElixir.Tracker.PollContext.t()
+        ) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(state_names, _context), do: fetch_issues_by_states(state_names)
+
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids) do
     wanted_ids = MapSet.new(issue_ids)
@@ -75,11 +81,26 @@ defmodule SymphonyElixir.Tracker.Memory do
     :ok
   end
 
+  @spec create_comment(
+          String.t(),
+          String.t(),
+          SymphonyElixir.Tracker.PollContext.t()
+        ) :: :ok | {:error, term()}
+  def create_comment(issue_id, body, _context), do: create_comment(issue_id, body)
+
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) do
     send_event({:memory_tracker_state_update, issue_id, state_name})
     :ok
   end
+
+  @spec update_issue_state(
+          String.t(),
+          String.t(),
+          SymphonyElixir.Tracker.PollContext.t()
+        ) :: :ok | {:error, term()}
+  def update_issue_state(issue_id, state_name, _context),
+    do: update_issue_state(issue_id, state_name)
 
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])

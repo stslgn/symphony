@@ -16,20 +16,29 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:ok, [:candidate]}
     end
 
+    def fetch_candidate_issues(_context), do: fetch_candidate_issues()
+
     def fetch_issues_by_states(states) do
       send(self(), {:fetch_issues_by_states_called, states})
       {:ok, states}
     end
+
+    def fetch_issues_by_states(states, _context), do: fetch_issues_by_states(states)
 
     def fetch_issue_states_by_ids(issue_ids) do
       send(self(), {:fetch_issue_states_by_ids_called, issue_ids})
       {:ok, issue_ids}
     end
 
+    def fetch_issue_states_by_ids(issue_ids, _context), do: fetch_issue_states_by_ids(issue_ids)
+
     def fetch_comments_since(issue_id, created_after) do
       send(self(), {:fetch_comments_since_called, issue_id, created_after})
       {:ok, [:comment]}
     end
+
+    def fetch_comments_since(issue_id, created_after, _context),
+      do: fetch_comments_since(issue_id, created_after)
 
     def graphql(query, variables) do
       send(self(), {:graphql_called, query, variables})
@@ -43,6 +52,8 @@ defmodule SymphonyElixir.ExtensionsTest do
           Process.get({__MODULE__, :graphql_result})
       end
     end
+
+    def graphql(query, variables, _opts), do: graphql(query, variables)
   end
 
   defmodule SlowOrchestrator do
@@ -296,12 +307,18 @@ defmodule SymphonyElixir.ExtensionsTest do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
 
     assert Config.settings!().tracker.kind == "memory"
-    assert SymphonyElixir.Tracker.adapter() == Memory
-    assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_candidate_issues()
-    assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42])
-    assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
-    assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
-    assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
+    context = SymphonyElixir.Tracker.current_poll_context()
+    assert SymphonyElixir.Tracker.adapter(context) == Memory
+    assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_candidate_issues(context)
+
+    assert {:ok, [^issue]} =
+             SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42], context)
+
+    assert {:ok, [^issue]} =
+             SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"], context)
+
+    assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment", context)
+    assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done", context)
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
 
@@ -310,23 +327,24 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert :ok = Memory.update_issue_state("issue-1", "Quiet")
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
-    assert SymphonyElixir.Tracker.adapter() == Adapter
+    assert SymphonyElixir.Tracker.adapter(SymphonyElixir.Tracker.current_poll_context()) == Adapter
   end
 
   test "linear adapter delegates reads and validates mutation responses" do
     Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+    context = SymphonyElixir.Tracker.current_poll_context()
 
-    assert {:ok, [:candidate]} = Adapter.fetch_candidate_issues()
+    assert {:ok, [:candidate]} = Adapter.fetch_candidate_issues(context)
     assert_receive :fetch_candidate_issues_called
 
-    assert {:ok, ["Todo"]} = Adapter.fetch_issues_by_states(["Todo"])
+    assert {:ok, ["Todo"]} = Adapter.fetch_issues_by_states(["Todo"], context)
     assert_receive {:fetch_issues_by_states_called, ["Todo"]}
 
-    assert {:ok, ["issue-1"]} = Adapter.fetch_issue_states_by_ids(["issue-1"])
+    assert {:ok, ["issue-1"]} = Adapter.fetch_issue_states_by_ids(["issue-1"], context)
     assert_receive {:fetch_issue_states_by_ids_called, ["issue-1"]}
 
     created_after = ~U[2026-08-03 10:00:00Z]
-    assert {:ok, [:comment]} = Adapter.fetch_comments_since("issue-1", created_after)
+    assert {:ok, [:comment]} = Adapter.fetch_comments_since("issue-1", created_after, context)
     assert_receive {:fetch_comments_since_called, "issue-1", ^created_after}
 
     Process.put(
@@ -334,7 +352,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
     )
 
-    assert :ok = Adapter.create_comment("issue-1", "hello")
+    assert :ok = Adapter.create_comment("issue-1", "hello", context)
     assert_receive {:graphql_called, create_comment_query, %{body: "hello", issueId: "issue-1"}}
     assert create_comment_query =~ "commentCreate"
 
@@ -344,17 +362,17 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :comment_create_failed} =
-             Adapter.create_comment("issue-1", "broken")
+             Adapter.create_comment("issue-1", "broken", context)
 
     Process.put({FakeLinearClient, :graphql_result}, {:error, :boom})
 
-    assert {:error, :boom} = Adapter.create_comment("issue-1", "boom")
+    assert {:error, :boom} = Adapter.create_comment("issue-1", "boom", context)
 
     Process.put({FakeLinearClient, :graphql_result}, {:ok, %{"data" => %{}}})
-    assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "weird")
+    assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "weird", context)
 
     Process.put({FakeLinearClient, :graphql_result}, :unexpected)
-    assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "odd")
+    assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "odd", context)
 
     Process.put(
       {FakeLinearClient, :graphql_results},
@@ -369,7 +387,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       ]
     )
 
-    assert :ok = Adapter.update_issue_state("issue-1", "Done")
+    assert :ok = Adapter.update_issue_state("issue-1", "Done", context)
     assert_receive {:graphql_called, state_lookup_query, %{issueId: "issue-1", stateName: "Done"}}
     assert state_lookup_query =~ "states"
 
@@ -391,14 +409,14 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :issue_update_failed} =
-             Adapter.update_issue_state("issue-1", "Broken")
+             Adapter.update_issue_state("issue-1", "Broken", context)
 
     Process.put({FakeLinearClient, :graphql_results}, [{:error, :boom}])
 
-    assert {:error, :boom} = Adapter.update_issue_state("issue-1", "Boom")
+    assert {:error, :boom} = Adapter.update_issue_state("issue-1", "Boom", context)
 
     Process.put({FakeLinearClient, :graphql_results}, [{:ok, %{"data" => %{}}}])
-    assert {:error, :state_not_found} = Adapter.update_issue_state("issue-1", "Missing")
+    assert {:error, :state_not_found} = Adapter.update_issue_state("issue-1", "Missing", context)
 
     Process.put(
       {FakeLinearClient, :graphql_results},
@@ -413,7 +431,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       ]
     )
 
-    assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Weird")
+    assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Weird", context)
 
     Process.put(
       {FakeLinearClient, :graphql_results},
@@ -428,7 +446,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       ]
     )
 
-    assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
+    assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd", context)
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do

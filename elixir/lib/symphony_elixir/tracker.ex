@@ -32,37 +32,26 @@ defmodule SymphonyElixir.Tracker do
           }
   end
 
-  @callback fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   @callback fetch_candidate_issues(PollContext.t()) :: {:ok, [term()]} | {:error, term()}
-  @callback fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
-  @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
-  @callback fetch_issue_states_by_ids([String.t()], PollContext.t()) ::
+  @callback fetch_issues_by_states([String.t()], PollContext.t()) ::
               {:ok, [term()]} | {:error, term()}
-  @callback fetch_comments_since(String.t(), DateTime.t()) ::
+  @callback fetch_issue_states_by_ids([String.t()], PollContext.t()) ::
               {:ok, [term()]} | {:error, term()}
   @callback fetch_comments_since(String.t(), DateTime.t(), PollContext.t()) ::
               {:ok, [term()]} | {:error, term()}
-  @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
-  @callback update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
-
-  @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
-  def fetch_candidate_issues do
-    adapter().fetch_candidate_issues()
-  end
+  @callback create_comment(String.t(), String.t(), PollContext.t()) :: :ok | {:error, term()}
+  @callback update_issue_state(String.t(), String.t(), PollContext.t()) ::
+              :ok | {:error, term()}
 
   @spec fetch_candidate_issues(PollContext.t()) :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues(%PollContext{} = context) do
     with_authorized_context(context, fn -> adapter(context).fetch_candidate_issues(context) end)
   end
 
-  @spec fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
-  def fetch_issues_by_states(states) do
-    adapter().fetch_issues_by_states(states)
-  end
-
-  @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
-  def fetch_issue_states_by_ids(issue_ids) do
-    adapter().fetch_issue_states_by_ids(issue_ids)
+  @spec fetch_issues_by_states([String.t()], PollContext.t()) ::
+          {:ok, [term()]} | {:error, term()}
+  def fetch_issues_by_states(states, %PollContext{} = context) do
+    with_authorized_context(context, fn -> adapter(context).fetch_issues_by_states(states, context) end)
   end
 
   @spec fetch_issue_states_by_ids([String.t()], PollContext.t()) ::
@@ -73,12 +62,6 @@ defmodule SymphonyElixir.Tracker do
     end)
   end
 
-  @spec fetch_comments_since(String.t(), DateTime.t()) ::
-          {:ok, [term()]} | {:error, term()}
-  def fetch_comments_since(issue_id, %DateTime{} = created_after) do
-    adapter().fetch_comments_since(issue_id, created_after)
-  end
-
   @spec fetch_comments_since(String.t(), DateTime.t(), PollContext.t()) ::
           {:ok, [term()]} | {:error, term()}
   def fetch_comments_since(issue_id, %DateTime{} = created_after, %PollContext{} = context) do
@@ -87,22 +70,16 @@ defmodule SymphonyElixir.Tracker do
     end)
   end
 
-  @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
-  def create_comment(issue_id, body) do
-    adapter().create_comment(issue_id, body)
+  @spec create_comment(String.t(), String.t(), PollContext.t()) :: :ok | {:error, term()}
+  def create_comment(issue_id, body, %PollContext{} = context) do
+    with_authorized_context(context, fn -> adapter(context).create_comment(issue_id, body, context) end)
   end
 
-  @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
-  def update_issue_state(issue_id, state_name) do
-    adapter().update_issue_state(issue_id, state_name)
-  end
-
-  @spec adapter() :: module()
-  def adapter do
-    case Config.settings!().tracker.kind do
-      "memory" -> SymphonyElixir.Tracker.Memory
-      _ -> SymphonyElixir.Linear.Adapter
-    end
+  @spec update_issue_state(String.t(), String.t(), PollContext.t()) :: :ok | {:error, term()}
+  def update_issue_state(issue_id, state_name, %PollContext{} = context) do
+    with_authorized_context(context, fn ->
+      adapter(context).update_issue_state(issue_id, state_name, context)
+    end)
   end
 
   @spec adapter(PollContext.t()) :: module()
