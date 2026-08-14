@@ -1246,7 +1246,7 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(reconciled.cleanup_pending, wait.issue_id)
 
     trace = File.read!(trace_file)
-    assert trace =~ "worker-a bash -lc"
+    assert trace =~ "worker-a /bin/bash --noprofile --norc -c"
     assert trace =~ "rm -rf"
     assert trace =~ workspace
   end
@@ -1343,7 +1343,7 @@ defmodule SymphonyElixir.CoreTest do
 
     refute Map.has_key?(restarted.cleanup_pending, wait.issue_id)
     refute MapSet.member?(restarted.claimed, wait.issue_id)
-    assert File.read!(trace_file) =~ "worker-a bash -lc"
+    assert File.read!(trace_file) =~ "worker-a /bin/bash --noprofile --norc -c"
     assert File.read!(trace_file) =~ workspace
   end
 
@@ -5360,8 +5360,8 @@ defmodule SymphonyElixir.CoreTest do
       end
 
       trace = File.read!(trace_file)
-      assert trace =~ "worker-a bash -lc"
-      refute trace =~ "worker-b bash -lc"
+      assert trace =~ "worker-a /bin/bash --noprofile --norc -c"
+      refute trace =~ "worker-b /bin/bash --noprofile --norc -c"
     after
       File.rm_rf(test_root)
     end

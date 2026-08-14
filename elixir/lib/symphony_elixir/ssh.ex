@@ -29,7 +29,7 @@ defmodule SymphonyElixir.SSH do
 
   @spec remote_shell_command(String.t()) :: String.t()
   def remote_shell_command(command) when is_binary(command) do
-    "bash -lc " <> shell_escape(command)
+    "/bin/bash --noprofile --norc -c " <> shell_escape(command)
   end
 
   defp ssh_executable do

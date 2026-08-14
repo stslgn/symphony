@@ -1974,7 +1974,7 @@ defmodule SymphonyElixir.AppServerTest do
       lines = String.split(trace, "\n", trim: true)
 
       assert argv_line = Enum.find(lines, &String.starts_with?(&1, "ARGV:"))
-      assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
+      assert argv_line =~ "-T -p 2200 worker-01 /bin/bash --noprofile --norc -c"
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
       assert argv_line =~ "exec "
@@ -2056,6 +2056,7 @@ defmodule SymphonyElixir.AppServerTest do
       pipe_probe = Path.join(test_root, "pipe-probe")
       trace_file = Path.join(test_root, "remote.env")
       hostile_env_trace = Path.join(test_root, "hostile-env.trace")
+      hostile_bash_trace = Path.join(test_root, "hostile-bash.trace")
 
       File.mkdir_p!(remote_workspace)
       System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
@@ -2087,11 +2088,8 @@ defmodule SymphonyElixir.AppServerTest do
 
       File.write!(fake_login_bash, """
       #!/bin/sh
-      if [ "${1:-}" = "-lc" ]; then
-        shift
-        exec /bin/bash -c "$1"
-      fi
-      exec /bin/bash "$@"
+      printf '%s\n' 'PATH_BASH_EXECUTED' >> #{hostile_bash_trace}
+      exit 98
       """)
 
       codex_env_probe =
@@ -2158,6 +2156,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       trace = File.read!(trace_file)
       refute File.exists?(hostile_env_trace)
+      refute File.exists?(hostile_bash_trace)
 
       Enum.each(secret_env_names, fn name ->
         assert trace =~ "CODEX:#{name}=__ABSENT__"
