@@ -34,22 +34,25 @@ defmodule SymphonyElixir.CLI do
   end
 
   def main(args) do
-    with :ok <- admit_runtime_identity() do
-      case evaluate(args) do
-        :ok ->
-          wait_for_shutdown()
-
-        {:error, message} ->
-          IO.puts(:stderr, message)
-          System.halt(1)
-      end
-    else
+    case admit_runtime_identity() do
+      :ok -> start_runtime(args)
       {:error, reason} -> halt_runtime_identity(reason)
     end
   end
 
   @spec startup_protocol() :: String.t()
   def startup_protocol, do: @startup_protocol
+
+  defp start_runtime(args) do
+    case evaluate(args) do
+      :ok ->
+        wait_for_shutdown()
+
+      {:error, message} ->
+        IO.puts(:stderr, message)
+        System.halt(1)
+    end
+  end
 
   defp admit_runtime_identity do
     if System.get_env(@managed_project_env) in [nil, ""] do
