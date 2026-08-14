@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Config do
   """
 
   alias SymphonyElixir.Config.Schema
-  alias SymphonyElixir.Workflow
+  alias SymphonyElixir.{Workflow, WorkflowStore}
 
   @default_prompt_template """
   You are working on a Linear issue.
@@ -44,6 +44,29 @@ defmodule SymphonyElixir.Config do
   @spec settings!() :: Schema.t()
   def settings! do
     case settings() do
+      {:ok, settings} ->
+        settings
+
+      {:error, reason} ->
+        raise ArgumentError, message: format_config_error(reason)
+    end
+  end
+
+  @spec settings_with_authority!() :: {Schema.t(), term(), term()}
+  def settings_with_authority! do
+    case WorkflowStore.current_with_authority() do
+      {:ok, workflow, authority_generation, tracker_authority_generation} ->
+        {settings_for_workflow!(workflow), authority_generation, tracker_authority_generation}
+
+      {:error, reason} ->
+        raise ArgumentError, message: format_config_error(reason)
+    end
+  end
+
+  @doc false
+  @spec settings_for_workflow!(Workflow.loaded_workflow()) :: Schema.t()
+  def settings_for_workflow!(%{config: config}) when is_map(config) do
+    case Schema.parse(config) do
       {:ok, settings} ->
         settings
 
@@ -97,7 +120,8 @@ defmodule SymphonyElixir.Config do
 
   @spec validate!() :: :ok | {:error, term()}
   def validate! do
-    with {:ok, settings} <- settings() do
+    with {:ok, %{config: config}} <- Workflow.load(),
+         {:ok, settings} <- Schema.parse(config) do
       validate_semantics(settings)
     end
   end

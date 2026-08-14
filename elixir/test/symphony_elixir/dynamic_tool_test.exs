@@ -1,7 +1,8 @@
 defmodule SymphonyElixir.Codex.DynamicToolTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.Codex.DynamicTool, as: RealDynamicTool
+  alias SymphonyElixir.TestDynamicTool, as: DynamicTool
 
   test "tool_specs advertises the linear_graphql input contract" do
     assert [
@@ -60,8 +61,30 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
            ]
   end
 
+  test "linear_graphql rejects a missing tracker context before client I/O" do
+    response =
+      RealDynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        linear_client: fn _query, _variables, _opts ->
+          flunk("linear client must not run without an admitted tracker context")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert %{
+             "error" => %{"message" => message},
+             "symphonyBoundary" => "tracker_context"
+           } = Jason.decode!(response["output"])
+
+    assert message =~ "tracker context"
+  end
+
   test "linear_graphql returns successful GraphQL responses as tool text" do
     test_pid = self()
+
+    tracker_context = Tracker.current_poll_context()
 
     response =
       DynamicTool.execute(
@@ -73,10 +96,11 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         linear_client: fn query, variables, opts ->
           send(test_pid, {:linear_client_called, query, variables, opts})
           {:ok, %{"data" => %{"viewer" => %{"id" => "usr_123"}}}}
-        end
+        end,
+        tracker_context: tracker_context
       )
 
-    assert_received {:linear_client_called, "query Viewer { viewer { id } }", %{"includeTeams" => false}, []}
+    assert_received {:linear_client_called, "query Viewer { viewer { id } }", %{"includeTeams" => false}, tracker_context: ^tracker_context}
 
     assert response["success"] == true
     assert Jason.decode!(response["output"]) == %{"data" => %{"viewer" => %{"id" => "usr_123"}}}
@@ -96,7 +120,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         end
       )
 
-    assert_received {:linear_client_called, "query Viewer { viewer { id } }", %{}, []}
+    assert_received {:linear_client_called, "query Viewer { viewer { id } }", %{}, tracker_context: %Tracker.PollContext{}}
     assert response["success"] == true
   end
 
@@ -113,7 +137,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         end
       )
 
-    assert_received {:linear_client_called, "query Viewer { viewer { id } }", %{}, []}
+    assert_received {:linear_client_called, "query Viewer { viewer { id } }", %{}, tracker_context: %Tracker.PollContext{}}
     assert response["success"] == true
   end
 
@@ -135,7 +159,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         end
       )
 
-    assert_received {:linear_client_called, forwarded_query, %{}, []}
+    assert_received {:linear_client_called, forwarded_query, %{}, tracker_context: %Tracker.PollContext{}}
     assert forwarded_query == String.trim(query)
     assert response["success"] == false
   end
@@ -150,6 +174,40 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "message" => "`linear_graphql` requires a non-empty `query` string."
              }
            }
+  end
+
+  test "linear_graphql rejects a session context after tracker authority drift" do
+    refute Tracker.authority_valid?(%Tracker.PollContext{})
+    tracker_context = Tracker.current_poll_context()
+
+    workflow_path = Workflow.workflow_file_path()
+
+    workflow_path
+    |> File.read!()
+    |> String.replace(
+      "https://api.linear.app/graphql",
+      "https://changed.example/graphql"
+    )
+    |> then(&File.write!(workflow_path, &1))
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        tracker_context: tracker_context,
+        linear_client: fn _query, _variables, _opts ->
+          flunk("linear client should not run after tracker authority drift")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert %{
+             "error" => %{"message" => message},
+             "symphonyBoundary" => "tracker_authority_generation"
+           } = Jason.decode!(response["output"])
+
+    assert message =~ "tracker authority changed"
   end
 
   test "linear_graphql marks GraphQL error responses as failures while preserving the body" do

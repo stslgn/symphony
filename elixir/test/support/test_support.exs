@@ -1,3 +1,58 @@
+defmodule SymphonyElixir.TestAppServer do
+  @moduledoc false
+
+  alias SymphonyElixir.Codex.AppServer
+
+  def run(workspace, prompt, issue, opts \\ []) do
+    AppServer.run(workspace, prompt, issue, with_tracker_context(opts))
+  end
+
+  def start_session(workspace, opts \\ []) do
+    AppServer.start_session(workspace, with_tracker_context(opts))
+  end
+
+  defp with_tracker_context(opts) do
+    Keyword.put_new_lazy(opts, :tracker_context, &SymphonyElixir.Tracker.current_poll_context/0)
+  end
+end
+
+defmodule SymphonyElixir.TestAgentRunner do
+  @moduledoc false
+
+  def run(issue, recipient \\ nil, opts \\ []) do
+    opts =
+      Keyword.put_new_lazy(
+        opts,
+        :tracker_context,
+        &SymphonyElixir.Tracker.current_poll_context/0
+      )
+
+    SymphonyElixir.AgentRunner.run(issue, recipient, opts)
+  end
+end
+
+defmodule SymphonyElixir.TestDynamicTool do
+  @moduledoc false
+
+  alias SymphonyElixir.Codex.DynamicTool
+
+  def execute(tool, arguments, opts \\ []) do
+    opts =
+      Keyword.put_new_lazy(
+        opts,
+        :tracker_context,
+        &SymphonyElixir.Tracker.current_poll_context/0
+      )
+
+    DynamicTool.execute(tool, arguments, opts)
+  end
+
+  defdelegate denied_response(tool, allowed_tools), to: DynamicTool
+  defdelegate supported_tool_names(), to: DynamicTool
+  defdelegate tool_specs(), to: DynamicTool
+  defdelegate tool_specs(allowed_tools), to: DynamicTool
+end
+
 defmodule SymphonyElixir.TestSupport do
   @workflow_prompt "You are an agent for this repository."
 
@@ -6,9 +61,7 @@ defmodule SymphonyElixir.TestSupport do
       use ExUnit.Case
       import ExUnit.CaptureLog
 
-      alias SymphonyElixir.AgentRunner
       alias SymphonyElixir.CLI
-      alias SymphonyElixir.Codex.AppServer
       alias SymphonyElixir.Config
       alias SymphonyElixir.HttpServer
       alias SymphonyElixir.Linear.Client
@@ -16,6 +69,8 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Orchestrator
       alias SymphonyElixir.PromptBuilder
       alias SymphonyElixir.StatusDashboard
+      alias SymphonyElixir.TestAgentRunner, as: AgentRunner
+      alias SymphonyElixir.TestAppServer, as: AppServer
       alias SymphonyElixir.Tracker
       alias SymphonyElixir.Workflow
       alias SymphonyElixir.WorkflowStore

@@ -1,9 +1,23 @@
 defmodule SymphonyElixir.CLITest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureIO
+
   alias SymphonyElixir.CLI
 
   @ack_flag "--i-understand-that-this-will-be-running-without-the-usual-guardrails"
+
+  test "reports startup protocol without starting the application" do
+    assert CLI.startup_protocol() == "3"
+    assert capture_io(fn -> assert :ok = CLI.main(["--startup-protocol"]) end) == "3\n"
+  end
+
+  test "reports a loaded-code runtime identity without starting the application" do
+    output = capture_io(fn -> assert :ok = CLI.main(["--runtime-identity"]) end)
+
+    assert output =~
+             ~r/\Aimage_sha256=[0-9a-f]{64}\nexecution_sha256=[0-9a-f]{64}\n\z/
+  end
 
   test "returns the guardrails acknowledgement banner when the flag is missing" do
     parent = self()

@@ -11,6 +11,20 @@ defmodule SymphonyElixir.AgentRunner do
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
+    case fetch_tracker_context(opts) do
+      {:ok, tracker_context} ->
+        run_with_tracker_context(
+          issue,
+          codex_update_recipient,
+          Keyword.put(opts, :tracker_context, tracker_context)
+        )
+
+      {:error, reason} ->
+        raise_run_error(issue, reason)
+    end
+  end
+
+  defp run_with_tracker_context(issue, codex_update_recipient, opts) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
 
@@ -21,10 +35,26 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, reason} ->
-        error_code = ObservabilitySanitizer.error_code(reason, "agent_run_failed")
-        Logger.error("Agent run failed for #{issue_context(issue)} error_code=#{error_code}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)} error_code=#{error_code}"
+        raise_run_error(issue, reason)
     end
+  end
+
+  defp fetch_tracker_context(opts) do
+    case Keyword.fetch(opts, :tracker_context) do
+      {:ok, %Tracker.PollContext{} = context} ->
+        if Tracker.authority_valid?(context),
+          do: {:ok, context},
+          else: {:error, :tracker_authority_invalidated}
+
+      _ ->
+        {:error, :tracker_context_required}
+    end
+  end
+
+  defp raise_run_error(issue, reason) do
+    error_code = ObservabilitySanitizer.error_code(reason, "agent_run_failed")
+    Logger.error("Agent run failed for #{issue_context(issue)} error_code=#{error_code}")
+    raise RuntimeError, "Agent run failed for #{issue_context(issue)} error_code=#{error_code}"
   end
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
@@ -105,12 +135,18 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
-    issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    tracker_context = Keyword.fetch!(opts, :tracker_context)
+
+    issue_state_fetcher =
+      Keyword.get(opts, :issue_state_fetcher, fn issue_ids ->
+        fetch_issue_states(issue_ids, tracker_context)
+      end)
 
     with {:ok, session} <-
            AppServer.start_session(workspace,
              worker_host: worker_host,
-             session_title: AppServer.session_title(issue)
+             session_title: AppServer.session_title(issue),
+             tracker_context: tracker_context
            ) do
       try do
         with :ok <- send_worker_model_resolution(codex_update_recipient, issue, session, opts) do
@@ -171,7 +207,9 @@ defmodule SymphonyElixir.AgentRunner do
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
+      active_states = Keyword.fetch!(opts, :tracker_context).active_states
+
+      case continue_with_issue?(issue, issue_state_fetcher, active_states) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
@@ -241,10 +279,11 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, active_states)
+       when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) do
+        if active_issue_state?(refreshed_issue.state, active_states) do
           {:continue, refreshed_issue}
         else
           {:done, refreshed_issue}
@@ -258,16 +297,25 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+  defp continue_with_issue?(issue, _issue_state_fetcher, _active_states), do: {:done, issue}
 
-  defp active_issue_state?(state_name) when is_binary(state_name) do
+  defp active_issue_state?(state_name, active_states)
+       when is_binary(state_name) and is_list(active_states) do
     normalized_state = normalize_issue_state(state_name)
 
-    Config.settings!().tracker.active_states
+    active_states
     |> Enum.any?(fn active_state -> normalize_issue_state(active_state) == normalized_state end)
   end
 
-  defp active_issue_state?(_state_name), do: false
+  defp active_issue_state?(_state_name, _active_states), do: false
+
+  defp fetch_issue_states(issue_ids, tracker_context) do
+    if Tracker.authority_valid?(tracker_context) do
+      Tracker.fetch_issue_states_by_ids(issue_ids, tracker_context)
+    else
+      {:error, :tracker_authority_invalidated}
+    end
+  end
 
   defp selected_worker_host(nil, []), do: nil
 

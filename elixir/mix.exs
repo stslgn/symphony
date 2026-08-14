@@ -83,9 +83,16 @@ defmodule SymphonyElixir.MixProject do
   defp aliases do
     [
       setup: ["deps.get"],
-      build: ["escript.build"],
+      build: ["escript.build", &write_runtime_manifest/1],
       lint: ["specs.check", "credo --strict"]
     ]
+  end
+
+  defp write_runtime_manifest(_args) do
+    SymphonyElixir.RuntimeIdentity.write_manifest!(
+      "bin/symphony",
+      "bin/symphony.runtime-identity"
+    )
   end
 
   defp escript do

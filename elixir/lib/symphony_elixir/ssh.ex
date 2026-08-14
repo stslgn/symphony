@@ -20,6 +20,7 @@ defmodule SymphonyElixir.SSH do
           :stderr_to_stdout,
           args: Enum.map(ssh_args(host, command), &String.to_charlist/1)
         ]
+        |> maybe_put_env_option(Keyword.get(opts, :env))
         |> maybe_put_line_option(line_bytes)
 
       {:ok, Port.open({:spawn_executable, String.to_charlist(executable)}, port_opts)}
@@ -28,7 +29,7 @@ defmodule SymphonyElixir.SSH do
 
   @spec remote_shell_command(String.t()) :: String.t()
   def remote_shell_command(command) when is_binary(command) do
-    "bash -lc " <> shell_escape(command)
+    "/bin/bash --noprofile --norc -c " <> shell_escape(command)
   end
 
   defp ssh_executable do
@@ -50,6 +51,9 @@ defmodule SymphonyElixir.SSH do
 
   defp maybe_put_line_option(port_opts, nil), do: port_opts
   defp maybe_put_line_option(port_opts, line_bytes), do: Keyword.put(port_opts, :line, line_bytes)
+
+  defp maybe_put_env_option(port_opts, nil), do: port_opts
+  defp maybe_put_env_option(port_opts, env), do: Keyword.put(port_opts, :env, env)
 
   defp maybe_put_config(args) do
     case System.get_env("SYMPHONY_SSH_CONFIG") do

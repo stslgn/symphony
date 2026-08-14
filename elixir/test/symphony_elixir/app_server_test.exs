@@ -1,6 +1,146 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Codex.AppServer, as: RealAppServer
+
+  @tracker_secret_env_names ~w(
+    LINEAR_API_KEY
+    LINEAR_WEBHOOK_SECRET
+    LINEAR_KEYCHAIN_SERVICE
+    LINEAR_KEYCHAIN_PATH
+    LINEAR_KEYCHAIN_ACCOUNT
+    LINEAR_WEBHOOK_KEYCHAIN_SERVICE
+  )
+  @custom_api_key_env "SYMP_TEST_CUSTOM_LINEAR_API_KEY"
+  @custom_webhook_secret_env "SYMP_TEST_CUSTOM_LINEAR_WEBHOOK_SECRET"
+
+  test "app server rejects a missing tracker context before workspace or port setup" do
+    assert {:error, :tracker_context_required} =
+             RealAppServer.start_session("/missing/workspace")
+  end
+
+  test "app server rejects invalid pinned tracker secret selectors before port setup" do
+    tracker_context = %{
+      Tracker.current_poll_context()
+      | api_key_env_var: "INVALID-SELECTOR"
+    }
+
+    assert {:error, :invalid_tracker_secret_selector} =
+             RealAppServer.start_session("/missing/workspace", tracker_context: tracker_context)
+  end
+
+  test "local app server subprocess cannot inherit tracker credentials or selectors" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-secret-env-#{System.unique_integer([:positive])}"
+      )
+
+    secret_env_names =
+      @tracker_secret_env_names ++ [@custom_api_key_env, @custom_webhook_secret_env]
+
+    previous_env = Map.new(secret_env_names, &{&1, System.get_env(&1)})
+    previous_trace = System.get_env("SYMP_TEST_APP_ENV_TRACE")
+
+    on_exit(fn ->
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+      restore_env("SYMP_TEST_APP_ENV_TRACE", previous_trace)
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-SECRET-ENV")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "app-server.env")
+
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_APP_ENV_TRACE", trace_file)
+
+      Enum.each(secret_env_names, fn name ->
+        System.put_env(name, "test-only-#{String.downcase(name)}")
+      end)
+
+      env_probe =
+        Enum.map_join(secret_env_names, "\n", fn name ->
+          "printf 'START:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> \"$trace_file\""
+        end)
+
+      turn_env_probe =
+        Enum.map_join(secret_env_names, "\n", fn name ->
+          "printf 'TURN:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> \"$trace_file\""
+        end)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file=#{trace_file}
+      #{env_probe}
+
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-secret-env"}}}' ;;
+          3) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-secret-env"}}}' ;;
+          4)
+            #{turn_env_probe}
+            printf '%s\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        tracker_api_token: "$#{@custom_api_key_env}",
+        tracker_webhook_secret: "$#{@custom_webhook_secret_env}"
+      )
+
+      issue = %Issue{
+        id: "issue-secret-env",
+        identifier: "MT-SECRET-ENV",
+        title: "Keep tracker credentials outside worker environment",
+        state: "In Progress"
+      }
+
+      tracker_context = Tracker.current_poll_context()
+
+      assert {:ok, session} =
+               RealAppServer.start_session(workspace, tracker_context: tracker_context)
+
+      try do
+        workflow_path = Workflow.workflow_file_path()
+
+        workflow_path
+        |> File.read!()
+        |> String.replace(@custom_api_key_env, "#{@custom_api_key_env}_ROTATED")
+        |> then(&File.write!(workflow_path, &1))
+
+        assert {:ok, _result} =
+                 RealAppServer.run_turn(
+                   session,
+                   "Check worker environment after authority drift",
+                   issue
+                 )
+      after
+        RealAppServer.stop_session(session)
+      end
+
+      trace = File.read!(trace_file)
+
+      Enum.each(secret_env_names, fn name ->
+        assert trace =~ "START:#{name}=__ABSENT__"
+        assert trace =~ "TURN:#{name}=__ABSENT__"
+      end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
@@ -1112,29 +1252,20 @@ defmodule SymphonyElixir.AppServerTest do
       }
 
       test_pid = self()
+      tracker_context = Tracker.current_poll_context()
 
-      tool_executor = fn tool, arguments ->
-        send(test_pid, {:tool_called, tool, arguments})
-
-        %{
-          "success" => true,
-          "contentItems" => [
-            %{
-              "type" => "inputText",
-              "text" => ~s({"data":{"viewer":{"id":"usr_123"}}})
-            }
-          ]
-        }
+      linear_client = fn query, variables, opts ->
+        send(test_pid, {:linear_client_called, query, variables, opts})
+        {:ok, %{"data" => %{"viewer" => %{"id" => "usr_123"}}}}
       end
 
       assert {:ok, _result} =
-               AppServer.run(workspace, "Handle supported tool calls", issue, tool_executor: tool_executor)
+               AppServer.run(workspace, "Handle supported tool calls", issue,
+                 linear_client: linear_client,
+                 tracker_context: tracker_context
+               )
 
-      assert_received {:tool_called, "linear_graphql",
-                       %{
-                         "query" => "query Viewer { viewer { id } }",
-                         "variables" => %{"includeTeams" => false}
-                       }}
+      assert_received {:linear_client_called, "query Viewer { viewer { id } }", %{"includeTeams" => false}, tracker_context: ^tracker_context}
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
@@ -1148,8 +1279,8 @@ defmodule SymphonyElixir.AppServerTest do
 
                  payload["id"] == 102 and
                    get_in(payload, ["result", "success"]) == true and
-                   get_in(payload, ["result", "output"]) ==
-                     ~s({"data":{"viewer":{"id":"usr_123"}}})
+                   Jason.decode!(get_in(payload, ["result", "output"])) ==
+                     %{"data" => %{"viewer" => %{"id" => "usr_123"}}}
                else
                  false
                end
@@ -1751,9 +1882,15 @@ defmodule SymphonyElixir.AppServerTest do
     previous_path = System.get_env("PATH")
     previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
 
+    secret_env_names =
+      @tracker_secret_env_names ++ [@custom_api_key_env, @custom_webhook_secret_env]
+
+    previous_env = Map.new(secret_env_names, &{&1, System.get_env(&1)})
+
     on_exit(fn ->
       restore_env("PATH", previous_path)
       restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
     end)
 
     try do
@@ -1765,11 +1902,21 @@ defmodule SymphonyElixir.AppServerTest do
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
       System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
 
+      Enum.each(secret_env_names, fn name ->
+        System.put_env(name, "test-only-#{String.downcase(name)}")
+      end)
+
+      env_probe =
+        Enum.map_join(secret_env_names, "\n", fn name ->
+          "printf 'ENV:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> \"$trace_file\""
+        end)
+
       File.write!(fake_ssh, """
       #!/bin/sh
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
       count=0
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+      #{env_probe}
 
       while IFS= read -r line; do
         count=$((count + 1))
@@ -1800,7 +1947,9 @@ defmodule SymphonyElixir.AppServerTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: "/remote/workspaces",
-        codex_command: "fake-remote-codex app-server"
+        codex_command: "fake-remote-codex app-server",
+        tracker_api_token: "$#{@custom_api_key_env}",
+        tracker_webhook_secret: "$#{@custom_webhook_secret_env}"
       )
 
       issue = %Issue{
@@ -1825,11 +1974,17 @@ defmodule SymphonyElixir.AppServerTest do
       lines = String.split(trace, "\n", trim: true)
 
       assert argv_line = Enum.find(lines, &String.starts_with?(&1, "ARGV:"))
-      assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
+      assert argv_line =~ "-T -p 2200 worker-01 /bin/bash --noprofile --norc -c"
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
       assert argv_line =~ "exec "
+      assert argv_line =~ "env -u LINEAR_API_KEY"
       assert argv_line =~ "fake-remote-codex app-server"
+
+      Enum.each(secret_env_names, fn name ->
+        assert "ENV:#{name}=__ABSENT__" in lines
+        assert argv_line =~ "-u #{name}"
+      end)
 
       expected_turn_policy = %{
         "type" => "workspaceWrite",
@@ -1868,6 +2023,145 @@ defmodule SymphonyElixir.AppServerTest do
                  false
                end
              end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "remote compound codex command executes entirely inside a scrubbed shell" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-remote-env-scope-#{System.unique_integer([:positive])}"
+      )
+
+    secret_env_names =
+      @tracker_secret_env_names ++
+        [@custom_api_key_env, @custom_webhook_secret_env, "BASH_ENV", "ENV"]
+
+    previous_path = System.get_env("PATH")
+    previous_env = Map.new(secret_env_names, &{&1, System.get_env(&1)})
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+    end)
+
+    try do
+      remote_workspace = Path.join(test_root, "remote-workspaces/MT-REMOTE-ENV")
+      fake_ssh = Path.join(test_root, "ssh")
+      fake_login_bash = Path.join(test_root, "bash")
+      hostile_env = Path.join(test_root, "env")
+      fake_codex = Path.join(test_root, "fake-remote-codex")
+      pipe_probe = Path.join(test_root, "pipe-probe")
+      trace_file = Path.join(test_root, "remote.env")
+      hostile_env_trace = Path.join(test_root, "hostile-env.trace")
+      hostile_bash_trace = Path.join(test_root, "hostile-bash.trace")
+
+      File.mkdir_p!(remote_workspace)
+      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+      Enum.each(secret_env_names, fn name ->
+        System.put_env(name, "/dev/null")
+      end)
+
+      remote_contamination =
+        Enum.map_join(secret_env_names, "\n", fn name ->
+          "export #{name}=/dev/null"
+        end)
+
+      File.write!(fake_ssh, """
+      #!/bin/sh
+      remote_command=""
+      for argument in "$@"; do
+        remote_command="$argument"
+      done
+      #{remote_contamination}
+      exec /bin/bash -c "$remote_command"
+      """)
+
+      File.write!(hostile_env, """
+      #!/bin/sh
+      printf '%s\n' 'PATH_ENV_EXECUTED' >> #{hostile_env_trace}
+      exit 97
+      """)
+
+      File.write!(fake_login_bash, """
+      #!/bin/sh
+      printf '%s\n' 'PATH_BASH_EXECUTED' >> #{hostile_bash_trace}
+      exit 98
+      """)
+
+      codex_env_probe =
+        Enum.map_join(secret_env_names, "\n", fn name ->
+          "printf 'CODEX:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> #{trace_file}"
+        end)
+
+      File.write!(fake_codex, """
+      #!/bin/sh
+      #{codex_env_probe}
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-remote-env"}}}' ;;
+          3) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-remote-env"}}}' ;;
+          4)
+            printf '%s\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      pipe_env_probe =
+        Enum.map_join(secret_env_names, "\n", fn name ->
+          "printf 'PIPE:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> #{trace_file}"
+        end)
+
+      File.write!(pipe_probe, """
+      #!/bin/sh
+      #{pipe_env_probe}
+      exec /bin/cat
+      """)
+
+      File.chmod!(fake_ssh, 0o755)
+      File.chmod!(fake_login_bash, 0o755)
+      File.chmod!(hostile_env, 0o755)
+      File.chmod!(fake_codex, 0o755)
+      File.chmod!(pipe_probe, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.dirname(remote_workspace),
+        codex_command: "#{fake_codex} app-server | #{pipe_probe}",
+        tracker_api_token: "$#{@custom_api_key_env}",
+        tracker_webhook_secret: "$#{@custom_webhook_secret_env}"
+      )
+
+      issue = %Issue{
+        id: "issue-remote-env",
+        identifier: "MT-REMOTE-ENV",
+        title: "Scope remote worker environment",
+        state: "In Progress"
+      }
+
+      assert {:ok, _result} =
+               AppServer.run(
+                 remote_workspace,
+                 "Execute compound worker command",
+                 issue,
+                 worker_host: "worker-env"
+               )
+
+      trace = File.read!(trace_file)
+      refute File.exists?(hostile_env_trace)
+      refute File.exists?(hostile_bash_trace)
+
+      Enum.each(secret_env_names, fn name ->
+        assert trace =~ "CODEX:#{name}=__ABSENT__"
+        assert trace =~ "PIPE:#{name}=__ABSENT__"
+      end)
     after
       File.rm_rf(test_root)
     end

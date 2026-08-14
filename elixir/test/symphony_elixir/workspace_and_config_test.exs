@@ -1015,6 +1015,74 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
   end
 
+  test "linear client revalidates tracker authority before every batched request" do
+    issue_ids = Enum.map(1..55, &"issue-authority-#{&1}")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_endpoint: "https://approved.example/graphql",
+      tracker_api_token: "approved-token",
+      tracker_project_slug: "approved-project"
+    )
+
+    context = SymphonyElixir.Tracker.current_poll_context()
+    workflow_path = Workflow.workflow_file_path()
+
+    request_fun = fn payload, _headers ->
+      request_number = Process.get(:authority_request_number, 0) + 1
+      Process.put(:authority_request_number, request_number)
+      send(self(), {:authority_request, request_number})
+
+      if request_number == 1 do
+        workflow_path
+        |> File.read!()
+        |> String.replace(
+          "https://approved.example/graphql",
+          "https://unapproved.example/graphql"
+        )
+        |> then(&File.write!(workflow_path, &1))
+      end
+
+      raw_issues =
+        Enum.map(payload["variables"].ids, fn issue_id ->
+          %{
+            "id" => issue_id,
+            "identifier" => String.upcase(issue_id),
+            "title" => issue_id,
+            "state" => %{"name" => "In Progress"},
+            "labels" => %{"nodes" => []},
+            "inverseRelations" => %{"nodes" => []}
+          }
+        end)
+
+      {:ok, %{status: 200, body: %{"data" => %{"issues" => %{"nodes" => raw_issues}}}}}
+    end
+
+    graphql_fun = fn query, variables ->
+      Client.graphql(query, variables,
+        tracker_context: context,
+        request_fun: request_fun
+      )
+    end
+
+    assert {:error, :tracker_authority_invalidated} =
+             Client.fetch_issue_states_by_ids_for_test(issue_ids, graphql_fun)
+
+    assert_receive {:authority_request, 1}
+    refute_receive {:authority_request, 2}
+  end
+
+  test "linear client rejects a missing tracker context before network I/O" do
+    assert {:error, :tracker_context_required} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               request_fun: fn _payload, _headers ->
+                 flunk("request must not run without an admitted tracker context")
+               end
+             )
+  end
+
   test "linear client logs response bodies for non-200 graphql responses" do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
@@ -1022,6 +1090,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                  Client.graphql(
                    "query Viewer { viewer { id } }",
                    %{},
+                   tracker_context: SymphonyElixir.Tracker.current_poll_context(),
                    request_fun: fn _payload, _headers ->
                      {:ok,
                       %{
@@ -1893,7 +1962,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert :ok = Workspace.remove_issue_workspaces("MT-SSH-WS", "worker-01:2200")
 
       trace = File.read!(trace_file)
-      assert trace =~ "-p 2200 worker-01 bash -lc"
+      assert trace =~ "-p 2200 worker-01 /bin/bash --noprofile --norc -c"
       assert trace =~ "__SYMPHONY_AFFINITY__"
       assert trace =~ "__SYMPHONY_WORKSPACE__"
       assert trace =~ "~/.symphony-remote-workspaces/MT-SSH-WS"

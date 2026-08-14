@@ -5,7 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
-  alias SymphonyElixir.{ParkedProjection, RunLedger}
+  alias SymphonyElixir.{ParkedProjection, RunLedger, RuntimeReadiness, StartupAttestation}
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -16,20 +16,29 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:ok, [:candidate]}
     end
 
+    def fetch_candidate_issues(_context), do: fetch_candidate_issues()
+
     def fetch_issues_by_states(states) do
       send(self(), {:fetch_issues_by_states_called, states})
       {:ok, states}
     end
+
+    def fetch_issues_by_states(states, _context), do: fetch_issues_by_states(states)
 
     def fetch_issue_states_by_ids(issue_ids) do
       send(self(), {:fetch_issue_states_by_ids_called, issue_ids})
       {:ok, issue_ids}
     end
 
+    def fetch_issue_states_by_ids(issue_ids, _context), do: fetch_issue_states_by_ids(issue_ids)
+
     def fetch_comments_since(issue_id, created_after) do
       send(self(), {:fetch_comments_since_called, issue_id, created_after})
       {:ok, [:comment]}
     end
+
+    def fetch_comments_since(issue_id, created_after, _context),
+      do: fetch_comments_since(issue_id, created_after)
 
     def graphql(query, variables) do
       send(self(), {:graphql_called, query, variables})
@@ -43,6 +52,8 @@ defmodule SymphonyElixir.ExtensionsTest do
           Process.get({__MODULE__, :graphql_result})
       end
     end
+
+    def graphql(query, variables, _opts), do: graphql(query, variables)
   end
 
   defmodule SlowOrchestrator do
@@ -158,6 +169,16 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     File.write!(Workflow.workflow_file_path(), "---\ntracker: [\n---\nBroken prompt\n")
+
+    workflow_store_pid = Process.whereis(WorkflowStore)
+    snapshot = WorkflowStore.current_with_authority()
+
+    assert {:ok, %{prompt: "Second prompt"}, authority, tracker_authority} = snapshot
+
+    assert {^workflow_store_pid, _authority_epoch} = authority
+    assert {^workflow_store_pid, _tracker_authority_epoch} = tracker_authority
+    assert ^tracker_authority = WorkflowStore.tracker_authority_generation()
+
     assert {:error, _reason} = WorkflowStore.force_reload()
     assert {:ok, %{prompt: "Second prompt"}} = Workflow.current()
 
@@ -166,9 +187,64 @@ defmodule SymphonyElixir.ExtensionsTest do
     Workflow.set_workflow_file_path(third_workflow)
     assert {:ok, %{prompt: "Third prompt"}} = Workflow.current()
 
+    assert {:ok, %{prompt: "Third prompt"}, authority_generation, tracker_authority_generation} =
+             WorkflowStore.current_with_authority()
+
+    assert {^workflow_store_pid, _authority_epoch} = authority_generation
+    assert {^workflow_store_pid, _tracker_authority_epoch} = tracker_authority_generation
+
     assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
     assert {:ok, %{prompt: "Third prompt"}} = WorkflowStore.current()
     assert :ok = WorkflowStore.force_reload()
+
+    assert {:ok, %{prompt: "Third prompt"}, {:standalone, _authority_contract}, {:standalone, _tracker_authority_contract}} =
+             WorkflowStore.current_with_authority()
+
+    assert {:standalone,
+            %{
+              kind: "linear",
+              endpoint: "https://api.linear.app/graphql",
+              api_key_selector: "token",
+              webhook_secret_selector: nil,
+              project_slug: "project",
+              operator_user_ids: []
+            }} = WorkflowStore.authority_generation()
+
+    assert {:standalone,
+            %{
+              kind: "linear",
+              endpoint: "https://api.linear.app/graphql",
+              api_key_selector: "token",
+              webhook_secret_selector: nil,
+              project_slug: "project"
+            }} = WorkflowStore.tracker_authority_generation()
+
+    invalid_tracker_path =
+      Path.join(Path.dirname(third_workflow), "INVALID_TRACKER_AUTHORITY_WORKFLOW.md")
+
+    File.write!(
+      invalid_tracker_path,
+      "---\ntracker: []\n---\n## Symphony Runtime Prompt\nInvalid tracker authority fixture\n"
+    )
+
+    Workflow.set_workflow_file_path(invalid_tracker_path)
+    assert {:standalone, {:invalid_tracker, []}} = WorkflowStore.authority_generation()
+    assert {:standalone, {:invalid_tracker, []}} = WorkflowStore.tracker_authority_generation()
+
+    missing_path = Path.join(Path.dirname(third_workflow), "MISSING_AUTHORITY_WORKFLOW.md")
+    Workflow.set_workflow_file_path(missing_path)
+
+    assert {:standalone, {:unavailable, {:missing_workflow_file, ^missing_path, :enoent}}} =
+             WorkflowStore.authority_generation()
+
+    assert {:standalone, {:unavailable, {:missing_workflow_file, ^missing_path, :enoent}}} =
+             WorkflowStore.tracker_authority_generation()
+
+    assert_raise ArgumentError, ~r/Missing WORKFLOW/, fn ->
+      Config.settings_with_authority!()
+    end
+
+    Workflow.set_workflow_file_path(third_workflow)
     assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
   end
 
@@ -177,6 +253,630 @@ defmodule SymphonyElixir.ExtensionsTest do
     Workflow.set_workflow_file_path(missing_path)
 
     assert {:stop, {:missing_workflow_file, ^missing_path, :enoent}} = WorkflowStore.init([])
+  end
+
+  test "workflow store stamp hashes the exact bytes used for its parsed snapshot" do
+    ensure_workflow_store_running()
+    workflow_path = Workflow.workflow_file_path()
+
+    write_workflow_file!(workflow_path, prompt: "Immutable snapshot B")
+    assert :ok = WorkflowStore.force_reload()
+
+    content = File.read!(workflow_path)
+    state = :sys.get_state(WorkflowStore)
+
+    assert state.stamp == :crypto.hash(:sha256, content)
+    assert state.workflow.prompt == "Immutable snapshot B"
+  end
+
+  test "workflow store rejects a startup snapshot that differs from the admitted digest" do
+    workflow_path = Workflow.workflow_file_path()
+    content = File.read!(workflow_path)
+    actual_digest = :sha256 |> :crypto.hash(content) |> Base.encode16(case: :lower)
+    expected_digest = String.duplicate("0", 64)
+    previous_digest = System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    previous_attestation_path = System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+    previous_managed_project = System.get_env("SYMPHONY_MANAGED_PROJECT")
+    attestation_path = Path.join(Path.dirname(workflow_path), "restart-attestation")
+    symlink_target = Path.join(Path.dirname(workflow_path), "restart-attestation-target")
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", previous_digest)
+      restore_env("SYMPHONY_STARTUP_ATTESTATION_PATH", previous_attestation_path)
+      restore_env("SYMPHONY_MANAGED_PROJECT", previous_managed_project)
+    end)
+
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", actual_digest)
+    assert {:ok, state} = WorkflowStore.init([])
+    assert state.stamp == :crypto.hash(:sha256, content)
+
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", expected_digest)
+    System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", attestation_path)
+    System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-test")
+    File.write!(attestation_path, "stale runtime evidence")
+
+    assert {:stop, {:workflow_digest_mismatch, ^expected_digest, ^actual_digest}} =
+             WorkflowStore.init([])
+
+    refute File.exists?(attestation_path)
+
+    File.write!(symlink_target, "do not remove")
+    File.ln_s!(symlink_target, attestation_path)
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", "not-a-sha256")
+    assert {:stop, {:invalid_expected_workflow_sha256, "not-a-sha256"}} = WorkflowStore.init([])
+    assert File.lstat!(attestation_path).type == :symlink
+    assert File.read!(symlink_target) == "do not remove"
+  end
+
+  test "startup attestation proves the verified digest and retains restart authority" do
+    ensure_workflow_store_running()
+    workflow_path = Workflow.workflow_file_path()
+    attestation_path = Path.join(Path.dirname(workflow_path), "startup-attestation")
+    workflow_digest = WorkflowStore.startup_digest()
+    runtime_digest = String.duplicate("a", 64)
+    previous_digest = System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    previous_runtime_digest = System.get_env("SYMPHONY_EXPECTED_RUNTIME_SHA256")
+    previous_attestation_path = System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", previous_digest)
+      restore_env("SYMPHONY_EXPECTED_RUNTIME_SHA256", previous_runtime_digest)
+      restore_env("SYMPHONY_STARTUP_ATTESTATION_PATH", previous_attestation_path)
+    end)
+
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest)
+    System.put_env("SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest)
+    System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", attestation_path)
+
+    assert {:ok, attestation_pid} = StartupAttestation.start_link([])
+    GenServer.stop(attestation_pid)
+    assert File.stat!(attestation_path).mode == 0o100600
+
+    attestation =
+      attestation_path
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Map.new(fn line -> List.to_tuple(String.split(line, "=", parts: 2)) end)
+
+    assert attestation["protocol"] == "3"
+    assert attestation["pid"] == System.pid()
+    assert attestation["process_start"] != ""
+    assert attestation["workflow_sha256"] == workflow_digest
+    assert attestation["runtime_sha256"] == runtime_digest
+    assert attestation["execution_sha256"] == "unmanaged"
+    assert System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256") == workflow_digest
+    assert System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH") == attestation_path
+
+    write_workflow_file!(workflow_path, prompt: "Post-attestation hot reload")
+    assert :ok = WorkflowStore.force_reload()
+    assert {:ok, %{prompt: "Post-attestation hot reload"}} = WorkflowStore.current()
+  end
+
+  test "application admits the runtime before side effects and restarts dependent authority together" do
+    ensure_workflow_store_running()
+
+    child_ids =
+      SymphonyElixir.Application.child_specs()
+      |> Enum.map(&Supervisor.child_spec(&1, []).id)
+
+    workflow_index = Enum.find_index(child_ids, &(&1 == WorkflowStore))
+    attestation_index = Enum.find_index(child_ids, &(&1 == StartupAttestation))
+    task_supervisor_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.TaskSupervisor))
+    poll_guard_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.PollGuardSupervisor))
+    orchestrator_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.Orchestrator))
+    http_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.HttpServer))
+    status_index = Enum.find_index(child_ids, &(&1 == SymphonyElixir.StatusDashboard))
+    readiness_index = Enum.find_index(child_ids, &(&1 == RuntimeReadiness))
+
+    assert SymphonyElixir.Application.supervisor_strategy() == :rest_for_one
+    assert Supervisor.child_spec(StartupAttestation, []).restart == :permanent
+    assert workflow_index < attestation_index
+    assert attestation_index < task_supervisor_index
+    assert attestation_index < poll_guard_index
+    assert task_supervisor_index < orchestrator_index
+    assert poll_guard_index < orchestrator_index
+    assert attestation_index < orchestrator_index
+    assert attestation_index < http_index
+    assert http_index < readiness_index
+    assert status_index < readiness_index
+
+    workflow_digest = WorkflowStore.startup_digest()
+    {runtime_path, runtime_digest} = executing_escript_evidence()
+    execution_digest = String.duplicate("e", 64)
+    state_dir = Path.dirname(Workflow.workflow_file_path())
+    admission_path = Path.join(state_dir, "restart-startup-admission")
+    readiness_path = Path.join(state_dir, "restart-runtime-readiness")
+
+    managed_env = [
+      {"SYMPHONY_MANAGED_PROJECT", "managed-restart-test"},
+      {"SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest},
+      {"SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest},
+      {"SYMPHONY_EXPECTED_EXECUTION_SHA256", execution_digest},
+      {"SYMPHONY_VERIFIED_EXECUTION_SHA256", execution_digest},
+      {"SYMPHONY_RUNTIME_IMAGE_PATH", runtime_path},
+      {"SYMPHONY_STARTUP_ATTESTATION_PATH", admission_path},
+      {"SYMPHONY_RUNTIME_READINESS_PATH", readiness_path}
+    ]
+
+    previous_env = Map.new(managed_env, fn {name, _value} -> {name, System.get_env(name)} end)
+
+    on_exit(fn ->
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+    end)
+
+    Enum.each(managed_env, fn {name, value} -> System.put_env(name, value) end)
+    File.write!(readiness_path, "stale readiness")
+
+    old_workflow_store = Process.whereis(WorkflowStore)
+    old_attestation = supervisor_child_pid(StartupAttestation)
+    old_task_supervisor = Process.whereis(SymphonyElixir.TaskSupervisor)
+    old_poll_guard = Process.whereis(SymphonyElixir.PollGuardSupervisor)
+    old_orchestrator = Process.whereis(SymphonyElixir.Orchestrator)
+    old_readiness = supervisor_child_pid(RuntimeReadiness)
+
+    task = fn -> Process.sleep(:infinity) end
+    {:ok, task_pid} = Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, task)
+    {:ok, guard_pid} = DynamicSupervisor.start_child(SymphonyElixir.PollGuardSupervisor, {Task, task})
+    task_ref = Process.monitor(task_pid)
+    guard_ref = Process.monitor(guard_pid)
+
+    Process.exit(old_workflow_store, :kill)
+
+    assert_receive {:DOWN, ^task_ref, :process, ^task_pid, _reason}, 1_000
+    assert_receive {:DOWN, ^guard_ref, :process, ^guard_pid, _reason}, 1_000
+
+    assert_eventually(fn ->
+      new_workflow_store = Process.whereis(WorkflowStore)
+      new_attestation = supervisor_child_pid(StartupAttestation)
+      new_task_supervisor = Process.whereis(SymphonyElixir.TaskSupervisor)
+      new_poll_guard = Process.whereis(SymphonyElixir.PollGuardSupervisor)
+      new_orchestrator = Process.whereis(SymphonyElixir.Orchestrator)
+      new_readiness = supervisor_child_pid(RuntimeReadiness)
+
+      Enum.all?(
+        [
+          {new_workflow_store, old_workflow_store},
+          {new_attestation, old_attestation},
+          {new_task_supervisor, old_task_supervisor},
+          {new_poll_guard, old_poll_guard},
+          {new_orchestrator, old_orchestrator},
+          {new_readiness, old_readiness}
+        ],
+        fn {new_pid, old_pid} -> is_pid(new_pid) and new_pid != old_pid and Process.alive?(new_pid) end
+      )
+    end)
+
+    assert File.read!(admission_path) =~ "protocol=3\n"
+    assert File.read!(readiness_path) =~ "protocol=3\n"
+    assert File.read!(readiness_path) =~ "runtime_sha256=#{runtime_digest}\n"
+    assert File.read!(readiness_path) =~ "execution_sha256=#{execution_digest}\n"
+  end
+
+  test "runtime readiness is distinct from pre-IO startup admission" do
+    ensure_workflow_store_running()
+    workflow_digest = WorkflowStore.startup_digest()
+    {runtime_path, runtime_digest} = executing_escript_evidence()
+    execution_digest = String.duplicate("e", 64)
+    state_dir = Path.dirname(Workflow.workflow_file_path())
+    admission_path = Path.join(state_dir, "startup-admission")
+    readiness_path = Path.join(state_dir, "runtime-readiness")
+
+    env = [
+      {"SYMPHONY_MANAGED_PROJECT", "managed-readiness-test"},
+      {"SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest},
+      {"SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest},
+      {"SYMPHONY_EXPECTED_EXECUTION_SHA256", execution_digest},
+      {"SYMPHONY_VERIFIED_EXECUTION_SHA256", execution_digest},
+      {"SYMPHONY_RUNTIME_IMAGE_PATH", runtime_path},
+      {"SYMPHONY_STARTUP_ATTESTATION_PATH", admission_path},
+      {"SYMPHONY_RUNTIME_READINESS_PATH", readiness_path}
+    ]
+
+    previous_env = Map.new(env, fn {name, _value} -> {name, System.get_env(name)} end)
+
+    on_exit(fn ->
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+    end)
+
+    Enum.each(env, fn {name, value} -> System.put_env(name, value) end)
+
+    assert {:ok, admission} =
+             StartupAttestation.admit(process_start_result: {"Fri Aug 14 12:00:00 2026\n", 0})
+
+    assert File.exists?(admission_path)
+    refute File.exists?(readiness_path)
+    assert {:ok, %{path: ^readiness_path}} = RuntimeReadiness.attest(admission: admission)
+
+    readiness = File.read!(readiness_path)
+    assert readiness =~ "protocol=3\n"
+    assert readiness =~ "workflow_sha256=#{workflow_digest}\n"
+    assert readiness =~ "runtime_sha256=#{runtime_digest}\n"
+    assert readiness =~ "execution_sha256=#{execution_digest}\n"
+  end
+
+  test "startup admission fails closed on unsafe or unreadable prior readiness" do
+    state_dir = Path.dirname(Workflow.workflow_file_path())
+    symlink_target = Path.join(state_dir, "readiness-target")
+    readiness_path = Path.join(state_dir, "unsafe-readiness")
+    previous_path = System.get_env("SYMPHONY_RUNTIME_READINESS_PATH")
+    previous_managed_project = System.get_env("SYMPHONY_MANAGED_PROJECT")
+    previous_digest = System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_RUNTIME_READINESS_PATH", previous_path)
+      restore_env("SYMPHONY_MANAGED_PROJECT", previous_managed_project)
+      restore_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", previous_digest)
+      Process.flag(:trap_exit, previous_trap_exit)
+    end)
+
+    File.write!(symlink_target, "preserve")
+    File.ln_s!(symlink_target, readiness_path)
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", readiness_path)
+
+    assert {:error, :unsafe_runtime_readiness_path} = StartupAttestation.start_link()
+    assert File.read!(symlink_target) == "preserve"
+
+    File.rm!(readiness_path)
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", Path.join(state_dir, "missing-readiness"))
+    assert {:ok, missing_path_pid} = StartupAttestation.start_link()
+    GenServer.stop(missing_path_pid)
+
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", String.duplicate("x", 5_000))
+
+    assert {:error, {:runtime_readiness_invalidation_failed, _reason}} =
+             StartupAttestation.start_link()
+
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", Path.join(state_dir, "missing-again"))
+    System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-admission-error-test")
+    System.delete_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    assert {:error, :missing_managed_startup_digest} = StartupAttestation.start_link()
+  end
+
+  test "managed admission measures the executing runtime image instead of trusting its claim" do
+    ensure_workflow_store_running()
+    state_dir = Path.dirname(Workflow.workflow_file_path())
+    runtime_image = Path.join(state_dir, "measured-runtime-image")
+    other_runtime = Path.join(state_dir, "other-runtime-image")
+    admission_path = Path.join(state_dir, "measured-runtime-admission")
+    workflow_digest = WorkflowStore.startup_digest()
+
+    env_names = [
+      "SYMPHONY_MANAGED_PROJECT",
+      "SYMPHONY_EXPECTED_WORKFLOW_SHA256",
+      "SYMPHONY_EXPECTED_RUNTIME_SHA256",
+      "SYMPHONY_EXPECTED_EXECUTION_SHA256",
+      "SYMPHONY_VERIFIED_EXECUTION_SHA256",
+      "SYMPHONY_RUNTIME_IMAGE_PATH",
+      "SYMPHONY_STARTUP_ATTESTATION_PATH"
+    ]
+
+    previous_env = Map.new(env_names, fn name -> {name, System.get_env(name)} end)
+
+    on_exit(fn ->
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+    end)
+
+    File.write!(runtime_image, "runtime-a")
+    File.chmod!(runtime_image, 0o500)
+    runtime_digest = runtime_image |> File.read!() |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
+
+    System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-runtime-measurement-test")
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest)
+    System.put_env("SYMPHONY_EXPECTED_RUNTIME_SHA256", runtime_digest)
+    execution_digest = String.duplicate("e", 64)
+    System.put_env("SYMPHONY_EXPECTED_EXECUTION_SHA256", execution_digest)
+    System.put_env("SYMPHONY_VERIFIED_EXECUTION_SHA256", execution_digest)
+    System.put_env("SYMPHONY_RUNTIME_IMAGE_PATH", runtime_image)
+    System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", admission_path)
+
+    opts = [
+      process_start_result: {"Fri Aug 14 12:00:00 2026\n", 0},
+      script_name_result: {:ok, runtime_image}
+    ]
+
+    assert {:ok, %{runtime_sha256: ^runtime_digest, execution_sha256: ^execution_digest}} =
+             StartupAttestation.admit(opts)
+
+    System.delete_env("SYMPHONY_VERIFIED_EXECUTION_SHA256")
+    assert {:error, :missing_verified_runtime_identity} = StartupAttestation.admit(opts)
+
+    System.put_env("SYMPHONY_VERIFIED_EXECUTION_SHA256", String.duplicate("f", 64))
+
+    assert {:error, {:verified_runtime_identity_mismatch, ^execution_digest, _actual}} =
+             StartupAttestation.admit(opts)
+
+    System.put_env("SYMPHONY_VERIFIED_EXECUTION_SHA256", execution_digest)
+    System.delete_env("SYMPHONY_EXPECTED_EXECUTION_SHA256")
+    assert {:error, :missing_managed_runtime_identity} = StartupAttestation.admit(opts)
+    System.put_env("SYMPHONY_EXPECTED_EXECUTION_SHA256", execution_digest)
+
+    File.chmod!(runtime_image, 0o600)
+    File.write!(runtime_image, "runtime-b")
+
+    assert {:error, {:runtime_image_digest_mismatch, ^runtime_digest, actual_digest}} =
+             StartupAttestation.admit(opts)
+
+    assert actual_digest != runtime_digest
+
+    File.write!(other_runtime, "runtime-a")
+
+    assert {:error, {:runtime_image_path_mismatch, _, _}} =
+             StartupAttestation.admit(Keyword.put(opts, :script_name_result, {:ok, other_runtime}))
+
+    System.delete_env("SYMPHONY_RUNTIME_IMAGE_PATH")
+    assert {:error, :missing_managed_runtime_image_path} = StartupAttestation.admit(opts)
+
+    System.put_env("SYMPHONY_RUNTIME_IMAGE_PATH", runtime_image)
+
+    assert {:error, {:runtime_script_name_unavailable, :unavailable}} =
+             StartupAttestation.admit(Keyword.put(opts, :script_name_result, {:error, :unavailable}))
+
+    assert {:error, :runtime_script_name_unavailable} =
+             StartupAttestation.admit(Keyword.put(opts, :script_name_result, :invalid))
+
+    assert {:error, {:runtime_image_read_failed, :eacces}} =
+             StartupAttestation.admit(Keyword.put(opts, :runtime_read_result, {:error, :eacces}))
+
+    File.rm!(runtime_image)
+    File.ln_s!(other_runtime, runtime_image)
+    assert {:error, :unsafe_managed_runtime_image} = StartupAttestation.admit(opts)
+
+    File.rm!(runtime_image)
+    assert {:error, {:runtime_image_stat_failed, :enoent}} = StartupAttestation.admit(opts)
+  end
+
+  test "runtime readiness fails closed and removes only its own regular evidence" do
+    ensure_workflow_store_running()
+    state_dir = Path.dirname(Workflow.workflow_file_path())
+    readiness_path = Path.join(state_dir, "runtime-readiness-lifecycle")
+    symlink_target = Path.join(state_dir, "runtime-readiness-target")
+    runtime_digest = String.duplicate("d", 64)
+    execution_digest = String.duplicate("e", 64)
+    workflow_digest = WorkflowStore.startup_digest()
+
+    admission = %{
+      process_start: "Fri Aug 14 12:00:00 2026",
+      runtime_sha256: runtime_digest,
+      execution_sha256: execution_digest,
+      workflow_sha256: workflow_digest
+    }
+
+    env = [
+      {"SYMPHONY_MANAGED_PROJECT", "managed-runtime-readiness-test"},
+      {"SYMPHONY_RUNTIME_READINESS_PATH", readiness_path}
+    ]
+
+    previous_env = Map.new(env, fn {name, _value} -> {name, System.get_env(name)} end)
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    on_exit(fn ->
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+      Process.flag(:trap_exit, previous_trap_exit)
+    end)
+
+    Enum.each(env, fn {name, value} -> System.put_env(name, value) end)
+
+    System.delete_env("SYMPHONY_RUNTIME_READINESS_PATH")
+    assert {:error, :missing_runtime_readiness_path} = RuntimeReadiness.attest()
+
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", readiness_path)
+
+    assert {:error, :invalid_startup_admission_evidence} =
+             RuntimeReadiness.attest(admission: %{})
+
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", state_dir)
+
+    assert {:error, {:runtime_readiness_write_failed, _reason}} =
+             RuntimeReadiness.attest(admission: admission)
+
+    missing_parent_path = Path.join(state_dir, "missing-readiness-parent/runtime-readiness")
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", missing_parent_path)
+
+    assert {:error, {:runtime_readiness_write_failed, :enoent}} =
+             RuntimeReadiness.attest(admission: admission)
+
+    System.put_env("SYMPHONY_RUNTIME_READINESS_PATH", readiness_path)
+    assert {:ok, readiness_pid} = RuntimeReadiness.start_link(admission: admission)
+    assert File.exists?(readiness_path)
+    GenServer.stop(readiness_pid)
+    refute File.exists?(readiness_path)
+
+    assert {:ok, missing_file_pid} = RuntimeReadiness.start_link(admission: admission)
+    File.rm!(readiness_path)
+    GenServer.stop(missing_file_pid)
+
+    assert {:ok, symlink_pid} = RuntimeReadiness.start_link(admission: admission)
+    File.rm!(readiness_path)
+    File.write!(symlink_target, "preserve")
+    File.ln_s!(symlink_target, readiness_path)
+    GenServer.stop(symlink_pid)
+    assert File.lstat!(readiness_path).type == :symlink
+    assert File.read!(symlink_target) == "preserve"
+
+    assert :ok =
+             RuntimeReadiness.terminate(:normal, %{path: String.duplicate("x", 5_000)})
+
+    System.delete_env("SYMPHONY_MANAGED_PROJECT")
+    assert {:ok, unmanaged_pid} = RuntimeReadiness.start_link()
+    GenServer.stop(unmanaged_pid)
+
+    System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-runtime-readiness-test")
+    System.delete_env("SYMPHONY_RUNTIME_READINESS_PATH")
+    assert {:error, :missing_runtime_readiness_path} = RuntimeReadiness.start_link()
+  end
+
+  test "orchestrator cannot replace admitted authority during an A-B-A startup race" do
+    ensure_workflow_store_running()
+    workflow_path = Workflow.workflow_file_path()
+    run_ledger_path = Path.join(Path.dirname(workflow_path), "startup-race-ledger.jsonl")
+
+    write_workflow_file!(workflow_path,
+      tracker_kind: "memory",
+      tracker_api_token: "authority-a-token",
+      prompt: "Authority A"
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+    assert {:ok, admission} = StartupAttestation.admit()
+
+    pinned_settings =
+      {admission.settings, admission.authority_generation, admission.tracker_authority_generation}
+
+    write_workflow_file!(workflow_path,
+      tracker_kind: "memory",
+      tracker_api_token: "authority-b-token",
+      prompt: "Authority B"
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+
+    orchestrator_name = :"startup_race_orchestrator_#{System.unique_integer([:positive])}"
+
+    assert {:ok, orchestrator_pid} =
+             Orchestrator.start_link(
+               name: orchestrator_name,
+               run_ledger_path: run_ledger_path,
+               startup_settings_fn: fn -> pinned_settings end
+             )
+
+    pinned_context = :sys.get_state(orchestrator_pid).operator_commands.tracker_context
+    refute Tracker.authority_valid?(pinned_context)
+    assert {:error, :tracker_authority_invalidated} = Tracker.fetch_candidate_issues(pinned_context)
+
+    write_workflow_file!(workflow_path,
+      tracker_kind: "memory",
+      tracker_api_token: "authority-a-token",
+      prompt: "Authority A"
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+    refute Tracker.authority_valid?(pinned_context)
+    assert {:error, :tracker_authority_invalidated} = Tracker.fetch_candidate_issues(pinned_context)
+    GenServer.stop(orchestrator_pid)
+  end
+
+  test "startup attestation fails closed when its managed path is missing or unwritable" do
+    ensure_workflow_store_running()
+    workflow_digest = WorkflowStore.startup_digest()
+    previous_digest = System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    previous_attestation_path = System.get_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+    previous_managed_project = System.get_env("SYMPHONY_MANAGED_PROJECT")
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", previous_digest)
+      restore_env("SYMPHONY_STARTUP_ATTESTATION_PATH", previous_attestation_path)
+      restore_env("SYMPHONY_MANAGED_PROJECT", previous_managed_project)
+    end)
+
+    System.delete_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+    System.delete_env("SYMPHONY_STARTUP_ATTESTATION_PATH")
+    System.delete_env("SYMPHONY_MANAGED_PROJECT")
+    assert {:ok, unmanaged_attestation_pid} = StartupAttestation.start_link()
+    GenServer.stop(unmanaged_attestation_pid)
+
+    System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-test")
+    assert {:error, :missing_managed_startup_digest} = StartupAttestation.admit([])
+    System.delete_env("SYMPHONY_MANAGED_PROJECT")
+
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", workflow_digest)
+    assert {:error, :missing_startup_attestation_path} = StartupAttestation.admit([])
+
+    System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", Path.dirname(Workflow.workflow_file_path()))
+    assert {:error, {:startup_attestation_write_failed, _reason}} = StartupAttestation.admit([])
+
+    missing_parent_path =
+      Workflow.workflow_file_path()
+      |> Path.dirname()
+      |> Path.join("missing-parent/startup-attestation")
+
+    System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", missing_parent_path)
+    assert {:error, {:startup_attestation_write_failed, :enoent}} = StartupAttestation.admit([])
+
+    valid_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "failed-startup-attestation")
+    System.put_env("SYMPHONY_STARTUP_ATTESTATION_PATH", valid_path)
+
+    assert {:error, :empty_process_start} =
+             StartupAttestation.admit(process_start_result: {"\n", 0})
+
+    assert {:error, {:process_start_failed, 1, "ps failed"}} =
+             StartupAttestation.admit(process_start_result: {"ps failed\n", 1})
+
+    mismatched_digest = String.duplicate("0", 64)
+    System.put_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256", mismatched_digest)
+
+    assert {:error, {:startup_attestation_digest_mismatch, ^mismatched_digest, ^workflow_digest}} =
+             StartupAttestation.admit([])
+  end
+
+  test "workflow store keeps last good authority across schema-invalid YAML reloads" do
+    ensure_workflow_store_running()
+    workflow_path = Workflow.workflow_file_path()
+
+    write_workflow_file!(workflow_path,
+      prompt: "Schema validated snapshot",
+      tracker_operator_user_ids: ["operator-1"]
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:ok, good_workflow, authority_generation, tracker_authority_generation} =
+             WorkflowStore.current_with_authority()
+
+    invalid_workflows = [
+      """
+      ---
+      tracker:
+        kind: linear
+        operator_user_ids: not-a-list
+      ---
+      ## Symphony Runtime Prompt
+      Invalid tracker schema
+      """,
+      """
+      ---
+      agent:
+        max_run_tokens: 0
+      ---
+      ## Symphony Runtime Prompt
+      Invalid unrelated schema
+      """
+    ]
+
+    Enum.each(invalid_workflows, fn invalid_workflow ->
+      File.write!(workflow_path, invalid_workflow)
+
+      assert {:error, {:invalid_workflow_config, _message}} =
+               WorkflowStore.force_reload()
+
+      assert {:ok, ^good_workflow, ^authority_generation, ^tracker_authority_generation} =
+               WorkflowStore.current_with_authority()
+
+      assert Process.alive?(Process.whereis(WorkflowStore))
+    end)
+  end
+
+  test "webhook secret selector changes invalidate pinned tracker authority" do
+    ensure_workflow_store_running()
+    workflow_path = Workflow.workflow_file_path()
+
+    write_workflow_file!(workflow_path,
+      tracker_kind: "memory",
+      tracker_webhook_secret: "$SYMP_TEST_WEBHOOK_SECRET_A"
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+    context = Tracker.current_poll_context()
+    initial_generation = WorkflowStore.tracker_authority_generation()
+
+    write_workflow_file!(workflow_path,
+      tracker_kind: "memory",
+      tracker_webhook_secret: "$SYMP_TEST_WEBHOOK_SECRET_B"
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+    refute WorkflowStore.tracker_authority_generation() == initial_generation
+    refute Tracker.authority_valid?(context)
   end
 
   test "workflow store start_link and poll callback cover missing-file error paths" do
@@ -233,37 +933,44 @@ defmodule SymphonyElixir.ExtensionsTest do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
 
     assert Config.settings!().tracker.kind == "memory"
-    assert SymphonyElixir.Tracker.adapter() == Memory
-    assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_candidate_issues()
-    assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42])
-    assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
-    assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
-    assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
+    context = SymphonyElixir.Tracker.current_poll_context()
+    assert SymphonyElixir.Tracker.adapter(context) == Memory
+    assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_candidate_issues(context)
+
+    assert {:ok, [^issue]} =
+             SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42], context)
+
+    assert {:ok, [^issue]} =
+             SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"], context)
+
+    assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment", context)
+    assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done", context)
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
-    assert :ok = Memory.create_comment("issue-1", "quiet")
-    assert :ok = Memory.update_issue_state("issue-1", "Quiet")
+    assert :ok = Memory.create_comment("issue-1", "quiet", context)
+    assert :ok = Memory.update_issue_state("issue-1", "Quiet", context)
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
-    assert SymphonyElixir.Tracker.adapter() == Adapter
+    assert SymphonyElixir.Tracker.adapter(SymphonyElixir.Tracker.current_poll_context()) == Adapter
   end
 
   test "linear adapter delegates reads and validates mutation responses" do
     Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+    context = SymphonyElixir.Tracker.current_poll_context()
 
-    assert {:ok, [:candidate]} = Adapter.fetch_candidate_issues()
+    assert {:ok, [:candidate]} = Adapter.fetch_candidate_issues(context)
     assert_receive :fetch_candidate_issues_called
 
-    assert {:ok, ["Todo"]} = Adapter.fetch_issues_by_states(["Todo"])
+    assert {:ok, ["Todo"]} = Adapter.fetch_issues_by_states(["Todo"], context)
     assert_receive {:fetch_issues_by_states_called, ["Todo"]}
 
-    assert {:ok, ["issue-1"]} = Adapter.fetch_issue_states_by_ids(["issue-1"])
+    assert {:ok, ["issue-1"]} = Adapter.fetch_issue_states_by_ids(["issue-1"], context)
     assert_receive {:fetch_issue_states_by_ids_called, ["issue-1"]}
 
     created_after = ~U[2026-08-03 10:00:00Z]
-    assert {:ok, [:comment]} = Adapter.fetch_comments_since("issue-1", created_after)
+    assert {:ok, [:comment]} = Adapter.fetch_comments_since("issue-1", created_after, context)
     assert_receive {:fetch_comments_since_called, "issue-1", ^created_after}
 
     Process.put(
@@ -271,7 +978,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
     )
 
-    assert :ok = Adapter.create_comment("issue-1", "hello")
+    assert :ok = Adapter.create_comment("issue-1", "hello", context)
     assert_receive {:graphql_called, create_comment_query, %{body: "hello", issueId: "issue-1"}}
     assert create_comment_query =~ "commentCreate"
 
@@ -281,17 +988,17 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :comment_create_failed} =
-             Adapter.create_comment("issue-1", "broken")
+             Adapter.create_comment("issue-1", "broken", context)
 
     Process.put({FakeLinearClient, :graphql_result}, {:error, :boom})
 
-    assert {:error, :boom} = Adapter.create_comment("issue-1", "boom")
+    assert {:error, :boom} = Adapter.create_comment("issue-1", "boom", context)
 
     Process.put({FakeLinearClient, :graphql_result}, {:ok, %{"data" => %{}}})
-    assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "weird")
+    assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "weird", context)
 
     Process.put({FakeLinearClient, :graphql_result}, :unexpected)
-    assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "odd")
+    assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "odd", context)
 
     Process.put(
       {FakeLinearClient, :graphql_results},
@@ -306,7 +1013,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       ]
     )
 
-    assert :ok = Adapter.update_issue_state("issue-1", "Done")
+    assert :ok = Adapter.update_issue_state("issue-1", "Done", context)
     assert_receive {:graphql_called, state_lookup_query, %{issueId: "issue-1", stateName: "Done"}}
     assert state_lookup_query =~ "states"
 
@@ -328,14 +1035,14 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :issue_update_failed} =
-             Adapter.update_issue_state("issue-1", "Broken")
+             Adapter.update_issue_state("issue-1", "Broken", context)
 
     Process.put({FakeLinearClient, :graphql_results}, [{:error, :boom}])
 
-    assert {:error, :boom} = Adapter.update_issue_state("issue-1", "Boom")
+    assert {:error, :boom} = Adapter.update_issue_state("issue-1", "Boom", context)
 
     Process.put({FakeLinearClient, :graphql_results}, [{:ok, %{"data" => %{}}}])
-    assert {:error, :state_not_found} = Adapter.update_issue_state("issue-1", "Missing")
+    assert {:error, :state_not_found} = Adapter.update_issue_state("issue-1", "Missing", context)
 
     Process.put(
       {FakeLinearClient, :graphql_results},
@@ -350,7 +1057,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       ]
     )
 
-    assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Weird")
+    assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Weird", context)
 
     Process.put(
       {FakeLinearClient, :graphql_results},
@@ -365,7 +1072,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       ]
     )
 
-    assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
+    assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd", context)
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do
@@ -1991,5 +2698,20 @@ defmodule SymphonyElixir.ExtensionsTest do
         {:error, {:already_started, _pid}} -> :ok
       end
     end
+  end
+
+  defp supervisor_child_pid(child_id) do
+    SymphonyElixir.Supervisor
+    |> Supervisor.which_children()
+    |> Enum.find_value(fn
+      {^child_id, pid, _type, _modules} when is_pid(pid) -> pid
+      _child -> nil
+    end)
+  end
+
+  defp executing_escript_evidence do
+    path = :escript.script_name() |> List.to_string() |> Path.expand()
+    digest = path |> File.read!() |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
+    {path, digest}
   end
 end

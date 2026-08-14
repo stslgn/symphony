@@ -61,7 +61,8 @@ defmodule SymphonyElixir.Workflow do
     end
   end
 
-  defp parse(content) do
+  @spec parse(binary()) :: {:ok, loaded_workflow()} | {:error, term()}
+  def parse(content) when is_binary(content) do
     {front_matter_lines, prompt_lines} = split_front_matter(content)
 
     case front_matter_yaml_to_map(front_matter_lines) do

@@ -5,13 +5,23 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   require Logger
   alias SymphonyElixir.Codex.{CapabilityPolicy, DynamicTool, ModelCatalog}
-  alias SymphonyElixir.{Config, ObservabilitySanitizer, PathSafety, SSH}
+  alias SymphonyElixir.{Config, ObservabilitySanitizer, PathSafety, SSH, Tracker}
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @worker_secret_env_names ~w(
+    LINEAR_API_KEY
+    LINEAR_WEBHOOK_SECRET
+    LINEAR_KEYCHAIN_SERVICE
+    LINEAR_KEYCHAIN_PATH
+    LINEAR_KEYCHAIN_ACCOUNT
+    LINEAR_WEBHOOK_KEYCHAIN_SERVICE
+    BASH_ENV
+    ENV
+  )
 
   @type session :: %{
           port: port(),
@@ -26,6 +36,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           reasoning_effort: String.t() | nil,
           model_catalog: ModelCatalog.t(),
           session_title: String.t(),
+          tracker_context: Tracker.PollContext.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil
         }
@@ -69,9 +80,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
     session_title = opts |> Keyword.get(:session_title, "Symphony worker") |> normalize_session_title()
 
-    with :ok <- Config.validate_runtime_capabilities(),
+    with {:ok, tracker_context} <- fetch_tracker_context(opts),
+         {:ok, secret_env_names} <- worker_secret_env_names(tracker_context),
+         :ok <- Config.validate_runtime_capabilities(),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host) do
+         {:ok, port} <- start_port(expanded_workspace, worker_host, secret_env_names) do
       metadata = port |> port_metadata(worker_host) |> Map.put(:session_title, session_title)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
@@ -100,6 +113,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            reasoning_effort: thread.reasoning_effort,
            model_catalog: thread.model_catalog,
            session_title: session_title,
+           tracker_context: tracker_context,
            workspace: expanded_workspace,
            worker_host: worker_host
          }}
@@ -108,6 +122,18 @@ defmodule SymphonyElixir.Codex.AppServer do
           stop_port(port)
           {:error, reason}
       end
+    end
+  end
+
+  defp fetch_tracker_context(opts) do
+    case Keyword.fetch(opts, :tracker_context) do
+      {:ok, %Tracker.PollContext{} = context} ->
+        if Tracker.authority_valid?(context),
+          do: {:ok, context},
+          else: {:error, :tracker_authority_invalidated}
+
+      _ ->
+        {:error, :tracker_context_required}
     end
   end
 
@@ -125,6 +151,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           reasoning_effort: reasoning_effort,
           model_catalog: model_catalog,
           session_title: session_title,
+          tracker_context: tracker_context,
           workspace: workspace
         },
         prompt,
@@ -133,9 +160,13 @@ defmodule SymphonyElixir.Codex.AppServer do
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
 
+    dynamic_tool_opts =
+      [tracker_context: tracker_context]
+      |> maybe_put_dynamic_tool_client(Keyword.get(opts, :linear_client))
+
     raw_tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments)
+        DynamicTool.execute(tool, arguments, dynamic_tool_opts)
       end)
 
     tool_executor = capability_checked_tool_executor(raw_tool_executor, capability_policy)
@@ -255,12 +286,19 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil) do
+  defp maybe_put_dynamic_tool_client(opts, linear_client) when is_function(linear_client, 3),
+    do: Keyword.put(opts, :linear_client, linear_client)
+
+  defp maybe_put_dynamic_tool_client(opts, _linear_client), do: opts
+
+  defp start_port(workspace, nil, secret_env_names) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
+      command = worker_launch_command(Config.settings!().codex.command, secret_env_names)
+
       port =
         Port.open(
           {:spawn_executable, String.to_charlist(executable)},
@@ -268,8 +306,9 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
+            args: [~c"-lc", String.to_charlist("exec " <> command)],
             cd: String.to_charlist(workspace),
+            env: scrubbed_worker_port_env(secret_env_names),
             line: @port_line_bytes
           ]
         )
@@ -278,18 +317,44 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace)
-    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+  defp start_port(workspace, worker_host, secret_env_names) when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, secret_env_names)
+
+    SSH.start_port(worker_host, remote_command,
+      line: @port_line_bytes,
+      env: scrubbed_worker_port_env(secret_env_names)
+    )
   end
 
-  defp remote_launch_command(workspace) when is_binary(workspace) do
+  defp remote_launch_command(workspace, secret_env_names) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
-      "exec #{Config.settings!().codex.command}"
+      "exec #{worker_launch_command(Config.settings!().codex.command, secret_env_names)}"
     ]
     |> Enum.join(" && ")
   end
+
+  defp worker_launch_command(command, secret_env_names) when is_binary(command) do
+    unset_args = Enum.map_join(secret_env_names, " ", &"-u #{&1}")
+    "/usr/bin/env #{unset_args} /bin/bash --noprofile --norc -c #{shell_escape(command)}"
+  end
+
+  defp scrubbed_worker_port_env(secret_env_names) do
+    Enum.map(secret_env_names, &{String.to_charlist(&1), false})
+  end
+
+  defp worker_secret_env_names(%Tracker.PollContext{} = tracker_context) do
+    selectors = [tracker_context.api_key_env_var, tracker_context.webhook_secret_env_var]
+
+    if Enum.all?(selectors, &valid_optional_env_name?/1) do
+      {:ok, Enum.uniq(@worker_secret_env_names ++ Enum.reject(selectors, &is_nil/1))}
+    else
+      {:error, :invalid_tracker_secret_selector}
+    end
+  end
+
+  defp valid_optional_env_name?(nil), do: true
+  defp valid_optional_env_name?(name), do: is_binary(name) and String.match?(name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
 
   defp port_metadata(port, worker_host) when is_port(port) do
     base_metadata =

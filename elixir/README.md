@@ -233,6 +233,52 @@ Notes:
   defaults to `[]`, which disables comment commands. The API-key identity (`user.isMe`) is always
   rejected even if listed, because workers can write comments with that same credential. Use a
   separate runner/service identity for `LINEAR_API_KEY` and allowlist only human operator user IDs.
+  The allowlist and raw tracker kind, endpoint, API-key selector, webhook-secret selector, and project
+  slug are pinned to the runner generation at startup. Every observed change advances a monotonic
+  authority generation. Operator-ID-only drift disables comment commands; tracker identity/scope
+  drift blocks every tracker request and discards in-flight poll results until restart, even if the
+  file is later restored.
+  Admitted polls, in-flight worker state checks, and worker-facing `linear_graphql` calls use the
+  immutable startup authority snapshot for the adapter, credential, endpoint, and project. Routing
+  assignee and active/terminal state sets are frozen per poll or worker session, so safe reloads
+  affect future work without changing an admitted decision. Every worker-side tracker call rechecks
+  the monotonic authority generation through a synchronous workflow refresh before every GraphQL
+  request, including viewer lookup, pagination, batching, reads, and mutations. The public tracker
+  facade, Linear client, and worker entrypoints require the admitted poll/session context; none mint
+  a replacement generation when it is missing. Missing or stale context fails before workspace
+  preparation, app-server port startup, or network I/O, and the network client never re-reads those
+  fields from hot-reloaded config.
+- A managed launcher sets `SYMPHONY_EXPECTED_WORKFLOW_SHA256` and
+  `SYMPHONY_EXPECTED_RUNTIME_SHA256` to the lowercase SHA-256 values of the exact workflow bytes and
+  generation-specific runtime image it admitted, and identifies that image with
+  `SYMPHONY_RUNTIME_IMAGE_PATH`. The launcher also pins
+  `SYMPHONY_EXPECTED_EXECUTION_SHA256`, a deterministic fingerprint of the loaded BEAM identities
+  for Symphony and the recursive graph of bundled application dependencies. `mix build` writes a
+  mode-0600 `bin/symphony.runtime-identity` manifest that binds the completed escript image digest
+  to that execution fingerprint. Manifest generation invokes the exact escript probe through an
+  explicit `env -i` allowlist, so inherited escript-emulator, Erlang-root, BEAM-loader, or
+  version-specific VM selectors cannot fabricate build evidence. The side-effect-free identity
+  probe reports both its own image
+  SHA-256 and its loaded-code fingerprint; the launcher accepts it only when the snapshot digest,
+  build manifest, and live probe all agree. Before application startup, Symphony computes the
+  execution fingerprint from loaded code and refuses an image/path A-B-A substitution even if the
+  pathname bytes are restored.
+  It also compares the workflow value with its single initial
+  snapshot and measures the named image bytes. With `SYMPHONY_MANAGED_PROJECT`,
+  `SYMPHONY_STARTUP_ATTESTATION_PATH` and
+  `SYMPHONY_RUNTIME_READINESS_PATH` are also mandatory. Immediately after `WorkflowStore`
+  verification and before Orchestrator or HTTP starts, Symphony atomically writes a mode-0600
+  protocol-3 startup-admission attestation. Orchestrator receives the exact immutable settings and
+  authority generations held by that live admission child; it cannot replace them with a later
+  workflow reload during startup. A separate mode-0600 protocol-3 runtime-readiness attestation is
+  written only after Orchestrator, HTTP, and status children initialize. Both attestations contain
+  the OS PID, locale-independent process start time, verified workflow digest, runtime-image digest,
+  and loaded-code execution digest. Missing or unwritable evidence fails closed. Under the
+  `:rest_for_one` supervisor,
+  `WorkflowStore` and the admission child precede both task supervisors and all side-effectful
+  children. Losing either authority boundary therefore terminates old agent, cleanup, and polling
+  tasks before a replacement Orchestrator starts, invalidates final readiness, and re-attests the
+  replacement generation. Ordinary in-process hot reload remains supported.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -322,6 +368,9 @@ mirrored external-thread comments, and oversized bodies are ignored. Commands ar
 an action that is not valid for the issue's current run/wait is recorded as rejected and has no
 scheduling effect. The durable ledger stores only bounded command identities, outcomes, and cursors,
 never the comment body. This makes repeated delivery and restart reconciliation idempotent.
+If the configured operator authority changes after startup, comment command reconciliation fails
+closed until the runner restarts with the new generation. Poll completion rechecks the generation
+before applying fetched comments.
 
 When an existing parked wait has no operator cursor during the first upgrade to this feature,
 Symphony initializes the cursor at upgrade time. Historical comments are not executed retroactively;

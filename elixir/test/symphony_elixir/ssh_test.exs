@@ -19,7 +19,7 @@ defmodule SymphonyElixir.SSHTest do
              SSH.run("root@[::1]:2200", "printf ok", stderr_to_stdout: true)
 
     trace = File.read!(trace_file)
-    assert trace =~ "-T -p 2200 root@[::1] bash -lc"
+    assert trace =~ "-T -p 2200 root@[::1] /bin/bash --noprofile --norc -c"
     assert trace =~ "printf ok"
   end
 
@@ -39,7 +39,7 @@ defmodule SymphonyElixir.SSHTest do
              SSH.run("::1:2200", "printf ok", stderr_to_stdout: true)
 
     trace = File.read!(trace_file)
-    assert trace =~ "-T ::1:2200 bash -lc"
+    assert trace =~ "-T ::1:2200 /bin/bash --noprofile --norc -c"
     refute trace =~ "-p 2200"
   end
 
@@ -63,7 +63,7 @@ defmodule SymphonyElixir.SSHTest do
 
     trace = File.read!(trace_file)
     assert trace =~ "-F /tmp/symphony-test-ssh-config"
-    assert trace =~ "-T -p 2222 localhost bash -lc"
+    assert trace =~ "-T -p 2222 localhost /bin/bash --noprofile --norc -c"
     assert trace =~ "echo ready"
   end
 
@@ -83,7 +83,7 @@ defmodule SymphonyElixir.SSHTest do
              SSH.run("root@127.0.0.1:2200", "printf ok", stderr_to_stdout: true)
 
     trace = File.read!(trace_file)
-    assert trace =~ "-T -p 2200 root@127.0.0.1 bash -lc"
+    assert trace =~ "-T -p 2200 root@127.0.0.1 /bin/bash --noprofile --norc -c"
     assert trace =~ "printf ok"
   end
 
@@ -128,7 +128,7 @@ defmodule SymphonyElixir.SSHTest do
     wait_for_trace!(trace_file)
 
     trace = File.read!(trace_file)
-    assert trace =~ "-T localhost bash -lc"
+    assert trace =~ "-T localhost /bin/bash --noprofile --norc -c"
     refute trace =~ " -F "
   end
 
@@ -154,12 +154,12 @@ defmodule SymphonyElixir.SSHTest do
     wait_for_trace!(trace_file)
 
     trace = File.read!(trace_file)
-    assert trace =~ "-T -p 2222 localhost bash -lc"
+    assert trace =~ "-T -p 2222 localhost /bin/bash --noprofile --norc -c"
   end
 
   test "remote_shell_command/1 escapes embedded single quotes" do
     assert SSH.remote_shell_command("printf 'hello'") ==
-             "bash -lc 'printf '\"'\"'hello'\"'\"''"
+             "/bin/bash --noprofile --norc -c 'printf '\"'\"'hello'\"'\"''"
   end
 
   defp install_fake_ssh!(test_root, trace_file, script \\ nil) do

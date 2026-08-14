@@ -67,7 +67,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:kind, :string)
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
       field(:api_key, :string)
+      field(:api_key_env_var, :string, virtual: true)
       field(:webhook_secret, :string)
+      field(:webhook_secret_env_var, :string, virtual: true)
       field(:project_slug, :string)
       field(:assignee, :string)
       field(:operator_user_ids, {:array, :string}, default: [])
@@ -93,6 +95,7 @@ defmodule SymphonyElixir.Config.Schema do
         ],
         empty_values: []
       )
+      |> validate_change(:api_key, &validate_optional_environment_reference/2)
       |> validate_format(:webhook_secret, ~r/^\$[A-Za-z_][A-Za-z0-9_]*$/, message: "must be an environment reference such as $LINEAR_WEBHOOK_SECRET")
       |> validate_change(:operator_user_ids, fn :operator_user_ids, user_ids ->
         if Enum.all?(user_ids, &(is_binary(&1) and String.trim(&1) != "")) do
@@ -102,6 +105,14 @@ defmodule SymphonyElixir.Config.Schema do
         end
       end)
     end
+
+    defp validate_optional_environment_reference(:api_key, "$" <> _rest = value) do
+      if String.match?(value, ~r/^\$[A-Za-z_][A-Za-z0-9_]*$/),
+        do: [],
+        else: [api_key: "must be a literal secret or an environment reference such as $LINEAR_API_KEY"]
+    end
+
+    defp validate_optional_environment_reference(_field, _value), do: []
   end
 
   defmodule Polling do
@@ -640,7 +651,9 @@ defmodule SymphonyElixir.Config.Schema do
   defp finalize_settings(settings) do
     tracker = %{
       settings.tracker
-      | api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
+      | api_key_env_var: environment_reference_name(settings.tracker.api_key),
+        api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
+        webhook_secret_env_var: environment_reference_name(settings.tracker.webhook_secret),
         webhook_secret:
           resolve_environment_secret(
             settings.tracker.webhook_secret,
@@ -750,6 +763,13 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp env_reference_name(_value), do: :error
+
+  defp environment_reference_name(value) do
+    case env_reference_name(value) do
+      {:ok, env_name} -> env_name
+      :error -> nil
+    end
+  end
 
   defp resolve_env_token(env_name) do
     case System.get_env(env_name) do

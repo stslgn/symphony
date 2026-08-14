@@ -23,23 +23,31 @@ defmodule SymphonyElixir.Application do
   def start(_type, _args) do
     :ok = SymphonyElixir.LogFile.configure()
 
-    children = [
-      {Phoenix.PubSub, name: SymphonyElixir.PubSub},
-      {Registry, keys: :unique, name: SymphonyElixir.PollTaskRegistry},
-      {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
-      {DynamicSupervisor, strategy: :one_for_one, name: SymphonyElixir.PollGuardSupervisor},
-      SymphonyElixir.WorkflowStore,
-      SymphonyElixir.Orchestrator,
-      SymphonyElixir.HttpServer,
-      SymphonyElixir.StatusDashboard
-    ]
-
     Supervisor.start_link(
-      children,
-      strategy: :one_for_one,
+      child_specs(),
+      strategy: supervisor_strategy(),
       name: SymphonyElixir.Supervisor
     )
   end
+
+  @spec child_specs() :: [Supervisor.child_spec() | {module(), term()} | module()]
+  def child_specs do
+    [
+      {Phoenix.PubSub, name: SymphonyElixir.PubSub},
+      {Registry, keys: :unique, name: SymphonyElixir.PollTaskRegistry},
+      SymphonyElixir.WorkflowStore,
+      SymphonyElixir.StartupAttestation,
+      {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
+      {DynamicSupervisor, strategy: :one_for_one, name: SymphonyElixir.PollGuardSupervisor},
+      {SymphonyElixir.Orchestrator, startup_settings_fn: &SymphonyElixir.StartupAttestation.settings_with_authority!/0},
+      SymphonyElixir.HttpServer,
+      SymphonyElixir.StatusDashboard,
+      SymphonyElixir.RuntimeReadiness
+    ]
+  end
+
+  @spec supervisor_strategy() :: :rest_for_one
+  def supervisor_strategy, do: :rest_for_one
 
   @impl true
   def stop(_state) do
