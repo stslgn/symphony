@@ -80,9 +80,8 @@ defmodule SymphonyElixir.StartupAttestation do
 
     result =
       with :ok <- File.write(temporary_path, content, [:exclusive]),
-           :ok <- File.chmod(temporary_path, 0o600),
-           :ok <- File.rename(temporary_path, path) do
-        :ok
+           :ok <- File.chmod(temporary_path, 0o600) do
+        File.rename(temporary_path, path)
       end
 
     _ = File.rm(temporary_path)
