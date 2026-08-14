@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Linear.Adapter do
   @behaviour SymphonyElixir.Tracker
 
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Tracker.PollContext
 
   @create_comment_mutation """
   mutation SymphonyCreateComment($issueId: String!, $body: String!) {
@@ -40,15 +41,30 @@ defmodule SymphonyElixir.Linear.Adapter do
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues, do: client_module().fetch_candidate_issues()
 
+  @spec fetch_candidate_issues(PollContext.t()) :: {:ok, [term()]} | {:error, term()}
+  def fetch_candidate_issues(%PollContext{} = context),
+    do: client_module().fetch_candidate_issues(context)
+
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issues_by_states(states), do: client_module().fetch_issues_by_states(states)
 
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids), do: client_module().fetch_issue_states_by_ids(issue_ids)
 
+  @spec fetch_issue_states_by_ids([String.t()], PollContext.t()) ::
+          {:ok, [term()]} | {:error, term()}
+  def fetch_issue_states_by_ids(issue_ids, %PollContext{} = context),
+    do: client_module().fetch_issue_states_by_ids(issue_ids, context)
+
   @spec fetch_comments_since(String.t(), DateTime.t()) :: {:ok, [term()]} | {:error, term()}
   def fetch_comments_since(issue_id, %DateTime{} = created_after) do
     client_module().fetch_comments_since(issue_id, created_after)
+  end
+
+  @spec fetch_comments_since(String.t(), DateTime.t(), PollContext.t()) ::
+          {:ok, [term()]} | {:error, term()}
+  def fetch_comments_since(issue_id, %DateTime{} = created_after, %PollContext{} = context) do
+    client_module().fetch_comments_since(issue_id, created_after, context)
   end
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}

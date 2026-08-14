@@ -237,6 +237,9 @@ Notes:
   runner generation at startup. Every observed change advances a monotonic authority generation.
   Operator-ID-only drift disables comment commands; tracker identity/scope drift blocks every tracker
   request and discards in-flight poll results until restart, even if the file is later restored.
+  Admitted polls and in-flight worker state checks use the immutable startup snapshot for the
+  adapter, credential, endpoint, project, routing assignee, and active states; the network client
+  never re-reads those fields from a hot-reloaded config.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the

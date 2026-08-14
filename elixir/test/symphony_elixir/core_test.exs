@@ -3,6 +3,23 @@ defmodule SymphonyElixir.CoreTest do
 
   alias SymphonyElixir.RunLedger
 
+  defmodule SnapshotLinearClient do
+    def fetch_candidate_issues(context) do
+      send(self(), {:snapshot_candidate_fetch, context})
+      {:ok, []}
+    end
+
+    def fetch_issue_states_by_ids(issue_ids, context) do
+      send(self(), {:snapshot_state_fetch, issue_ids, context})
+      {:ok, []}
+    end
+
+    def fetch_comments_since(issue_id, created_after, context) do
+      send(self(), {:snapshot_comment_fetch, issue_id, created_after, context})
+      {:ok, []}
+    end
+  end
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -3355,6 +3372,61 @@ defmodule SymphonyElixir.CoreTest do
 
     if is_reference(blocked_poll_state.tick_timer_ref),
       do: Process.cancel_timer(blocked_poll_state.tick_timer_ref)
+  end
+
+  test "tracker poll collection keeps the startup-approved network authority snapshot" do
+    previous_client = Application.get_env(:symphony_elixir, :linear_client_module)
+
+    on_exit(fn ->
+      if previous_client do
+        Application.put_env(:symphony_elixir, :linear_client_module, previous_client)
+      else
+        Application.delete_env(:symphony_elixir, :linear_client_module)
+      end
+    end)
+
+    Application.put_env(:symphony_elixir, :linear_client_module, SnapshotLinearClient)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_endpoint: "https://approved.example/graphql",
+      tracker_api_token: "approved-token",
+      tracker_project_slug: "approved-project"
+    )
+
+    approved_context = Tracker.poll_context(Config.settings!().tracker)
+    comment_cursor = ~U[2026-08-14 09:00:00Z]
+
+    request = %{
+      running_ids: ["issue-running"],
+      parked_ids: [],
+      retry_issue_ids: [],
+      comment_requests: [{"issue-comments", comment_cursor}],
+      operator_user_ids: [],
+      dispatch_paused: false,
+      tracker_authority_valid: true,
+      tracker_context: approved_context
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_endpoint: "https://unapproved.example/graphql",
+      tracker_api_token: "unapproved-token",
+      tracker_project_slug: "unapproved-project"
+    )
+
+    result = Orchestrator.collect_tracker_poll_for_test(request)
+    assert result.running == {:ok, []}
+    assert result.dispatch == {:ok, []}
+
+    assert_receive {:snapshot_state_fetch, ["issue-running"], ^approved_context}
+    assert_receive {:snapshot_candidate_fetch, ^approved_context}
+
+    assert_receive {:snapshot_comment_fetch, "issue-comments", ^comment_cursor, ^approved_context}
+
+    inspected = inspect(approved_context)
+    refute inspected =~ "approved-token"
+    assert inspected =~ ", ...>"
   end
 
   test "Linear retry command resumes a matching wait exactly once while globally paused" do

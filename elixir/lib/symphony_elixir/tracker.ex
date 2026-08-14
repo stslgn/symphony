@@ -5,10 +5,31 @@ defmodule SymphonyElixir.Tracker do
 
   alias SymphonyElixir.Config
 
+  defmodule PollContext do
+    @moduledoc false
+
+    @derive {Inspect, except: [:api_key]}
+    defstruct [:kind, :endpoint, :api_key, :project_slug, :assignee, active_states: []]
+
+    @type t :: %__MODULE__{
+            kind: String.t() | nil,
+            endpoint: String.t() | nil,
+            api_key: String.t() | nil,
+            project_slug: String.t() | nil,
+            assignee: String.t() | nil,
+            active_states: [String.t()]
+          }
+  end
+
   @callback fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
+  @callback fetch_candidate_issues(PollContext.t()) :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
+  @callback fetch_issue_states_by_ids([String.t()], PollContext.t()) ::
+              {:ok, [term()]} | {:error, term()}
   @callback fetch_comments_since(String.t(), DateTime.t()) ::
+              {:ok, [term()]} | {:error, term()}
+  @callback fetch_comments_since(String.t(), DateTime.t(), PollContext.t()) ::
               {:ok, [term()]} | {:error, term()}
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   @callback update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
@@ -16,6 +37,11 @@ defmodule SymphonyElixir.Tracker do
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues do
     adapter().fetch_candidate_issues()
+  end
+
+  @spec fetch_candidate_issues(PollContext.t()) :: {:ok, [term()]} | {:error, term()}
+  def fetch_candidate_issues(%PollContext{} = context) do
+    adapter(context).fetch_candidate_issues(context)
   end
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
@@ -28,10 +54,22 @@ defmodule SymphonyElixir.Tracker do
     adapter().fetch_issue_states_by_ids(issue_ids)
   end
 
+  @spec fetch_issue_states_by_ids([String.t()], PollContext.t()) ::
+          {:ok, [term()]} | {:error, term()}
+  def fetch_issue_states_by_ids(issue_ids, %PollContext{} = context) do
+    adapter(context).fetch_issue_states_by_ids(issue_ids, context)
+  end
+
   @spec fetch_comments_since(String.t(), DateTime.t()) ::
           {:ok, [term()]} | {:error, term()}
   def fetch_comments_since(issue_id, %DateTime{} = created_after) do
     adapter().fetch_comments_since(issue_id, created_after)
+  end
+
+  @spec fetch_comments_since(String.t(), DateTime.t(), PollContext.t()) ::
+          {:ok, [term()]} | {:error, term()}
+  def fetch_comments_since(issue_id, %DateTime{} = created_after, %PollContext{} = context) do
+    adapter(context).fetch_comments_since(issue_id, created_after, context)
   end
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
@@ -50,5 +88,21 @@ defmodule SymphonyElixir.Tracker do
       "memory" -> SymphonyElixir.Tracker.Memory
       _ -> SymphonyElixir.Linear.Adapter
     end
+  end
+
+  @spec adapter(PollContext.t()) :: module()
+  def adapter(%PollContext{kind: "memory"}), do: SymphonyElixir.Tracker.Memory
+  def adapter(%PollContext{}), do: SymphonyElixir.Linear.Adapter
+
+  @spec poll_context(map()) :: PollContext.t()
+  def poll_context(tracker) when is_map(tracker) do
+    %PollContext{
+      kind: Map.get(tracker, :kind),
+      endpoint: Map.get(tracker, :endpoint),
+      api_key: Map.get(tracker, :api_key),
+      project_slug: Map.get(tracker, :project_slug),
+      assignee: Map.get(tracker, :assignee),
+      active_states: Map.get(tracker, :active_states, [])
+    }
   end
 end

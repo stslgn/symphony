@@ -74,6 +74,7 @@ defmodule SymphonyElixir.Orchestrator do
       :run_ledger_append_fn,
       :task_start_fn,
       :runner_generation,
+      :tracker_context,
       poll_generation: 0,
       poll_dirty: false,
       poll_failure_count: 0,
@@ -127,6 +128,7 @@ defmodule SymphonyElixir.Orchestrator do
             run_ledger_path: run_ledger_path,
             run_ledger_append_fn: run_ledger_append_fn,
             runner_generation: runner_generation,
+            tracker_context: Tracker.poll_context(config.tracker),
             dispatch_paused: recovery.dispatch_paused,
             recovered_attempts: recovery.recovered_attempts,
             recovered_dispatches: recovery.recovered_dispatches,
@@ -705,7 +707,8 @@ defmodule SymphonyElixir.Orchestrator do
       comment_requests: operator_comment_requests(state, operator_user_ids),
       operator_user_ids: operator_user_ids,
       dispatch_paused: state.dispatch_paused,
-      tracker_authority_valid: true
+      tracker_authority_valid: true,
+      tracker_context: tracker_context(state)
     }
   end
 
@@ -735,45 +738,50 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp collect_tracker_poll(request) do
+    tracker_context = Map.fetch!(request, :tracker_context)
+
     %{
       request: request,
-      running: fetch_issue_states(request.running_ids),
-      parked: fetch_issue_states(request.parked_ids),
-      comments: fetch_operator_comments(request.comment_requests),
-      dispatch: fetch_dispatch_candidates(request.dispatch_paused)
+      running: fetch_issue_states(request.running_ids, tracker_context),
+      parked: fetch_issue_states(request.parked_ids, tracker_context),
+      comments: fetch_operator_comments(request.comment_requests, tracker_context),
+      dispatch: fetch_dispatch_candidates(request.dispatch_paused, tracker_context)
     }
   end
 
-  defp fetch_issue_states([]), do: {:ok, []}
-  defp fetch_issue_states(issue_ids), do: Tracker.fetch_issue_states_by_ids(issue_ids)
+  defp fetch_issue_states([], _tracker_context), do: {:ok, []}
 
-  defp fetch_operator_comments(comment_requests) do
+  defp fetch_issue_states(issue_ids, tracker_context),
+    do: Tracker.fetch_issue_states_by_ids(issue_ids, tracker_context)
+
+  defp fetch_operator_comments(comment_requests, tracker_context) do
     Map.new(comment_requests, fn {issue_id, cursor} ->
-      {issue_id, Tracker.fetch_comments_since(issue_id, cursor)}
+      {issue_id, Tracker.fetch_comments_since(issue_id, cursor, tracker_context)}
     end)
   end
 
-  defp fetch_dispatch_candidates(true), do: {:skip, :paused}
+  defp fetch_dispatch_candidates(true, _tracker_context), do: {:skip, :paused}
 
-  defp fetch_dispatch_candidates(false) do
+  defp fetch_dispatch_candidates(false, tracker_context) do
     with :ok <- Config.validate!(),
          :ok <- Config.validate_runtime_capabilities(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues() do
-      revalidate_poll_candidates(issues)
+         {:ok, issues} <- Tracker.fetch_candidate_issues(tracker_context) do
+      revalidate_poll_candidates(issues, tracker_context)
     end
   end
 
-  defp revalidate_poll_candidates(issues) when is_list(issues) do
+  defp revalidate_poll_candidates(issues, tracker_context) when is_list(issues) do
     issue_ids =
       Enum.flat_map(issues, fn
         %Issue{id: issue_id} when is_binary(issue_id) -> [issue_id]
         _issue -> []
       end)
 
-    fetch_issue_states(issue_ids)
+    fetch_issue_states(issue_ids, tracker_context)
   end
 
-  defp revalidate_poll_candidates(_issues), do: {:error, :invalid_candidate_collection}
+  defp revalidate_poll_candidates(_issues, _tracker_context),
+    do: {:error, :invalid_candidate_collection}
 
   defp apply_poll_result(%State{} = state, %{request: request} = result) when is_map(request) do
     state = refresh_runtime_config(state)
@@ -988,7 +996,7 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec revalidate_poll_candidates_for_test(term()) :: {:ok, [term()]} | {:error, term()}
   def revalidate_poll_candidates_for_test(issues) do
-    revalidate_poll_candidates(issues)
+    revalidate_poll_candidates(issues, tracker_context(%State{}))
   end
 
   @doc false
@@ -1089,6 +1097,11 @@ defmodule SymphonyElixir.Orchestrator do
   @spec apply_poll_result_for_test(term(), map()) :: term()
   def apply_poll_result_for_test(%State{} = state, result) when is_map(result),
     do: apply_poll_result(state, result)
+
+  @doc false
+  @spec collect_tracker_poll_for_test(map()) :: map()
+  def collect_tracker_poll_for_test(request) when is_map(request),
+    do: collect_tracker_poll(request)
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
@@ -1786,6 +1799,7 @@ defmodule SymphonyElixir.Orchestrator do
          normalized_attempt
        ) do
     run_budget = RunBudget.from_agent_config(Config.settings!().agent)
+    tracker_context = tracker_context(state)
 
     task = fn ->
       AgentRunner.run(issue, recipient,
@@ -1797,7 +1811,10 @@ defmodule SymphonyElixir.Orchestrator do
         run_id: run_id,
         runner_generation: state.runner_generation,
         stage: "running",
-        max_turns: run_budget.max_turns
+        max_turns: run_budget.max_turns,
+        issue_state_fetcher: fn issue_ids ->
+          Tracker.fetch_issue_states_by_ids(issue_ids, tracker_context)
+        end
       )
     end
 
@@ -4699,6 +4716,12 @@ defmodule SymphonyElixir.Orchestrator do
       tracker_authority_generation
     )
   end
+
+  defp tracker_context(%State{tracker_context: %Tracker.PollContext{} = context}),
+    do: context
+
+  defp tracker_context(%State{}),
+    do: Config.settings!().tracker |> Tracker.poll_context()
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states) and
