@@ -267,6 +267,53 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert state.workflow.prompt == "Immutable snapshot B"
   end
 
+  test "workflow store keeps last good authority across schema-invalid YAML reloads" do
+    ensure_workflow_store_running()
+    workflow_path = Workflow.workflow_file_path()
+
+    write_workflow_file!(workflow_path,
+      prompt: "Schema validated snapshot",
+      tracker_operator_user_ids: ["operator-1"]
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:ok, good_workflow, authority_generation, tracker_authority_generation} =
+             WorkflowStore.current_with_authority()
+
+    invalid_workflows = [
+      """
+      ---
+      tracker:
+        kind: linear
+        operator_user_ids: not-a-list
+      ---
+      ## Symphony Runtime Prompt
+      Invalid tracker schema
+      """,
+      """
+      ---
+      agent:
+        max_run_tokens: 0
+      ---
+      ## Symphony Runtime Prompt
+      Invalid unrelated schema
+      """
+    ]
+
+    Enum.each(invalid_workflows, fn invalid_workflow ->
+      File.write!(workflow_path, invalid_workflow)
+
+      assert {:error, {:invalid_workflow_config, _message}} =
+               WorkflowStore.force_reload()
+
+      assert {:ok, ^good_workflow, ^authority_generation, ^tracker_authority_generation} =
+               WorkflowStore.current_with_authority()
+
+      assert Process.alive?(Process.whereis(WorkflowStore))
+    end)
+  end
+
   test "workflow store start_link and poll callback cover missing-file error paths" do
     ensure_workflow_store_running()
     existing_path = Workflow.workflow_file_path()
