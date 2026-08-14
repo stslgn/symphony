@@ -2,7 +2,6 @@ defmodule SymphonyElixir.RuntimeIdentity do
   @moduledoc false
 
   @application :symphony_elixir
-  @loader_env ~w(ERL_AFLAGS ERL_ZFLAGS ERL_FLAGS ERL_LIBS ELIXIR_ERL_OPTIONS)
 
   @type evidence :: %{
           image_sha256: String.t(),
@@ -29,12 +28,26 @@ defmodule SymphonyElixir.RuntimeIdentity do
     end
   end
 
-  @spec write_manifest!(Path.t(), Path.t()) :: :ok
-  def write_manifest!(image_path, manifest_path) do
+  @spec write_manifest!(Path.t(), Path.t(), keyword()) :: :ok
+  def write_manifest!(image_path, manifest_path, opts \\ []) do
+    escript_path =
+      Keyword.get_lazy(opts, :escript_path, fn ->
+        System.find_executable("escript") || raise "escript executable is unavailable"
+      end)
+
+    clean_env_args = [
+      "-i",
+      "HOME=/var/empty",
+      "LANG=C.UTF-8",
+      "LC_ALL=C.UTF-8",
+      "PATH=#{Path.dirname(escript_path)}:/usr/bin:/bin"
+    ]
+
     {output, 0} =
-      System.cmd(Path.expand(image_path), ["--runtime-identity"],
-        stderr_to_stdout: true,
-        env: Enum.map(@loader_env, &{&1, nil})
+      System.cmd(
+        "/usr/bin/env",
+        clean_env_args ++ [escript_path, Path.expand(image_path), "--runtime-identity"],
+        stderr_to_stdout: true
       )
 
     ["image_sha256=" <> image_sha256, "execution_sha256=" <> execution_sha256] =

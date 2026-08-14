@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.RuntimeIdentityTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias SymphonyElixir.RuntimeIdentity
 
@@ -215,9 +215,21 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
 
     runtime_path = Path.join(test_root, "symphony")
     manifest_path = Path.join(test_root, "symphony.runtime-identity")
+    escript_path = Path.join(test_root, "escript")
+    selector_trace = Path.join(test_root, "vm-selector.trace")
     execution_sha256 = String.duplicate("a", 64)
+    selector_names = ~w(ESCRIPT_EMULATOR ESCRIPT_NAME ERL_ROOTDIR ERL_OTP28_FLAGS)
+    previous_selectors = Map.new(selector_names, &{&1, System.get_env(&1)})
 
-    on_exit(fn -> File.rm_rf(test_root) end)
+    on_exit(fn ->
+      Enum.each(previous_selectors, fn
+        {name, nil} -> System.delete_env(name)
+        {name, value} -> System.put_env(name, value)
+      end)
+
+      File.rm_rf(test_root)
+    end)
+
     File.mkdir_p!(test_root)
 
     File.write!(
@@ -231,7 +243,26 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
 
     File.chmod!(runtime_path, 0o700)
 
-    assert :ok = RuntimeIdentity.write_manifest!(runtime_path, manifest_path)
+    File.write!(
+      escript_path,
+      """
+      #!/bin/sh
+      if [ -n "${ESCRIPT_EMULATOR:-}" ] || [ -n "${ESCRIPT_NAME:-}" ] || \
+         [ -n "${ERL_ROOTDIR:-}" ] || [ -n "${ERL_OTP28_FLAGS:-}" ]; then
+        : > "#{selector_trace}"
+        exit 97
+      fi
+      exec "$@"
+      """
+    )
+
+    File.chmod!(escript_path, 0o700)
+    Enum.each(selector_names, &System.put_env(&1, "hostile-selector"))
+
+    assert :ok =
+             RuntimeIdentity.write_manifest!(runtime_path, manifest_path, escript_path: escript_path)
+
+    refute File.exists?(selector_trace)
 
     runtime_sha256 =
       runtime_path
