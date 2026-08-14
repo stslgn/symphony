@@ -2027,4 +2027,123 @@ defmodule SymphonyElixir.AppServerTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "remote compound codex command executes entirely inside a scrubbed shell" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-remote-env-scope-#{System.unique_integer([:positive])}"
+      )
+
+    secret_env_names =
+      @tracker_secret_env_names ++
+        [@custom_api_key_env, @custom_webhook_secret_env, "BASH_ENV", "ENV"]
+
+    previous_path = System.get_env("PATH")
+    previous_env = Map.new(secret_env_names, &{&1, System.get_env(&1)})
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+    end)
+
+    try do
+      remote_workspace = Path.join(test_root, "remote-workspaces/MT-REMOTE-ENV")
+      fake_ssh = Path.join(test_root, "ssh")
+      fake_codex = Path.join(test_root, "fake-remote-codex")
+      pipe_probe = Path.join(test_root, "pipe-probe")
+      trace_file = Path.join(test_root, "remote.env")
+
+      File.mkdir_p!(remote_workspace)
+      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+      Enum.each(secret_env_names, fn name ->
+        System.put_env(name, "/dev/null")
+      end)
+
+      remote_contamination =
+        Enum.map_join(secret_env_names, "\n", fn name ->
+          "export #{name}=/dev/null"
+        end)
+
+      File.write!(fake_ssh, """
+      #!/bin/sh
+      remote_command=""
+      for argument in "$@"; do
+        remote_command="$argument"
+      done
+      #{remote_contamination}
+      exec /bin/bash -c "$remote_command"
+      """)
+
+      codex_env_probe =
+        Enum.map_join(secret_env_names, "\n", fn name ->
+          "printf 'CODEX:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> #{trace_file}"
+        end)
+
+      File.write!(fake_codex, """
+      #!/bin/sh
+      #{codex_env_probe}
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-remote-env"}}}' ;;
+          3) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-remote-env"}}}' ;;
+          4)
+            printf '%s\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      pipe_env_probe =
+        Enum.map_join(secret_env_names, "\n", fn name ->
+          "printf 'PIPE:#{name}=%s\\n' \"${#{name}-__ABSENT__}\" >> #{trace_file}"
+        end)
+
+      File.write!(pipe_probe, """
+      #!/bin/sh
+      #{pipe_env_probe}
+      exec /bin/cat
+      """)
+
+      File.chmod!(fake_ssh, 0o755)
+      File.chmod!(fake_codex, 0o755)
+      File.chmod!(pipe_probe, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.dirname(remote_workspace),
+        codex_command: "#{fake_codex} app-server | #{pipe_probe}",
+        tracker_api_token: "$#{@custom_api_key_env}",
+        tracker_webhook_secret: "$#{@custom_webhook_secret_env}"
+      )
+
+      issue = %Issue{
+        id: "issue-remote-env",
+        identifier: "MT-REMOTE-ENV",
+        title: "Scope remote worker environment",
+        state: "In Progress"
+      }
+
+      assert {:ok, _result} =
+               AppServer.run(
+                 remote_workspace,
+                 "Execute compound worker command",
+                 issue,
+                 worker_host: "worker-env"
+               )
+
+      trace = File.read!(trace_file)
+
+      Enum.each(secret_env_names, fn name ->
+        assert trace =~ "CODEX:#{name}=__ABSENT__"
+        assert trace =~ "PIPE:#{name}=__ABSENT__"
+      end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
 end
