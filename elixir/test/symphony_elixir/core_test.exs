@@ -72,13 +72,12 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
-    assert_raise ArgumentError, ~r/interval_ms/, fn ->
-      Config.settings!().polling.interval_ms
-    end
+    assert Config.settings!().tracker.webhook_secret == "synthetic-env-webhook-secret"
 
-    assert_raise ArgumentError, ~r/interval_ms/, fn ->
+    {last_good_settings, _authority_generation, _tracker_authority_generation} =
       Config.settings_with_authority!()
-    end
+
+    assert last_good_settings.tracker.webhook_secret == "synthetic-env-webhook-secret"
 
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "polling.interval_ms"
