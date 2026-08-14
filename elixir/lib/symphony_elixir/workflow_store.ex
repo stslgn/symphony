@@ -357,12 +357,17 @@ defmodule SymphonyElixir.WorkflowStore do
     managed_project = System.get_env("SYMPHONY_MANAGED_PROJECT")
 
     if managed_project not in [nil, ""] do
-      for env_name <- ["SYMPHONY_STARTUP_ATTESTATION_PATH", "SYMPHONY_RUNTIME_READINESS_PATH"] do
-        case System.get_env(env_name) do
-          path when path in [nil, ""] -> :ok
-          path -> remove_regular_attestation(path)
-        end
-      end
+      Enum.each(
+        ["SYMPHONY_STARTUP_ATTESTATION_PATH", "SYMPHONY_RUNTIME_READINESS_PATH"],
+        &invalidate_attestation_env/1
+      )
+    end
+  end
+
+  defp invalidate_attestation_env(env_name) do
+    case System.get_env(env_name) do
+      path when path in [nil, ""] -> :ok
+      path -> remove_regular_attestation(path)
     end
   end
 
