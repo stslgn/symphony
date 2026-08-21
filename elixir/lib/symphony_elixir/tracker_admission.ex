@@ -127,21 +127,16 @@ defmodule SymphonyElixir.TrackerAdmission do
       :ok
     else
       {:error, reason} -> {:error, reason}
-      false -> {:error, :issue_snapshot_conflict}
     end
   end
 
   defp authority_digest(nil), do: {:error, :tracker_authority_unavailable}
 
   defp authority_digest(authority_generation) do
-    digest =
-      authority_generation
-      |> :erlang.term_to_binary([:deterministic])
-      |> sha256()
-
-    {:ok, digest}
-  rescue
-    _error -> {:error, :tracker_authority_unavailable}
+    {:ok,
+     authority_generation
+     |> :erlang.term_to_binary([:deterministic])
+     |> sha256()}
   end
 
   defp validate_string_fields(issue, fields) do
