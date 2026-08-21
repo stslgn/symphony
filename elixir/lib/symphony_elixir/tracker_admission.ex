@@ -65,13 +65,13 @@ defmodule SymphonyElixir.TrackerAdmission do
           {:ok, packet(), snapshot()} | {:error, term()}
   def packet(
         %Issue{state: source_state} = issue,
-        %PollContext{authority_generation: authority_generation},
+        %PollContext{} = context,
         admission_id,
         target_state
       )
       when is_binary(source_state) and is_binary(admission_id) and is_binary(target_state) do
     with {:ok, snapshot} <- snapshot(issue),
-         {:ok, authority_digest} <- authority_digest(authority_generation) do
+         {:ok, authority_digest} <- authority_digest(context) do
       {:ok,
        %{
          admission_id: admission_id,
@@ -115,12 +115,12 @@ defmodule SymphonyElixir.TrackerAdmission do
   @spec verify_recovery_evidence(Issue.t(), PollContext.t(), map()) :: :ok | {:error, term()}
   def verify_recovery_evidence(
         %Issue{} = issue,
-        %PollContext{authority_generation: authority_generation},
+        %PollContext{} = context,
         admission
       )
       when is_map(admission) do
     with {:ok, snapshot} <- snapshot(issue),
-         {:ok, current_authority_digest} <- authority_digest(authority_generation),
+         {:ok, current_authority_digest} <- authority_digest(context),
          true <-
            current_authority_digest == Map.get(admission, :tracker_authority_digest) or
              {:error, :tracker_authority_conflict},
@@ -135,14 +135,26 @@ defmodule SymphonyElixir.TrackerAdmission do
     end
   end
 
-  defp authority_digest(nil), do: {:error, :tracker_authority_unavailable}
+  defp authority_digest(%PollContext{authority_generation: nil}),
+    do: {:error, :tracker_authority_unavailable}
 
-  defp authority_digest(authority_generation) do
+  defp authority_digest(%PollContext{} = context) do
+    contract = %{
+      api_key_selector: credential_selector(context.api_key_env_var, context.api_key),
+      endpoint: context.endpoint,
+      kind: context.kind,
+      project_slug: context.project_slug,
+      webhook_secret_selector: credential_selector(context.webhook_secret_env_var, nil)
+    }
+
     {:ok,
-     authority_generation
+     contract
      |> :erlang.term_to_binary([:deterministic])
      |> sha256()}
   end
+
+  defp credential_selector(env_var, _value) when is_binary(env_var), do: "$" <> env_var
+  defp credential_selector(_env_var, value), do: value
 
   defp validate_string_fields(issue, fields) do
     Enum.reduce_while(fields, :ok, fn field, :ok ->

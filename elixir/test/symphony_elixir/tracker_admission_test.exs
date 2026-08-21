@@ -81,7 +81,7 @@ defmodule SymphonyElixir.TrackerAdmissionTest do
   end
 
   test "recovery evidence pins snapshot bytes and tracker authority" do
-    context = %PollContext{authority_generation: {:workflow_store, 7}}
+    context = context(authority_generation: {self(), 7})
 
     assert {:ok, packet, _snapshot} =
              TrackerAdmission.packet(
@@ -93,7 +93,16 @@ defmodule SymphonyElixir.TrackerAdmissionTest do
 
     assert :ok = TrackerAdmission.verify_recovery_evidence(issue(), context, packet)
 
-    changed_context = %{context | authority_generation: {:workflow_store, 8}}
+    restarted_context = %{context | authority_generation: {spawn(fn -> :ok end), 0}}
+
+    assert :ok =
+             TrackerAdmission.verify_recovery_evidence(
+               issue(),
+               restarted_context,
+               packet
+             )
+
+    changed_context = %{context | endpoint: "https://other.example/graphql"}
 
     assert {:error, :tracker_authority_conflict} =
              TrackerAdmission.verify_recovery_evidence(issue(), changed_context, packet)
@@ -118,6 +127,24 @@ defmodule SymphonyElixir.TrackerAdmissionTest do
           state: "Agent Ready",
           url: "https://linear.example/DUD-1",
           labels: ["alpha", "zeta"]
+        ],
+        overrides
+      )
+    )
+  end
+
+  defp context(overrides) do
+    struct!(
+      PollContext,
+      Keyword.merge(
+        [
+          kind: "linear",
+          endpoint: "https://api.linear.app/graphql",
+          api_key: "synthetic-secret",
+          api_key_env_var: "LINEAR_API_KEY",
+          webhook_secret_env_var: "LINEAR_WEBHOOK_SECRET",
+          project_slug: "project",
+          authority_generation: {self(), 0}
         ],
         overrides
       )

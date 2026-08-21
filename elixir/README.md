@@ -247,6 +247,9 @@ Notes:
   other state, snapshot, or tracker-authority value creates a conflict wait.
   Tracker read/mutation failure creates a failure wait. Neither recovery path
   can dispatch a duplicate run or start Codex before durable completion.
+  The persisted authority hash binds the stable tracker contract rather than a
+  process PID/epoch; live I/O still requires the current generation, while an
+  exact contract can reconcile across a full process restart.
 - Managed workflows must use an exact `## Symphony Runtime Prompt` line so
   pickup/watch-loop guidance does not get sent to the worker as task
   instructions.
