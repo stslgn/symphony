@@ -17,6 +17,8 @@ defmodule SymphonyElixir.RunLedger do
   @transition_stages %{
     "runner_started" => ["startup"],
     "run_claimed" => ["claimed"],
+    "tracker_admission_io_started" => ["admission"],
+    "tracker_admission_completed" => ["admission"],
     "run_started" => ["running"],
     "run_runtime_ready" => ["running"],
     "model_resolved" => ["running"],
@@ -70,6 +72,18 @@ defmodule SymphonyElixir.RunLedger do
     "run_claimed" => %{
       required_strings: ~w(stage run_id issue_id issue_identifier),
       required_attempt: true
+    },
+    "tracker_admission_io_started" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier admission_id source_state target_state issue_snapshot_schema issue_snapshot_sha256 tracker_authority_digest),
+      required_attempt: true,
+      required_non_negative_integers: ~w(issue_snapshot_bytes),
+      sha256_fields: ~w(issue_snapshot_sha256 tracker_authority_digest)
+    },
+    "tracker_admission_completed" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier admission_id source_state target_state issue_snapshot_schema issue_snapshot_sha256 tracker_authority_digest),
+      required_attempt: true,
+      required_non_negative_integers: ~w(issue_snapshot_bytes),
+      sha256_fields: ~w(issue_snapshot_sha256 tracker_authority_digest)
     },
     "run_started" => %{
       required_strings: ~w(stage run_id issue_id issue_identifier),
@@ -178,12 +192,16 @@ defmodule SymphonyElixir.RunLedger do
   }
   @allowed_fields MapSet.new([
                     :allowed_actions,
+                    :admission_id,
                     :attempt,
                     :comment_created_at,
                     :comment_id,
                     :cleanup_error,
                     :issue_id,
                     :issue_identifier,
+                    :issue_snapshot_bytes,
+                    :issue_snapshot_schema,
+                    :issue_snapshot_sha256,
                     :operator_command,
                     :parked_reason,
                     :model_catalog_source,
@@ -195,7 +213,10 @@ defmodule SymphonyElixir.RunLedger do
                     :run_id,
                     :runner_generation,
                     :stage,
+                    :source_state,
+                    :target_state,
                     :terminal_reason,
+                    :tracker_authority_digest,
                     :tracker_state,
                     :transition,
                     :wait_id,
@@ -210,6 +231,7 @@ defmodule SymphonyElixir.RunLedger do
   @optional_string_fields @allowed_fields
                           |> MapSet.delete(:allowed_actions)
                           |> MapSet.delete(:attempt)
+                          |> MapSet.delete(:issue_snapshot_bytes)
                           |> MapSet.delete(:next_attempt)
                           |> Enum.map(&Atom.to_string/1)
 
@@ -276,6 +298,7 @@ defmodule SymphonyElixir.RunLedger do
        %{
          recovered_attempts: recovered_attempts,
          recovered_dispatches: recovered_dispatches,
+         tracker_admissions: recovery.tracker_admissions,
          queued_resumes: recovery.queued_resumes,
          cleanup_pending: recovery.cleanup_pending,
          parked: parked,
@@ -359,9 +382,13 @@ defmodule SymphonyElixir.RunLedger do
           update_run_state(acc, run_id, event)
         end)
 
+      tracker_admissions = Enum.reduce(events, %{}, &update_tracker_admission_state/2)
+      protected_admission_run_ids = tracker_admissions |> Map.values() |> MapSet.new(& &1.run_id)
+
       unfinished =
         states
         |> Enum.filter(&unfinished_run?/1)
+        |> Enum.reject(fn {run_id, _state} -> MapSet.member?(protected_admission_run_ids, run_id) end)
         |> Map.new(fn {run_id, state} -> {run_id, state.event} end)
 
       parked = Enum.reduce(events, %{}, &update_parked_state/2)
@@ -389,6 +416,7 @@ defmodule SymphonyElixir.RunLedger do
       {:ok,
        %{
          stale_runs: unfinished,
+         tracker_admissions: tracker_admissions,
          parked: parked,
          queued_resumes: queued_resumes,
          cleanup_pending: cleanup_pending,
@@ -413,6 +441,53 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp update_run_state(acc, _run_id, _event), do: acc
+
+  defp update_tracker_admission_state(
+         %{"transition" => transition, "issue_id" => issue_id} = event,
+         acc
+       )
+       when transition in ["tracker_admission_io_started", "tracker_admission_completed"] and
+              is_binary(issue_id) do
+    status =
+      if transition == "tracker_admission_completed",
+        do: "completed",
+        else: "io_started"
+
+    Map.put(acc, issue_id, %{
+      admission_id: event["admission_id"],
+      attempt: event["attempt"],
+      identifier: event["issue_identifier"],
+      issue_id: issue_id,
+      issue_snapshot_bytes: event["issue_snapshot_bytes"],
+      issue_snapshot_schema: event["issue_snapshot_schema"],
+      issue_snapshot_sha256: event["issue_snapshot_sha256"],
+      run_id: event["run_id"],
+      source_state: event["source_state"],
+      status: status,
+      target_state: event["target_state"],
+      tracker_authority_digest: event["tracker_authority_digest"],
+      worker_host: event["worker_host"],
+      workspace_path: event["workspace_path"],
+      workspace_root: event["workspace_root"]
+    })
+  end
+
+  defp update_tracker_admission_state(
+         %{"transition" => transition, "issue_id" => issue_id},
+         acc
+       )
+       when transition in [
+              "run_started",
+              "run_parked",
+              "run_completed",
+              "run_failed",
+              "run_interrupted",
+              "run_stopped"
+            ] and is_binary(issue_id) do
+    Map.delete(acc, issue_id)
+  end
+
+  defp update_tracker_admission_state(_event, acc), do: acc
 
   defp unfinished_run?({_run_id, state}), do: state.started and not state.terminal
 
@@ -820,6 +895,12 @@ defmodule SymphonyElixir.RunLedger do
     with :ok <- validate_required_strings(event, required_strings),
          :ok <- validate_required_attempt(event, Map.get(schema, :required_attempt, false)),
          :ok <- validate_required_next_attempt(event, Map.get(schema, :required_next_attempt, false)),
+         :ok <-
+           validate_required_non_negative_integers(
+             event,
+             Map.get(schema, :required_non_negative_integers, [])
+           ),
+         :ok <- validate_sha256_fields(event, Map.get(schema, :sha256_fields, [])),
          :ok <- validate_typed_wait(event, Map.get(schema, :typed_wait, false)),
          :ok <- validate_typed_cleanup_error(event, Map.get(schema, :typed_cleanup_error, false)),
          :ok <-
@@ -875,6 +956,29 @@ defmodule SymphonyElixir.RunLedger do
       {:ok, attempt} when is_integer(attempt) and attempt >= 1 -> :ok
       _other -> {:error, {:invalid_field, "next_attempt"}}
     end
+  end
+
+  defp validate_required_non_negative_integers(event, fields) do
+    Enum.reduce_while(fields, :ok, fn field, :ok ->
+      case Map.fetch(event, field) do
+        {:ok, value} when is_integer(value) and value >= 0 -> {:cont, :ok}
+        _other -> {:halt, {:error, {:invalid_field, field}}}
+      end
+    end)
+  end
+
+  defp validate_sha256_fields(event, fields) do
+    Enum.reduce_while(fields, :ok, fn field, :ok ->
+      case Map.fetch(event, field) do
+        {:ok, value} when is_binary(value) ->
+          if Regex.match?(~r/\A[0-9a-f]{64}\z/, value),
+            do: {:cont, :ok},
+            else: {:halt, {:error, {:invalid_field, field}}}
+
+        _other ->
+          {:halt, {:error, {:invalid_field, field}}}
+      end
+    end)
   end
 
   defp validate_typed_wait(_event, false), do: :ok
@@ -1156,6 +1260,7 @@ defmodule SymphonyElixir.RunLedger do
               terminal: nil,
               terminal_reason: nil,
               dispatch_intent: nil,
+              tracker_admission: nil,
               model_resolution: nil,
               retry_event: nil,
               cleanup_intent: false,
@@ -1174,9 +1279,47 @@ defmodule SymphonyElixir.RunLedger do
     end
   end
 
-  defp validate_ordered_event(%{"transition" => "run_started"} = event, state) do
+  defp validate_ordered_event(
+         %{"transition" => "tracker_admission_io_started"} = event,
+         state
+       ) do
     with {:ok, run} <- fetch_run(state, event),
          :ok <- require_phase(run, [:claimed]),
+         :ok <- require_tracker_admission(run, nil),
+         {:ok, run} <- merge_run_affinity(run, event) do
+      admission = Map.put(tracker_admission_identity(event), :status, :io_started)
+
+      {:ok,
+       put_run(state, event["run_id"], %{
+         run
+         | phase: :admitting,
+           tracker_admission: admission
+       })}
+    end
+  end
+
+  defp validate_ordered_event(
+         %{"transition" => "tracker_admission_completed"} = event,
+         state
+       ) do
+    with {:ok, run} <- fetch_run(state, event),
+         :ok <- require_phase(run, [:admitting]),
+         :ok <- require_tracker_admission(run, tracker_admission_identity(event)),
+         {:ok, run} <- merge_run_affinity(run, event) do
+      admission = Map.put(tracker_admission_identity(event), :status, :completed)
+
+      {:ok,
+       put_run(state, event["run_id"], %{
+         run
+         | phase: :admitted,
+           tracker_admission: admission
+       })}
+    end
+  end
+
+  defp validate_ordered_event(%{"transition" => "run_started"} = event, state) do
+    with {:ok, run} <- fetch_run(state, event),
+         :ok <- require_phase(run, [:claimed, :admitted]),
          {:ok, run} <- merge_run_affinity(run, event) do
       {:ok, put_run(state, event["run_id"], %{run | phase: :started})}
     end
@@ -1207,7 +1350,7 @@ defmodule SymphonyElixir.RunLedger do
 
   defp validate_ordered_event(%{"transition" => "run_parked"} = event, state) do
     with {:ok, run} <- fetch_run(state, event),
-         :ok <- require_phase(run, [:started]),
+         :ok <- require_phase(run, [:claimed, :admitting, :admitted, :started]),
          {:ok, run} <- merge_run_affinity(run, event),
          :ok <- ensure_wait_available(state.waits, event) do
       wait = wait_identity(event)
@@ -1400,6 +1543,29 @@ defmodule SymphonyElixir.RunLedger do
 
   defp require_unresolved_model(%{model_resolution: nil}), do: :ok
   defp require_unresolved_model(_run), do: {:error, :duplicate_model_resolution}
+
+  defp require_tracker_admission(%{tracker_admission: nil}, nil), do: :ok
+
+  defp require_tracker_admission(%{tracker_admission: admission}, expected)
+       when is_map(admission) and is_map(expected) do
+    if Map.delete(admission, :status) == expected,
+      do: :ok,
+      else: {:error, :tracker_admission_mismatch}
+  end
+
+  defp require_tracker_admission(_run, _expected), do: {:error, :tracker_admission_mismatch}
+
+  defp tracker_admission_identity(event) do
+    Map.take(event, [
+      "admission_id",
+      "source_state",
+      "target_state",
+      "issue_snapshot_schema",
+      "issue_snapshot_bytes",
+      "issue_snapshot_sha256",
+      "tracker_authority_digest"
+    ])
+  end
 
   defp maybe_record_operator_action_context(state, %{"comment_id" => comment_id} = event)
        when is_binary(comment_id) do

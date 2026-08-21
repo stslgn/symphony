@@ -18,6 +18,8 @@ defmodule SymphonyElixir.OperatorWait do
     "review_cap_reached" => ["approve", "reject"],
     "auth_reconnect_required" => ["retry", "reject"],
     "run_budget_exhausted" => ["retry", "reject"],
+    "tracker_admission_failed" => ["retry", "reject"],
+    "tracker_admission_conflict" => ["retry", "reject"],
     "operator_stopped" => ["retry", "reject"]
   }
   @field_limits %{

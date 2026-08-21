@@ -3,6 +3,145 @@ defmodule SymphonyElixir.RunLedgerTest do
 
   alias SymphonyElixir.RunLedger
 
+  test "records completed tracker admission before a run starts" do
+    path = ledger_path()
+
+    assert :ok = append_claim!(path, "run-admitted", "issue-admitted", "DUD-ADMITTED", 0)
+
+    admission = %{
+      stage: "admission",
+      run_id: "run-admitted",
+      issue_id: "issue-admitted",
+      issue_identifier: "DUD-ADMITTED",
+      attempt: 0,
+      admission_id: "admission-1",
+      source_state: "Agent Ready",
+      target_state: "Agent Running",
+      issue_snapshot_schema: "symphony.issue_snapshot.v1",
+      issue_snapshot_bytes: 128,
+      issue_snapshot_sha256: String.duplicate("a", 64),
+      tracker_authority_digest: String.duplicate("b", 64)
+    }
+
+    assert :ok =
+             RunLedger.append(
+               path,
+               Map.put(admission, :transition, "tracker_admission_io_started")
+             )
+
+    assert :ok =
+             RunLedger.append(
+               path,
+               Map.put(admission, :transition, "tracker_admission_completed")
+             )
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_started",
+               stage: "running",
+               run_id: "run-admitted",
+               issue_id: "issue-admitted",
+               issue_identifier: "DUD-ADMITTED",
+               attempt: 0
+             })
+
+    assert {:ok, [_claim, started, completed, run_started]} = RunLedger.read_events(path)
+    assert started["admission_id"] == "admission-1"
+    assert started["issue_snapshot_bytes"] == 128
+    assert completed["issue_snapshot_sha256"] == String.duplicate("a", 64)
+    assert run_started["transition"] == "run_started"
+  end
+
+  test "rejects run start while tracker admission is incomplete" do
+    path = ledger_path()
+
+    assert :ok = append_claim!(path, "run-incomplete", "issue-incomplete", "DUD-INCOMPLETE", 0)
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "tracker_admission_io_started",
+               stage: "admission",
+               run_id: "run-incomplete",
+               issue_id: "issue-incomplete",
+               issue_identifier: "DUD-INCOMPLETE",
+               attempt: 0,
+               admission_id: "admission-incomplete",
+               source_state: "Agent Ready",
+               target_state: "Agent Running",
+               issue_snapshot_schema: "symphony.issue_snapshot.v1",
+               issue_snapshot_bytes: 128,
+               issue_snapshot_sha256: String.duplicate("a", 64),
+               tracker_authority_digest: String.duplicate("b", 64)
+             })
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_started",
+               stage: "running",
+               run_id: "run-incomplete",
+               issue_id: "issue-incomplete",
+               issue_identifier: "DUD-INCOMPLETE",
+               attempt: 0
+             })
+
+    assert {:error, {:invalid_ledger_record, 3, {:invalid_transition_sequence, "run_started", :illegal_predecessor}}} =
+             RunLedger.read_events(path)
+  end
+
+  test "startup preserves an in-flight tracker admission for exact reconciliation" do
+    path = ledger_path()
+
+    assert :ok = append_claim!(path, "run-reconcile", "issue-reconcile", "DUD-RECONCILE", 2)
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "tracker_admission_io_started",
+               stage: "admission",
+               run_id: "run-reconcile",
+               issue_id: "issue-reconcile",
+               issue_identifier: "DUD-RECONCILE",
+               attempt: 2,
+               admission_id: "admission-reconcile",
+               source_state: "Agent Ready",
+               target_state: "Agent Running",
+               issue_snapshot_schema: "symphony.issue_snapshot.v1",
+               issue_snapshot_bytes: 128,
+               issue_snapshot_sha256: String.duplicate("a", 64),
+               tracker_authority_digest: String.duplicate("b", 64),
+               workspace_path: "/tmp/workspaces/DUD-RECONCILE",
+               workspace_root: "/tmp/workspaces"
+             })
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-new")
+    assert recovery.recovered_attempts == %{}
+    assert recovery.recovered_dispatches == %{}
+
+    assert recovery.tracker_admissions["issue-reconcile"] == %{
+             admission_id: "admission-reconcile",
+             attempt: 2,
+             identifier: "DUD-RECONCILE",
+             issue_id: "issue-reconcile",
+             issue_snapshot_bytes: 128,
+             issue_snapshot_schema: "symphony.issue_snapshot.v1",
+             issue_snapshot_sha256: String.duplicate("a", 64),
+             run_id: "run-reconcile",
+             source_state: "Agent Ready",
+             status: "io_started",
+             target_state: "Agent Running",
+             tracker_authority_digest: String.duplicate("b", 64),
+             worker_host: nil,
+             workspace_path: "/tmp/workspaces/DUD-RECONCILE",
+             workspace_root: "/tmp/workspaces"
+           }
+
+    assert {:ok, events} = RunLedger.read_events(path)
+
+    refute Enum.any?(events, fn event ->
+             event["run_id"] == "run-reconcile" and
+               event["transition"] == "run_interrupted"
+           end)
+  end
+
   test "appends bounded events with restrictive file permissions" do
     path = ledger_path()
 
