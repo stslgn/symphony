@@ -504,7 +504,8 @@ Fields:
     closed if the hook changes tracked or untracked workspace state.
 - `timeout_ms` (integer, OPTIONAL)
   - Default: `60000`
-  - Applies to all workspace hooks.
+  - Applies to all workspace hooks, each durability/cleanup command, and the
+    overall supervised terminal-cleanup task.
   - Invalid values fail configuration validation.
   - Changes SHOULD be re-applied at runtime for future hook executions.
 
@@ -739,7 +740,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.before_run`: shell script or null
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
-- `hooks.timeout_ms`: integer, default `60000`
+- `hooks.timeout_ms`: integer, default `60000`; also bounds durability/cleanup
+  command steps and the overall terminal-cleanup task
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_run_tokens`: positive integer or null, default `null`
@@ -1218,6 +1220,13 @@ It MUST disable repository-controlled executable Git features, including
 `core.fsmonitor`, while inspecting the quarantined worktree. Production cleanup
 MUST reject mutable path-form and `file://` durability remotes.
 The external verifier MUST be removed after each proof attempt.
+
+Each local durability command MUST run in an owned process group. Timeout,
+cancellation, or exceeding 64 KiB of combined standard output and error output
+MUST terminate and reap that complete group before returning a bounded
+`workspace_preservation_required` result. Cancellation of the outer cleanup
+task MUST propagate to the active proof command without bypassing removal of the
+runner-owned verifier directory.
 
 If a pre-hook check fails, the implementation MUST NOT run `before_remove`. If
 either verification fails, it MUST attempt to restore the quarantine to the exact

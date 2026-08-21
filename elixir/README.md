@@ -46,6 +46,11 @@ quarantine artifact; physical deletion remains a separate operator/GC gate.
 The proof runs outside the orchestrator in one supervised task with an overall
 deadline. Stable preservation failures become operator-required and are not
 repeated on each poll.
+Each local Git proof command has the same deadline and a 64 KiB combined-output
+limit. Timeout, cancellation, or excess output terminates and reaps the exact
+process group before returning a preservation failure. A runner-owned validator
+also removes its temporary bare repository after the outer cleanup task is
+terminated.
 The ledger records cleanup request, I/O start, operator-required, explicit
 retry, I/O completion, and final completion separately. A restart after I/O
 start stays operator-required; tracker state cannot authorize a replay. Once
