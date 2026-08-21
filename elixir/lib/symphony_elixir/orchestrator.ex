@@ -2143,9 +2143,13 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_event: nil,
           codex_app_server_pid: nil,
           codex_input_tokens: 0,
+          codex_cached_input_tokens: 0,
+          codex_uncached_input_tokens: 0,
           codex_output_tokens: 0,
           codex_total_tokens: 0,
           codex_last_reported_input_tokens: 0,
+          codex_last_reported_cached_input_tokens: 0,
+          codex_last_reported_uncached_input_tokens: 0,
           codex_last_reported_output_tokens: 0,
           codex_last_reported_total_tokens: 0,
           codex_token_accounting: new_token_accounting(),
@@ -2153,6 +2157,9 @@ defmodule SymphonyElixir.Orchestrator do
           codex_token_telemetry_integrity: :unobserved,
           codex_token_telemetry_failure: nil,
           codex_token_telemetry_epoch: 0,
+          codex_uncached_input_telemetry_observed: false,
+          codex_uncached_input_telemetry_integrity: :unobserved,
+          codex_uncached_input_telemetry_failure: nil,
           turn_count: 0,
           run_budget: run_budget,
           run_budget_timer_ref: nil,
@@ -3644,6 +3651,8 @@ defmodule SymphonyElixir.Orchestrator do
           model_catalog: Map.get(metadata, :model_catalog),
           codex_app_server_pid: Map.get(metadata, :codex_app_server_pid),
           codex_input_tokens: Map.get(metadata, :codex_input_tokens, 0),
+          codex_cached_input_tokens: Map.get(metadata, :codex_cached_input_tokens, 0),
+          codex_uncached_input_tokens: Map.get(metadata, :codex_uncached_input_tokens, 0),
           codex_output_tokens: Map.get(metadata, :codex_output_tokens, 0),
           codex_total_tokens: Map.get(metadata, :codex_total_tokens, 0),
           turn_count: Map.get(metadata, :turn_count, 0),
@@ -3770,9 +3779,13 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: accounting.input.lifetime,
+        codex_cached_input_tokens: accounting.cached_input.lifetime,
+        codex_uncached_input_tokens: accounting.uncached_input.lifetime,
         codex_output_tokens: accounting.output.lifetime,
         codex_total_tokens: accounting.total.lifetime,
         codex_last_reported_input_tokens: accounting.input.last_raw || 0,
+        codex_last_reported_cached_input_tokens: accounting.cached_input.last_raw || 0,
+        codex_last_reported_uncached_input_tokens: accounting.uncached_input.last_raw || 0,
         codex_last_reported_output_tokens: accounting.output.last_raw || 0,
         codex_last_reported_total_tokens: accounting.total.last_raw || 0,
         codex_token_accounting: accounting,
@@ -3780,6 +3793,9 @@ defmodule SymphonyElixir.Orchestrator do
         codex_token_telemetry_integrity: accounting.integrity,
         codex_token_telemetry_failure: accounting.failure,
         codex_token_telemetry_epoch: accounting.total.epoch,
+        codex_uncached_input_telemetry_observed: accounting.uncached_integrity == :valid,
+        codex_uncached_input_telemetry_integrity: accounting.uncached_integrity,
+        codex_uncached_input_telemetry_failure: accounting.uncached_failure,
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
       token_delta
@@ -5114,16 +5130,26 @@ defmodule SymphonyElixir.Orchestrator do
   defp extract_token_delta(running_entry, %{event: _, timestamp: _} = update) do
     accounting = token_accounting(running_entry)
 
+    uncached_guard_enabled? =
+      is_integer(get_in(running_entry, [:run_budget, :max_uncached_input_tokens]))
+
     case canonical_token_usage(extract_token_usage(update)) do
-      {:ok, usage} -> token_delta_from_canonical_usage(accounting, usage)
-      {:error, reason} -> failed_token_delta(accounting, reason)
+      {:ok, usage} ->
+        token_delta_from_canonical_usage(accounting, usage, uncached_guard_enabled?)
+
+      {:error, reason} ->
+        failed_token_delta(accounting, reason)
     end
   end
 
-  defp token_delta_from_canonical_usage(%{integrity: :failed} = accounting, _usage),
-    do: empty_token_delta(accounting)
+  defp token_delta_from_canonical_usage(
+         %{integrity: :failed} = accounting,
+         _usage,
+         _uncached_guard_enabled?
+       ),
+       do: empty_token_delta(accounting)
 
-  defp token_delta_from_canonical_usage(accounting, usage) do
+  defp token_delta_from_canonical_usage(accounting, usage, uncached_guard_enabled?) do
     with {:ok, input, input_delta} <-
            advance_token_component(accounting.input, get_token_usage(usage, :input)),
          {:ok, output, output_delta} <-
@@ -5135,16 +5161,29 @@ defmodule SymphonyElixir.Orchestrator do
           do: :valid,
           else: :unobserved
 
+      {cached_input, uncached_input, uncached_integrity, uncached_failure} =
+        advance_uncached_input_accounting(
+          accounting,
+          usage,
+          uncached_guard_enabled?
+        )
+
       updated_accounting = %{
         integrity: integrity,
         failure: nil,
         input: input,
+        cached_input: cached_input,
+        uncached_input: uncached_input,
+        uncached_integrity: uncached_integrity,
+        uncached_failure: uncached_failure,
         output: output,
         total: total
       }
 
       %{
         input_tokens: input_delta,
+        cached_input_tokens: cached_input.lifetime,
+        uncached_input_tokens: uncached_input.lifetime,
         output_tokens: output_delta,
         total_tokens: total_delta,
         accounting: updated_accounting
@@ -5157,6 +5196,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp empty_token_delta(accounting) do
     %{
       input_tokens: 0,
+      cached_input_tokens: 0,
+      uncached_input_tokens: 0,
       output_tokens: 0,
       total_tokens: 0,
       accounting: accounting
@@ -5179,6 +5220,7 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok,
        %{
          input: input,
+         cached_input: optional_token_component(usage, token_fields(:cached_input)),
          output: output,
          total: canonical_total(explicit_total, derived_total)
        }}
@@ -5202,6 +5244,13 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp optional_token_component(usage, fields) do
+    case normalized_token_component(usage, fields) do
+      {:ok, value} -> value
+      :invalid -> :invalid
+    end
+  end
+
   defp checked_token_sum(input, output) when is_integer(input) and is_integer(output) do
     if input <= @max_cumulative_token_count - output do
       {:ok, input + output}
@@ -5216,6 +5265,65 @@ defmodule SymphonyElixir.Orchestrator do
   defp canonical_total(total, nil), do: total
   defp canonical_total(nil, derived), do: derived
   defp canonical_total(total, derived), do: max(total, derived)
+
+  defp advance_uncached_input_accounting(
+         %{uncached_integrity: :failed} = accounting,
+         _usage,
+         _guard_enabled?
+       ) do
+    {
+      accounting.cached_input,
+      accounting.uncached_input,
+      accounting.uncached_integrity,
+      accounting.uncached_failure
+    }
+  end
+
+  defp advance_uncached_input_accounting(accounting, usage, guard_enabled?) do
+    input = get_token_usage(usage, :input)
+    cached_input = get_token_usage(usage, :cached_input)
+
+    token_usage_observed? =
+      Enum.any?(
+        [input, get_token_usage(usage, :output), get_token_usage(usage, :total)],
+        &is_integer/1
+      )
+
+    cond do
+      is_integer(input) and is_integer(cached_input) and cached_input <= input ->
+        uncached_input = input - cached_input
+
+        with {:ok, cached_component, _cached_delta} <-
+               advance_token_component(accounting.cached_input, cached_input),
+             {:ok, uncached_component, _uncached_delta} <-
+               advance_token_component(accounting.uncached_input, uncached_input) do
+          {cached_component, uncached_component, :valid, nil}
+        else
+          {:error, reason} -> failed_uncached_accounting(accounting, reason)
+        end
+
+      cached_input == :invalid or (is_integer(cached_input) and not is_integer(input)) ->
+        failed_uncached_accounting(accounting, :malformed_cached_input_counter)
+
+      is_integer(input) and is_integer(cached_input) and cached_input > input ->
+        failed_uncached_accounting(accounting, :cached_input_exceeds_input)
+
+      token_usage_observed? and guard_enabled? ->
+        failed_uncached_accounting(accounting, :missing_cached_input_counter)
+
+      true ->
+        {
+          accounting.cached_input,
+          accounting.uncached_input,
+          accounting.uncached_integrity,
+          accounting.uncached_failure
+        }
+    end
+  end
+
+  defp failed_uncached_accounting(accounting, reason) do
+    {accounting.cached_input, accounting.uncached_input, :failed, reason}
+  end
 
   defp advance_token_component(component, nil), do: {:ok, component, 0}
 
@@ -5257,8 +5365,9 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp token_accounting(%{codex_token_accounting: accounting}) when is_map(accounting),
-    do: accounting
+  defp token_accounting(%{codex_token_accounting: accounting} = running_entry)
+       when is_map(accounting),
+       do: normalize_token_accounting(accounting, running_entry)
 
   defp token_accounting(running_entry) do
     observed? = Map.get(running_entry, :codex_token_telemetry_observed, false) == true
@@ -5267,6 +5376,10 @@ defmodule SymphonyElixir.Orchestrator do
       integrity: if(observed?, do: :valid, else: :unobserved),
       failure: Map.get(running_entry, :codex_token_telemetry_failure),
       input: legacy_token_component(running_entry, :input),
+      cached_input: legacy_token_component(running_entry, :cached_input),
+      uncached_input: legacy_token_component(running_entry, :uncached_input),
+      uncached_integrity: Map.get(running_entry, :codex_uncached_input_telemetry_integrity, :unobserved),
+      uncached_failure: Map.get(running_entry, :codex_uncached_input_telemetry_failure),
       output: legacy_token_component(running_entry, :output),
       total: legacy_token_component(running_entry, :total)
     }
@@ -5283,11 +5396,29 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp normalize_token_accounting(accounting, running_entry) do
+    accounting
+    |> Map.put_new(:cached_input, legacy_token_component(running_entry, :cached_input))
+    |> Map.put_new(:uncached_input, legacy_token_component(running_entry, :uncached_input))
+    |> Map.put_new(
+      :uncached_integrity,
+      Map.get(running_entry, :codex_uncached_input_telemetry_integrity, :unobserved)
+    )
+    |> Map.put_new(
+      :uncached_failure,
+      Map.get(running_entry, :codex_uncached_input_telemetry_failure)
+    )
+  end
+
   defp token_lifetime_key(:input), do: :codex_input_tokens
+  defp token_lifetime_key(:cached_input), do: :codex_cached_input_tokens
+  defp token_lifetime_key(:uncached_input), do: :codex_uncached_input_tokens
   defp token_lifetime_key(:output), do: :codex_output_tokens
   defp token_lifetime_key(:total), do: :codex_total_tokens
 
   defp token_last_reported_key(:input), do: :codex_last_reported_input_tokens
+  defp token_last_reported_key(:cached_input), do: :codex_last_reported_cached_input_tokens
+  defp token_last_reported_key(:uncached_input), do: :codex_last_reported_uncached_input_tokens
   defp token_last_reported_key(:output), do: :codex_last_reported_output_tokens
   defp token_last_reported_key(:total), do: :codex_last_reported_total_tokens
 
@@ -5296,6 +5427,10 @@ defmodule SymphonyElixir.Orchestrator do
       integrity: :unobserved,
       failure: nil,
       input: new_token_component(),
+      cached_input: new_token_component(),
+      uncached_input: new_token_component(),
+      uncached_integrity: :unobserved,
+      uncached_failure: nil,
       output: new_token_component(),
       total: new_token_component()
     }
@@ -5426,12 +5561,17 @@ defmodule SymphonyElixir.Orchestrator do
   defp map_at_path(_payload, _path), do: nil
 
   defp token_counter_map?(payload) do
-    token_fields = token_fields(:input) ++ token_fields(:output) ++ token_fields(:total)
+    token_fields =
+      token_fields(:input) ++
+        token_fields(:cached_input) ++ token_fields(:output) ++ token_fields(:total)
+
     Enum.any?(token_fields, &Map.has_key?(payload, &1))
   end
 
   defp get_token_usage(usage, :input),
     do: payload_get(usage, token_fields(:input))
+
+  defp get_token_usage(usage, :cached_input), do: Map.get(usage, :cached_input)
 
   defp get_token_usage(usage, :output),
     do: payload_get(usage, token_fields(:output))
@@ -5450,6 +5590,17 @@ defmodule SymphonyElixir.Orchestrator do
       :promptTokens,
       "inputTokens",
       :inputTokens
+    ]
+  end
+
+  defp token_fields(:cached_input) do
+    [
+      "cached_input_tokens",
+      :cached_input_tokens,
+      "cachedInputTokens",
+      :cachedInputTokens,
+      "cached_prompt_tokens",
+      :cached_prompt_tokens
     ]
   end
 
@@ -5510,12 +5661,21 @@ defmodule SymphonyElixir.Orchestrator do
           if(telemetry_observed?, do: :valid, else: :unobserved)
         ),
       token_telemetry_failure: Map.get(running_entry, :codex_token_telemetry_failure),
+      uncached_input_tokens: Map.get(running_entry, :codex_uncached_input_tokens, 0),
+      uncached_input_telemetry_observed: Map.get(running_entry, :codex_uncached_input_telemetry_observed, false),
+      uncached_input_telemetry_integrity: Map.get(running_entry, :codex_uncached_input_telemetry_integrity, :unobserved),
+      uncached_input_telemetry_failure: Map.get(running_entry, :codex_uncached_input_telemetry_failure),
       seconds: running_seconds(Map.get(running_entry, :started_at), now)
     }
   end
 
   defp disabled_run_budget do
-    %{max_turns: Config.settings!().agent.max_turns, max_tokens: nil, max_seconds: nil}
+    %{
+      max_turns: Config.settings!().agent.max_turns,
+      max_tokens: nil,
+      max_uncached_input_tokens: nil,
+      max_seconds: nil
+    }
   end
 
   defp running_seconds(%DateTime{} = started_at, %DateTime{} = now) do

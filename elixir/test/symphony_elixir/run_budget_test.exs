@@ -7,8 +7,75 @@ defmodule SymphonyElixir.RunBudgetTest do
     assert RunBudget.from_agent_config(%{
              max_turns: 20,
              max_run_tokens: 250_000,
+             max_run_uncached_input_tokens: 100_000,
              max_run_seconds: 7_200
-           }) == %{max_turns: 20, max_tokens: 250_000, max_seconds: 7_200}
+           }) == %{
+             max_turns: 20,
+             max_tokens: 250_000,
+             max_uncached_input_tokens: 100_000,
+             max_seconds: 7_200
+           }
+  end
+
+  test "enforces uncached input independently from total tokens" do
+    limits = %{
+      max_turns: 20,
+      max_tokens: 350_000,
+      max_uncached_input_tokens: 100_000,
+      max_seconds: nil
+    }
+
+    metrics = %{
+      tokens: 200_000,
+      token_telemetry_observed: true,
+      uncached_input_tokens: 100_000,
+      uncached_input_telemetry_observed: true,
+      uncached_input_telemetry_integrity: :valid
+    }
+
+    assert RunBudget.exhausted_reason(limits, metrics) ==
+             "uncached_input_budget_exhausted"
+
+    assert RunBudget.snapshot(limits, metrics).uncached_input_tokens == %{
+             limit: 100_000,
+             used: 100_000,
+             remaining: 0,
+             telemetry_observed: true,
+             telemetry_integrity: "valid",
+             integrity_error: nil
+           }
+  end
+
+  test "fails closed on cached-input telemetry loss only when uncached guard is enabled" do
+    metrics = %{
+      uncached_input_tokens: 0,
+      uncached_input_telemetry_observed: false,
+      uncached_input_telemetry_integrity: :failed,
+      uncached_input_telemetry_failure: :missing_cached_input_counter
+    }
+
+    enabled = %{
+      max_turns: 20,
+      max_tokens: nil,
+      max_uncached_input_tokens: 100_000,
+      max_seconds: nil
+    }
+
+    disabled = %{enabled | max_uncached_input_tokens: nil}
+
+    assert RunBudget.exhausted_reason(enabled, metrics) ==
+             "token_telemetry_integrity_failed"
+
+    assert RunBudget.exhausted_reason(disabled, metrics) == nil
+
+    assert RunBudget.snapshot(enabled, metrics).uncached_input_tokens == %{
+             limit: 100_000,
+             used: 0,
+             remaining: nil,
+             telemetry_observed: false,
+             telemetry_integrity: "failed",
+             integrity_error: "missing_cached_input_counter"
+           }
   end
 
   test "enforces observed token and elapsed time limits" do
@@ -80,6 +147,7 @@ defmodule SymphonyElixir.RunBudgetTest do
              "turn_budget_exhausted",
              "token_budget_exhausted",
              "token_telemetry_integrity_failed",
+             "uncached_input_budget_exhausted",
              "time_budget_exhausted"
            ]
 

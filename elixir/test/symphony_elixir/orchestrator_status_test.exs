@@ -978,6 +978,70 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end
   end
 
+  test "uncached-input telemetry accumulates independently and parks at its limit" do
+    {state, issue_id, run_id} =
+      token_accounting_state("uncached-budget", max_uncached_input_tokens: 100)
+
+    state =
+      apply_token_usage(state, issue_id, run_id, %{
+        "input_tokens" => 120,
+        "cached_input_tokens" => 70,
+        "output_tokens" => 10,
+        "total_tokens" => 130
+      })
+
+    entry = state.running[issue_id]
+    assert entry.codex_cached_input_tokens == 70
+    assert entry.codex_uncached_input_tokens == 50
+    assert entry.codex_uncached_input_telemetry_observed == true
+
+    parked =
+      apply_token_usage(state, issue_id, run_id, %{
+        "input_tokens" => 220,
+        "cached_input_tokens" => 120,
+        "output_tokens" => 20,
+        "total_tokens" => 240
+      })
+
+    refute Map.has_key?(parked.running, issue_id)
+
+    assert %{
+             reason: "run_budget_exhausted",
+             terminal_reason: "uncached_input_budget_exhausted"
+           } = parked.parked[issue_id]
+  end
+
+  test "missing cached-input telemetry fails closed only for an enabled uncached guard" do
+    usage = %{"input_tokens" => 80, "output_tokens" => 20, "total_tokens" => 100}
+
+    {disabled, disabled_issue_id, disabled_run_id} =
+      token_accounting_state("uncached-disabled")
+
+    disabled = apply_token_usage(disabled, disabled_issue_id, disabled_run_id, usage)
+    assert Map.has_key?(disabled.running, disabled_issue_id)
+
+    assert disabled.running[disabled_issue_id].codex_uncached_input_telemetry_integrity ==
+             :unobserved
+
+    assert {:reply, disabled_snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, disabled)
+
+    assert [disabled_row] = disabled_snapshot.running
+    assert disabled_row.budget.uncached_input_tokens.telemetry_integrity == "unobserved"
+    assert disabled_row.budget.uncached_input_tokens.used == nil
+
+    {enabled, issue_id, run_id} =
+      token_accounting_state("uncached-enabled", max_uncached_input_tokens: 100)
+
+    parked = apply_token_usage(enabled, issue_id, run_id, usage)
+    refute Map.has_key?(parked.running, issue_id)
+
+    assert %{
+             reason: "run_budget_exhausted",
+             terminal_reason: "token_telemetry_integrity_failed"
+           } = parked.parked[issue_id]
+  end
+
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
     issue_id = "issue-last-token-ignored"
 
@@ -1013,6 +1077,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_timestamp: nil,
       last_codex_event: nil,
       codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
+      codex_uncached_input_tokens: 0,
       codex_output_tokens: 0,
       codex_total_tokens: 0,
       codex_last_reported_input_tokens: 0,
@@ -2504,6 +2570,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         integrity: :unobserved,
         failure: nil,
         input: %{last_raw: nil, lifetime: 0, epoch: 0},
+        cached_input: %{last_raw: nil, lifetime: 0, epoch: 0},
+        uncached_input: %{last_raw: nil, lifetime: 0, epoch: 0},
+        uncached_integrity: :unobserved,
+        uncached_failure: nil,
         output: %{last_raw: nil, lifetime: 0, epoch: 0},
         total: %{last_raw: nil, lifetime: 0, epoch: 0}
       },
@@ -2511,8 +2581,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       codex_token_telemetry_integrity: :unobserved,
       codex_token_telemetry_failure: nil,
       codex_token_telemetry_epoch: 0,
+      codex_uncached_input_telemetry_observed: false,
+      codex_uncached_input_telemetry_integrity: :unobserved,
+      codex_uncached_input_telemetry_failure: nil,
       turn_count: 0,
-      run_budget: %{max_turns: 20, max_tokens: Keyword.get(opts, :max_tokens), max_seconds: nil},
+      run_budget: %{
+        max_turns: 20,
+        max_tokens: Keyword.get(opts, :max_tokens),
+        max_uncached_input_tokens: Keyword.get(opts, :max_uncached_input_tokens),
+        max_seconds: nil
+      },
       run_budget_timer_ref: nil,
       worker_host: nil,
       workspace_path: nil,

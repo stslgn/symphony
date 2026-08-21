@@ -167,6 +167,7 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
   max_run_tokens: 250000
+  max_run_uncached_input_tokens: 100000
   max_run_seconds: 7200
 codex:
   command: codex app-server
@@ -209,6 +210,14 @@ Notes:
   overflow, and ambiguous non-zero decreases permanently fail the attempt's telemetry integrity.
   With a configured token limit, that integrity failure creates a typed durable park instead of
   admitting more work with unknown usage.
+- `agent.max_run_uncached_input_tokens` independently caps cumulative uncached
+  input (`input_tokens - cached_input_tokens`) across the same checked reset
+  epochs. Cached-input telemetry is optional while this guard is disabled and
+  appears as unavailable in status. Once the guard is enabled, a cumulative
+  usage event without a valid cached-input counter fails telemetry integrity
+  closed; reaching the limit parks with
+  `uncached_input_budget_exhausted`. The existing total-token limit remains an
+  independent coarse ceiling.
 - `agent.max_run_seconds` optionally caps wall-clock seconds for one attempt and can stop an
   in-flight turn.
 - Reaching any run budget preserves the workspace and creates a durable

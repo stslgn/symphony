@@ -49,6 +49,7 @@ defmodule SymphonyElixir.OperatorWait do
     "time_budget_exhausted",
     "token_budget_exhausted",
     "token_telemetry_integrity_failed",
+    "uncached_input_budget_exhausted",
     "turn_budget_exhausted"
   ]
 

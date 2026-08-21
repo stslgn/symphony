@@ -44,6 +44,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.webhook_secret == nil
     assert config.agent.max_turns == 20
     assert config.agent.max_run_tokens == nil
+    assert config.agent.max_run_uncached_input_tokens == nil
     assert config.agent.max_run_seconds == nil
     assert config.workflow.runtime_prompt_mode == "full_prompt_compat"
     assert config.codex.dynamic_tool_allowlist == []
@@ -94,15 +95,21 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       max_run_tokens: 250_000,
+      max_run_uncached_input_tokens: 100_000,
       max_run_seconds: 7_200
     )
 
     assert Config.settings!().agent.max_run_tokens == 250_000
+    assert Config.settings!().agent.max_run_uncached_input_tokens == 100_000
     assert Config.settings!().agent.max_run_seconds == 7_200
 
     write_workflow_file!(Workflow.workflow_file_path(), max_run_tokens: 0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "agent.max_run_tokens"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_run_uncached_input_tokens: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_run_uncached_input_tokens"
 
     write_workflow_file!(Workflow.workflow_file_path(), max_run_seconds: 0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
