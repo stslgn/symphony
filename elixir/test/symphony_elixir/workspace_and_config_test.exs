@@ -405,6 +405,93 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "automatic terminal cleanup bounds local git output before the command deadline" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-output-limit-preservation-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-OUTPUT-LIMIT")
+    fake_bin = Path.join(test_root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    process_group_file = Path.join(test_root, "git-process-group.pid")
+    previous_path = System.get_env("PATH")
+    output_chunk = String.duplicate("x", 1_024)
+
+    on_exit(fn ->
+      case File.read(process_group_file) do
+        {:ok, raw_pid} ->
+          process_group = raw_pid |> String.trim() |> String.to_integer()
+
+          System.cmd(
+            "/bin/kill",
+            ["-KILL", "--", "-#{process_group}"],
+            stderr_to_stdout: true
+          )
+
+        {:error, _reason} ->
+          :ok
+      end
+
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "baseline\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "baseline"])
+    File.mkdir_p!(workspace_root)
+    System.cmd("git", ["clone", source, workspace])
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    printf '%s\\n' "$$" > '#{process_group_file}'
+    output_chunk='#{output_chunk}'
+    index=0
+    while [ "$index" -lt 128 ]; do
+      printf '%s' "$output_chunk"
+      index=$((index + 1))
+    done
+    sleep 30
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      workspace_durability_remote_url: source,
+      hook_timeout_ms: 30_000
+    )
+
+    task =
+      Task.async(fn ->
+        Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+      end)
+
+    result =
+      case Task.yield(task, 3_000) do
+        {:ok, result} ->
+          result
+
+        nil ->
+          Task.shutdown(task, :brutal_kill)
+          flunk("local durability validation exceeded the bounded output deadline")
+      end
+
+    assert {:error, :workspace_preservation_required, ""} = result
+    assert File.dir?(workspace)
+    refute File.exists?(workspace <> ".symphony-cleanup")
+  end
+
   test "automatic terminal cleanup quarantines a clean remote-backed workspace" do
     test_root =
       Path.join(

@@ -15,6 +15,10 @@ defmodule SymphonyElixir.Workspace do
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
   @remote_affinity_marker "__SYMPHONY_AFFINITY__"
   @remote_durability_marker "__SYMPHONY_DURABILITY__"
+  @owned_command_output_limit_bytes 64 * 1_024
+  @owned_command_output_limit_status 125
+  @owned_command_timeout_status 124
+  @owned_command_start_failure_status 127
   @owned_command_termination_grace_ms 50
   @owned_command_termination_wait_ms 1_000
   @owned_command_termination_poll_ms 10
@@ -743,7 +747,7 @@ defmodule SymphonyElixir.Workspace do
               timeout_ms > 0 and (is_nil(cancellation_owner) or is_pid(cancellation_owner)) do
     case System.find_executable(command) do
       nil ->
-        {"", 127}
+        {"", @owned_command_start_failure_status}
 
       executable ->
         owner = self()
@@ -768,7 +772,7 @@ defmodule SymphonyElixir.Workspace do
             result
 
           {:DOWN, ^runner_ref, :process, ^runner, _reason} ->
-            {"", 127}
+            {"", @owned_command_start_failure_status}
         end
     end
   end
@@ -812,6 +816,7 @@ defmodule SymphonyElixir.Workspace do
       result_ref,
       timeout_ref,
       os_pid,
+      0,
       []
     )
   end
@@ -825,21 +830,44 @@ defmodule SymphonyElixir.Workspace do
          result_ref,
          timeout_ref,
          os_pid,
+         output_size,
          output_chunks
        ) do
     receive do
       {^port, {:data, data}} ->
-        collect_owned_system_command(
-          port,
-          owner,
-          owner_ref,
-          cancellation_owner,
-          cancellation_ref,
-          result_ref,
-          timeout_ref,
-          os_pid,
-          [data | output_chunks]
-        )
+        new_output_size = output_size + byte_size(data)
+
+        if new_output_size <= @owned_command_output_limit_bytes do
+          collect_owned_system_command(
+            port,
+            owner,
+            owner_ref,
+            cancellation_owner,
+            cancellation_ref,
+            result_ref,
+            timeout_ref,
+            os_pid,
+            new_output_size,
+            [data | output_chunks]
+          )
+        else
+          remaining_bytes = @owned_command_output_limit_bytes - output_size
+
+          bounded_chunks =
+            if remaining_bytes > 0,
+              do: [binary_part(data, 0, remaining_bytes) | output_chunks],
+              else: output_chunks
+
+          Process.cancel_timer(timeout_ref)
+          Process.demonitor(owner_ref, [:flush])
+          demonitor_owned_command_cancellation(cancellation_ref)
+          terminate_owned_system_command(port, os_pid)
+
+          send(
+            owner,
+            {result_ref, {owned_system_command_output(bounded_chunks), @owned_command_output_limit_status}}
+          )
+        end
 
       {^port, {:exit_status, status}} ->
         Process.cancel_timer(timeout_ref)
@@ -857,13 +885,21 @@ defmodule SymphonyElixir.Workspace do
         Process.cancel_timer(timeout_ref)
         Process.demonitor(owner_ref, [:flush])
         terminate_owned_system_command(port, os_pid)
-        send(owner, {result_ref, {owned_system_command_output(output_chunks), 124}})
+
+        send(
+          owner,
+          {result_ref, {owned_system_command_output(output_chunks), @owned_command_timeout_status}}
+        )
 
       {:owned_command_timeout, ^result_ref} ->
         Process.demonitor(owner_ref, [:flush])
         demonitor_owned_command_cancellation(cancellation_ref)
         terminate_owned_system_command(port, os_pid)
-        send(owner, {result_ref, {owned_system_command_output(output_chunks), 124}})
+
+        send(
+          owner,
+          {result_ref, {owned_system_command_output(output_chunks), @owned_command_timeout_status}}
+        )
     end
   end
 
