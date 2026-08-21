@@ -979,8 +979,6 @@ defmodule SymphonyElixir.RunLedger do
   defp valid_sha256?(value) when is_binary(value),
     do: Regex.match?(~r/\A[0-9a-f]{64}\z/, value)
 
-  defp valid_sha256?(_value), do: false
-
   defp validate_typed_wait(_event, false), do: :ok
 
   defp validate_typed_wait(event, true) do
@@ -1552,8 +1550,6 @@ defmodule SymphonyElixir.RunLedger do
       do: :ok,
       else: {:error, :tracker_admission_mismatch}
   end
-
-  defp require_tracker_admission(_run, _expected), do: {:error, :tracker_admission_mismatch}
 
   defp tracker_admission_identity(event) do
     Map.take(event, [
