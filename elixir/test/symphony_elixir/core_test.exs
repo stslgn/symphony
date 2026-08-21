@@ -2249,6 +2249,8 @@ defmodule SymphonyElixir.CoreTest do
     fake_bin = Path.join(root, "fake-bin")
     fake_git = Path.join(fake_bin, "git")
     trace_file = Path.join(root, "git.trace")
+    process_group_file = Path.join(root, "git-process-group.pid")
+    child_pid_file = Path.join(root, "git-child.pid")
     issue_id = "issue-async-timeout"
     server_name = Module.concat(__MODULE__, :AsyncCleanupTimeout)
     previous_path = System.get_env("PATH")
@@ -2260,14 +2262,25 @@ defmodule SymphonyElixir.CoreTest do
     File.write!(fake_git, """
     #!/bin/sh
     printf 'called\\n' >> '#{trace_file}'
-    sleep 2
+    printf '%s\\n' "$$" > '#{process_group_file}'
+    (
+      trap '' HUP INT TERM
+      while :; do sleep 1; done
+    ) &
+    child_pid=$!
+    printf '%s\\n' "$child_pid" > '#{child_pid_file}'
+    wait "$child_pid"
     printf 'survived\\n' >> '#{trace_file}'
     exit 1
     """)
 
     File.chmod!(fake_git, 0o755)
     System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
-    on_exit(fn -> restore_env("PATH", previous_path) end)
+
+    on_exit(fn ->
+      terminate_test_process_group(process_group_file)
+      restore_env("PATH", previous_path)
+    end)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -2327,6 +2340,12 @@ defmodule SymphonyElixir.CoreTest do
     refute File.exists?(workspace)
     assert File.read!(Path.join(workspace <> ".symphony-cleanup", "preserve.txt")) == "must survive\n"
     assert File.read!(trace_file) == "called\n"
+
+    process_group = process_group_file |> File.read!() |> String.trim() |> String.to_integer()
+    child_pid = child_pid_file |> File.read!() |> String.trim() |> String.to_integer()
+
+    assert_os_process_stopped(process_group)
+    assert_os_process_stopped(child_pid)
 
     send(pid, :start_pending_workspace_cleanups)
     send(pid, :start_pending_workspace_cleanups)
@@ -6734,6 +6753,44 @@ defmodule SymphonyElixir.CoreTest do
 
   defp await_orchestrator_state(pid, _predicate, 0) do
     flunk("orchestrator state did not reach the expected condition: #{inspect(:sys.get_state(pid))}")
+  end
+
+  defp os_process_alive?(pid) when is_integer(pid) and pid > 0 do
+    case System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {_output, 0} -> true
+      {_output, _status} -> false
+    end
+  end
+
+  defp assert_os_process_stopped(pid, attempts \\ 100)
+
+  defp assert_os_process_stopped(pid, attempts) when attempts > 0 do
+    if os_process_alive?(pid) do
+      Process.sleep(10)
+      assert_os_process_stopped(pid, attempts - 1)
+    else
+      :ok
+    end
+  end
+
+  defp assert_os_process_stopped(pid, 0) do
+    refute os_process_alive?(pid), "expected OS process #{pid} to stop"
+  end
+
+  defp terminate_test_process_group(process_group_file) do
+    case File.read(process_group_file) do
+      {:ok, raw_pid} ->
+        process_group = raw_pid |> String.trim() |> String.to_integer()
+
+        System.cmd(
+          "/bin/kill",
+          ["-KILL", "--", "-#{process_group}"],
+          stderr_to_stdout: true
+        )
+
+      {:error, _reason} ->
+        :ok
+    end
   end
 
   defp blocked_ledger_path do

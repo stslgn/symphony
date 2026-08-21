@@ -15,6 +15,9 @@ defmodule SymphonyElixir.Workspace do
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
   @remote_affinity_marker "__SYMPHONY_AFFINITY__"
   @remote_durability_marker "__SYMPHONY_DURABILITY__"
+  @owned_command_termination_grace_ms 50
+  @owned_command_termination_wait_ms 1_000
+  @owned_command_termination_poll_ms 10
 
   @type worker_host :: String.t() | nil
   @type prepared_workspace :: %{
@@ -801,26 +804,78 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp terminate_owned_system_command(port, os_pid) do
-    if owned_system_command_alive?(port, os_pid) do
-      signal_owned_system_command(os_pid, "TERM")
-      Process.sleep(50)
-
-      if owned_system_command_alive?(port, os_pid) do
-        signal_owned_system_command(os_pid, "KILL")
-      end
-    end
+    group_termination? = terminate_owned_system_command_group(port, os_pid)
 
     try do
       Port.close(port)
     rescue
       ArgumentError -> :ok
     end
+
+    if group_termination?, do: wait_for_owned_system_command_group(os_pid)
   end
 
   defp owned_system_command_alive?(port, os_pid) when is_integer(os_pid),
     do: Port.info(port, :os_pid) == {:os_pid, os_pid}
 
   defp owned_system_command_alive?(_port, _os_pid), do: false
+
+  defp terminate_owned_system_command_group(port, os_pid) when is_integer(os_pid) do
+    if owned_system_command_alive?(port, os_pid) and system_command_group_alive?(os_pid) do
+      signal_owned_system_command_group(os_pid, "TERM")
+      Process.sleep(@owned_command_termination_grace_ms)
+
+      if system_command_group_alive?(os_pid) do
+        signal_owned_system_command_group(os_pid, "KILL")
+      end
+
+      true
+    else
+      terminate_owned_system_command_directly(port, os_pid)
+      false
+    end
+  end
+
+  defp terminate_owned_system_command_group(_port, _os_pid), do: false
+
+  defp terminate_owned_system_command_directly(port, os_pid) do
+    if owned_system_command_alive?(port, os_pid) do
+      signal_owned_system_command(os_pid, "TERM")
+      Process.sleep(@owned_command_termination_grace_ms)
+
+      if owned_system_command_alive?(port, os_pid) do
+        signal_owned_system_command(os_pid, "KILL")
+      end
+    end
+
+    :ok
+  end
+
+  defp system_command_group_alive?(os_pid) do
+    case System.cmd("/bin/kill", ["-0", "--", "-#{os_pid}"], stderr_to_stdout: true) do
+      {_output, 0} -> true
+      {_output, _status} -> false
+    end
+  end
+
+  defp wait_for_owned_system_command_group(os_pid) do
+    deadline = System.monotonic_time(:millisecond) + @owned_command_termination_wait_ms
+    do_wait_for_owned_system_command_group(os_pid, deadline)
+  end
+
+  defp do_wait_for_owned_system_command_group(os_pid, deadline) do
+    if system_command_group_alive?(os_pid) and System.monotonic_time(:millisecond) < deadline do
+      Process.sleep(@owned_command_termination_poll_ms)
+      do_wait_for_owned_system_command_group(os_pid, deadline)
+    else
+      :ok
+    end
+  end
+
+  defp signal_owned_system_command_group(os_pid, signal) do
+    System.cmd("/bin/kill", ["-#{signal}", "--", "-#{os_pid}"], stderr_to_stdout: true)
+    :ok
+  end
 
   defp signal_owned_system_command(os_pid, signal) do
     System.cmd("/bin/kill", ["-#{signal}", Integer.to_string(os_pid)], stderr_to_stdout: true)
