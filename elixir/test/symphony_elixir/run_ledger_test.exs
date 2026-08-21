@@ -52,6 +52,72 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert run_started["transition"] == "run_started"
   end
 
+  test "rejects malformed tracker admission evidence" do
+    path = ledger_path()
+
+    admission = %{
+      transition: "tracker_admission_io_started",
+      stage: "admission",
+      run_id: "run-malformed",
+      issue_id: "issue-malformed",
+      issue_identifier: "DUD-MALFORMED",
+      attempt: 0,
+      admission_id: "admission-malformed",
+      source_state: "Agent Ready",
+      target_state: "Agent Running",
+      issue_snapshot_schema: "symphony.issue_snapshot.v1",
+      issue_snapshot_bytes: 128,
+      issue_snapshot_sha256: String.duplicate("a", 64),
+      tracker_authority_digest: String.duplicate("b", 64)
+    }
+
+    assert {:error, {:invalid_field, "issue_snapshot_bytes"}} =
+             RunLedger.append(path, %{admission | issue_snapshot_bytes: :invalid})
+
+    assert {:error, {:invalid_field, "issue_snapshot_sha256"}} =
+             RunLedger.append(path, %{admission | issue_snapshot_sha256: "not-a-sha256"})
+  end
+
+  test "rejects tracker admission completion with different evidence" do
+    path = ledger_path()
+
+    assert :ok = append_claim!(path, "run-mismatch", "issue-mismatch", "DUD-MISMATCH", 0)
+
+    admission = %{
+      stage: "admission",
+      run_id: "run-mismatch",
+      issue_id: "issue-mismatch",
+      issue_identifier: "DUD-MISMATCH",
+      attempt: 0,
+      admission_id: "admission-mismatch",
+      source_state: "Agent Ready",
+      target_state: "Agent Running",
+      issue_snapshot_schema: "symphony.issue_snapshot.v1",
+      issue_snapshot_bytes: 128,
+      issue_snapshot_sha256: String.duplicate("a", 64),
+      tracker_authority_digest: String.duplicate("b", 64)
+    }
+
+    assert :ok =
+             RunLedger.append(
+               path,
+               Map.put(admission, :transition, "tracker_admission_io_started")
+             )
+
+    assert :ok =
+             RunLedger.append(
+               path,
+               admission
+               |> Map.put(:transition, "tracker_admission_completed")
+               |> Map.put(:issue_snapshot_sha256, String.duplicate("c", 64))
+             )
+
+    expected_error =
+      {:error, {:invalid_ledger_record, 3, {:invalid_transition_sequence, "tracker_admission_completed", :tracker_admission_mismatch}}}
+
+    assert RunLedger.read_events(path) == expected_error
+  end
+
   test "rejects run start while tracker admission is incomplete" do
     path = ledger_path()
 

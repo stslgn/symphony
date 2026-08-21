@@ -45,6 +45,39 @@ defmodule SymphonyElixir.TrackerAdmissionTest do
 
     assert {:error, {:invalid_snapshot_field, :id}} =
              TrackerAdmission.snapshot(issue(id: nil))
+
+    assert {:error, {:invalid_snapshot_field, :description}} =
+             TrackerAdmission.snapshot(issue(description: 42))
+
+    assert {:error, {:invalid_snapshot_field, :labels}} =
+             TrackerAdmission.snapshot(issue(labels: :invalid))
+  end
+
+  test "rejects malformed packets and unavailable tracker authority" do
+    context = %PollContext{authority_generation: {:workflow_store, 7}}
+
+    assert {:error, :invalid_admission_packet} =
+             TrackerAdmission.packet(issue(state: nil), context, "admission-1", "Agent Running")
+
+    assert {:error, :tracker_authority_unavailable} =
+             TrackerAdmission.packet(
+               issue(),
+               %PollContext{authority_generation: nil},
+               "admission-1",
+               "Agent Running"
+             )
+  end
+
+  test "read-back propagates malformed snapshot evidence" do
+    assert {:ok, expected} = TrackerAdmission.snapshot(issue())
+
+    assert {:error, {:invalid_snapshot_field, :title}} =
+             TrackerAdmission.verify_readback(
+               [issue(state: "Agent Running", title: nil)],
+               "issue-1",
+               expected,
+               target_state: "Agent Running"
+             )
   end
 
   test "recovery evidence pins snapshot bytes and tracker authority" do

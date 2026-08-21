@@ -204,4 +204,30 @@ defmodule SymphonyElixir.RunBudgetTest do
 
     assert snapshot.tokens.integrity_error == "unknown_integrity_failure"
   end
+
+  test "bounds uncached-input integrity failure details" do
+    limits = %{
+      max_turns: 20,
+      max_tokens: nil,
+      max_uncached_input_tokens: 100_000,
+      max_seconds: nil
+    }
+
+    string_snapshot =
+      RunBudget.snapshot(limits, %{
+        uncached_input_telemetry_integrity: :failed,
+        uncached_input_telemetry_failure: "missing_cached_usage"
+      })
+
+    assert string_snapshot.uncached_input_tokens.integrity_error == "missing_cached_usage"
+
+    untyped_snapshot =
+      RunBudget.snapshot(limits, %{
+        uncached_input_telemetry_integrity: :failed,
+        uncached_input_telemetry_failure: %{raw: "hidden"}
+      })
+
+    assert untyped_snapshot.uncached_input_tokens.integrity_error ==
+             "unknown_integrity_failure"
+  end
 end
