@@ -70,6 +70,13 @@ defmodule SymphonyElixir.Tracker.Memory do
   @spec update_issue_state(String.t(), String.t(), SymphonyElixir.Tracker.PollContext.t()) ::
           :ok | {:error, term()}
   def update_issue_state(issue_id, state_name, _context) do
+    updated_issues =
+      Enum.map(configured_issues(), fn
+        %Issue{id: ^issue_id} = issue -> %{issue | state: state_name}
+        issue -> issue
+      end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, updated_issues)
     send_event({:memory_tracker_state_update, issue_id, state_name})
     :ok
   end
