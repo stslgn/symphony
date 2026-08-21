@@ -99,7 +99,10 @@ defmodule SymphonyElixir.TestSupport do
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
         Application.put_env(:symphony_elixir, :run_ledger_path, run_ledger_path)
-        if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
+
+        :ok = SymphonyElixir.TestSupport.ensure_workflow_store_running()
+        :ok = SymphonyElixir.WorkflowStore.force_reload()
+
         stop_default_http_server()
 
         on_exit(fn ->
@@ -134,6 +137,22 @@ defmodule SymphonyElixir.TestSupport do
 
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
+
+  def ensure_workflow_store_running do
+    case Process.whereis(SymphonyElixir.WorkflowStore) do
+      pid when is_pid(pid) ->
+        :ok
+
+      nil ->
+        case Supervisor.restart_child(
+               SymphonyElixir.Supervisor,
+               SymphonyElixir.WorkflowStore
+             ) do
+          {:ok, _pid} -> :ok
+          {:error, {:already_started, _pid}} -> :ok
+        end
+    end
+  end
 
   def stop_default_http_server do
     case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
