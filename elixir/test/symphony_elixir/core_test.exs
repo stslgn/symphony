@@ -5028,6 +5028,36 @@ defmodule SymphonyElixir.CoreTest do
              "run=run-stable attempt=4 stage=running generation=runner-generation"
   end
 
+  test "prompt builder exposes the sanitized pre-model admission packet" do
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      prompt:
+        "admission={{ run.admission.id }} source={{ run.admission.source_state }} target={{ run.admission.target_state }} snapshot={{ run.admission.issue_snapshot_sha256 }} authority={{ run.admission.tracker_authority_digest }}"
+    )
+
+    issue = %Issue{
+      id: "issue-admission-prompt",
+      identifier: "MT-ADMISSION-PROMPT",
+      title: "Expose admission evidence",
+      state: "Agent Running"
+    }
+
+    admission = %{
+      admission_id: "admission-stable",
+      issue_snapshot_bytes: 144,
+      issue_snapshot_schema: "symphony.issue_snapshot.v1",
+      issue_snapshot_sha256: String.duplicate("a", 64),
+      source_state: "Agent Ready",
+      target_state: "Agent Running",
+      tracker_authority_digest: String.duplicate("b", 64)
+    }
+
+    prompt = PromptBuilder.build_prompt(issue, admission: admission)
+
+    assert prompt ==
+             "admission=admission-stable source=Agent Ready target=Agent Running snapshot=#{String.duplicate("a", 64)} authority=#{String.duplicate("b", 64)}"
+  end
+
   test "prompt builder renders only the runtime prompt section when present" do
     workflow_prompt = """
     # Operator workflow
@@ -5231,7 +5261,19 @@ defmodule SymphonyElixir.CoreTest do
 
     on_exit(fn -> Workflow.set_workflow_file_path(workflow_path) end)
 
-    prompt = PromptBuilder.build_prompt(issue, attempt: 2)
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        attempt: 2,
+        admission: %{
+          admission_id: "admission-runtime-contract",
+          issue_snapshot_bytes: 144,
+          issue_snapshot_schema: "symphony.issue_snapshot.v1",
+          issue_snapshot_sha256: String.duplicate("a", 64),
+          source_state: "Agent Ready",
+          target_state: "Agent Running",
+          tracker_authority_digest: String.duplicate("b", 64)
+        }
+      )
 
     assert prompt =~ "You are working on a Linear ticket `MT-616`"
     assert prompt =~ "Issue context:"
@@ -5246,6 +5288,10 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Do not call `gh pr merge` directly"
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"
+    assert prompt =~ "Pre-model admission is already complete"
+    assert prompt =~ "Admission ID: admission-runtime-contract"
+    assert prompt =~ "Snapshot SHA-256: #{String.duplicate("a", 64)}"
+    assert prompt =~ "Do not repeat the initial state mutation or admission read-back"
   end
 
   test "prompt builder adds continuation guidance for retries" do

@@ -218,6 +218,18 @@ Notes:
   runtime heading is absent.
 - Prompt templates may read immutable run metadata from `run.id`, `run.attempt`,
   `run.stage`, and `run.runner_generation`.
+- For an `Agent Ready` candidate, the Orchestrator owns the pre-model
+  `Agent Ready` to `Agent Running` mutation. It records the admission I/O
+  intent, performs the tracker mutation, reads the exact issue back, verifies
+  the target state and a state-independent canonical issue snapshot, and only
+  then starts the agent task. Tracker I/O failures and read-back conflicts
+  create typed durable `tracker_admission_failed` or
+  `tracker_admission_conflict` waits; neither path starts Codex.
+- Managed prompt templates receive only the sanitized evidence fields under
+  `run.admission`: `id`, source/target states, snapshot schema/byte count/hash,
+  and tracker-authority hash. No credential or raw authority value crosses
+  this boundary. The worker inherits that completed admission and must not
+  repeat the initial mutation/read-back.
 - Managed workflows must use an exact `## Symphony Runtime Prompt` line so
   pickup/watch-loop guidance does not get sent to the worker as task
   instructions.

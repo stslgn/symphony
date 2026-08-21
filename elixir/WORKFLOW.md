@@ -81,6 +81,22 @@ Description:
 No description provided.
 {% endif %}
 
+{% if run.admission %}
+Pre-model admission is already complete. The orchestrator durably mutated the
+exact issue from `{{ run.admission.source_state }}` to
+`{{ run.admission.target_state }}`, read it back, and verified that the
+state-independent issue snapshot was unchanged before starting this worker.
+
+Admission ID: {{ run.admission.id }}
+Snapshot schema: {{ run.admission.issue_snapshot_schema }}
+Snapshot bytes: {{ run.admission.issue_snapshot_bytes }}
+Snapshot SHA-256: {{ run.admission.issue_snapshot_sha256 }}
+Tracker authority SHA-256: {{ run.admission.tracker_authority_digest }}
+
+Do not repeat the initial state mutation or admission read-back. Start from the
+admitted issue above; use Linear only for subsequent workflow work.
+{% endif %}
+
 Instructions:
 
 1. This is an unattended orchestration session. Never ask a human to perform follow-up actions.
@@ -97,6 +113,8 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 ## Default posture
 
 - Start by determining the ticket's current status, then follow the matching flow for that status.
+- When a pre-model admission packet is present, inherit it as the authoritative
+  startup transition and do not repeat that mutation/read-back.
 - Start every task by opening the tracking workpad comment and bringing it up to date before doing new implementation work.
 - Spend extra effort up front on planning and verification design before implementation.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.

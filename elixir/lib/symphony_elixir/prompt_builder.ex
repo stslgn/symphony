@@ -22,7 +22,8 @@ defmodule SymphonyElixir.PromptBuilder do
           "id" => Keyword.get(opts, :run_id),
           "attempt" => Keyword.get(opts, :attempt),
           "stage" => Keyword.get(opts, :stage),
-          "runner_generation" => Keyword.get(opts, :runner_generation)
+          "runner_generation" => Keyword.get(opts, :runner_generation),
+          "admission" => admission_to_solid(Keyword.get(opts, :admission))
         },
         "issue" => issue |> Map.from_struct() |> to_solid_map()
       },
@@ -59,6 +60,20 @@ defmodule SymphonyElixir.PromptBuilder do
   defp to_solid_value(value) when is_map(value), do: to_solid_map(value)
   defp to_solid_value(value) when is_list(value), do: Enum.map(value, &to_solid_value/1)
   defp to_solid_value(value), do: value
+
+  defp admission_to_solid(admission) when is_map(admission) do
+    %{
+      "id" => Map.get(admission, :admission_id),
+      "issue_snapshot_bytes" => Map.get(admission, :issue_snapshot_bytes),
+      "issue_snapshot_schema" => Map.get(admission, :issue_snapshot_schema),
+      "issue_snapshot_sha256" => Map.get(admission, :issue_snapshot_sha256),
+      "source_state" => Map.get(admission, :source_state),
+      "target_state" => Map.get(admission, :target_state),
+      "tracker_authority_digest" => Map.get(admission, :tracker_authority_digest)
+    }
+  end
+
+  defp admission_to_solid(_admission), do: nil
 
   defp default_prompt(prompt) when is_binary(prompt) do
     if String.trim(prompt) == "" do
