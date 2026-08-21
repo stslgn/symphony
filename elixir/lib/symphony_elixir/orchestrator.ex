@@ -52,7 +52,10 @@ defmodule SymphonyElixir.Orchestrator do
               operator_authority_invalidated: false,
               tracker_authority_generation: nil,
               tracker_authority_invalidated: false,
-              tracker_context: nil
+              tracker_context: nil,
+              tracker_admissions: %{},
+              tracker_fetch_by_ids_fn: nil,
+              tracker_update_state_fn: nil
   end
 
   defmodule State do
@@ -74,8 +77,6 @@ defmodule SymphonyElixir.Orchestrator do
       :run_ledger_path,
       :run_ledger_append_fn,
       :task_start_fn,
-      :tracker_fetch_by_ids_fn,
-      :tracker_update_state_fn,
       :runner_generation,
       poll_generation: 0,
       poll_dirty: false,
@@ -87,7 +88,6 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       recovered_attempts: %{},
       recovered_dispatches: %{},
-      tracker_admissions: %{},
       queued_resumes: %{},
       retry_attempts: %{},
       cleanup_pending: %{},
@@ -135,13 +135,10 @@ defmodule SymphonyElixir.Orchestrator do
             tick_token: nil,
             run_ledger_path: run_ledger_path,
             run_ledger_append_fn: run_ledger_append_fn,
-            tracker_fetch_by_ids_fn: Keyword.get(opts, :tracker_fetch_by_ids_fn),
-            tracker_update_state_fn: Keyword.get(opts, :tracker_update_state_fn),
             runner_generation: runner_generation,
             dispatch_paused: recovery.dispatch_paused,
             recovered_attempts: recovery.recovered_attempts,
             recovered_dispatches: recovery.recovered_dispatches,
-            tracker_admissions: recovery.tracker_admissions,
             queued_resumes: queued_resumes,
             cleanup_pending: restore_cleanup_pending(recovery.cleanup_pending),
             parked: parked,
@@ -156,7 +153,10 @@ defmodule SymphonyElixir.Orchestrator do
               operator_user_ids_generation: config.tracker.operator_user_ids || [],
               operator_authority_generation: authority_generation,
               tracker_authority_generation: tracker_authority_generation,
-              tracker_context: Tracker.poll_context(config.tracker, tracker_authority_generation)
+              tracker_context: Tracker.poll_context(config.tracker, tracker_authority_generation),
+              tracker_admissions: recovery.tracker_admissions,
+              tracker_fetch_by_ids_fn: Keyword.get(opts, :tracker_fetch_by_ids_fn),
+              tracker_update_state_fn: Keyword.get(opts, :tracker_update_state_fn)
             },
             operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
             codex_totals: @empty_codex_totals,
@@ -714,7 +714,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     %{
       running_ids: running_ids,
-      admission_ids: Map.keys(state.tracker_admissions),
+      admission_ids: Map.keys(tracker_admissions(state)),
       parked_ids: Map.keys(state.parked),
       retry_issue_ids: retry_issue_ids,
       comment_requests: operator_comment_requests(state, operator_user_ids),
@@ -738,6 +738,23 @@ defmodule SymphonyElixir.Orchestrator do
       dispatch_paused: true,
       tracker_authority_valid: false
     }
+  end
+
+  defp tracker_admissions(%State{
+         operator_commands: %OperatorCommandState{tracker_admissions: admissions}
+       }),
+       do: admissions
+
+  defp delete_tracker_admission(
+         %State{operator_commands: %OperatorCommandState{} = operator_commands} = state,
+         issue_id
+       ) do
+    operator_commands = %{
+      operator_commands
+      | tracker_admissions: Map.delete(operator_commands.tracker_admissions, issue_id)
+    }
+
+    %{state | operator_commands: operator_commands}
   end
 
   defp operator_comment_requests(_state, []), do: []
@@ -872,8 +889,8 @@ defmodule SymphonyElixir.Orchestrator do
          {:ok, issues}
        )
        when is_list(issues) do
-    Enum.reduce(Map.keys(state.tracker_admissions), state, fn issue_id, state_acc ->
-      admission = Map.get(state_acc.tracker_admissions, issue_id)
+    Enum.reduce(Map.keys(tracker_admissions(state)), state, fn issue_id, state_acc ->
+      admission = Map.get(tracker_admissions(state_acc), issue_id)
       issue = find_issue_by_id(issues, issue_id)
 
       reconcile_recovered_tracker_admission(state_acc, issue, admission, tracker_context)
@@ -885,7 +902,7 @@ defmodule SymphonyElixir.Orchestrator do
          _request,
          {:error, reason}
        ) do
-    Enum.reduce(state.tracker_admissions, state, fn {_issue_id, admission}, state_acc ->
+    Enum.reduce(tracker_admissions(state), state, fn {_issue_id, admission}, state_acc ->
       park_recovered_tracker_admission(
         state_acc,
         recovered_admission_issue(admission),
@@ -904,9 +921,10 @@ defmodule SymphonyElixir.Orchestrator do
          tracker_context
        )
        when is_map(admission) do
-    with :ok <- TrackerAdmission.verify_recovery_evidence(issue, tracker_context, admission) do
-      reconcile_recovered_tracker_state(state, issue, admission, tracker_context)
-    else
+    case TrackerAdmission.verify_recovery_evidence(issue, tracker_context, admission) do
+      :ok ->
+        reconcile_recovered_tracker_state(state, issue, admission, tracker_context)
+
       {:error, reason} ->
         park_recovered_tracker_admission(
           state,
@@ -2266,7 +2284,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp tracker_update_issue_state(
-         %State{tracker_update_state_fn: update_fn},
+         %State{
+           operator_commands: %OperatorCommandState{tracker_update_state_fn: update_fn}
+         },
          issue_id,
          target_state,
          tracker_context
@@ -2278,7 +2298,9 @@ defmodule SymphonyElixir.Orchestrator do
     do: Tracker.update_issue_state(issue_id, target_state, tracker_context)
 
   defp tracker_fetch_issues_by_ids(
-         %State{tracker_fetch_by_ids_fn: fetch_fn},
+         %State{
+           operator_commands: %OperatorCommandState{tracker_fetch_by_ids_fn: fetch_fn}
+         },
          issue_ids,
          tracker_context
        )
@@ -2323,9 +2345,9 @@ defmodule SymphonyElixir.Orchestrator do
         state
         | parked: Map.put(state.parked, issue.id, wait),
           claimed: MapSet.delete(state.claimed, issue.id),
-          tracker_admissions: Map.delete(state.tracker_admissions, issue.id),
           retry_attempts: Map.delete(state.retry_attempts, issue.id)
       }
+      |> delete_tracker_admission(issue.id)
     else
       {:error, error} ->
         Logger.error("Failed to durably park claimed issue_id=#{issue.id} reason=#{reason}: #{inspect(error)}")
@@ -2431,10 +2453,10 @@ defmodule SymphonyElixir.Orchestrator do
                 claimed: MapSet.put(state.claimed, issue.id),
                 recovered_attempts: Map.delete(state.recovered_attempts, issue.id),
                 recovered_dispatches: Map.delete(state.recovered_dispatches, issue.id),
-                tracker_admissions: Map.delete(state.tracker_admissions, issue.id),
                 queued_resumes: Map.delete(state.queued_resumes, issue.id),
                 retry_attempts: Map.delete(state.retry_attempts, issue.id)
             }
+            |> delete_tracker_admission(issue.id)
             |> initialize_operator_cursor(issue.id, running_entry.started_at)
 
           {:error, reason} ->
@@ -3917,7 +3939,7 @@ defmodule SymphonyElixir.Orchestrator do
       end)
 
     admitting =
-      Enum.map(state.tracker_admissions, fn {issue_id, admission} ->
+      Enum.map(tracker_admissions(state), fn {issue_id, admission} ->
         %{
           issue_id: issue_id,
           run_id: admission.run_id,
@@ -5562,36 +5584,62 @@ defmodule SymphonyElixir.Orchestrator do
         &is_integer/1
       )
 
-    cond do
-      is_integer(input) and is_integer(cached_input) and cached_input <= input ->
-        uncached_input = input - cached_input
+    case classify_uncached_input(
+           input,
+           cached_input,
+           token_usage_observed?,
+           guard_enabled?
+         ) do
+      {:counters, cached_raw, uncached_raw} ->
+        advance_uncached_counters(accounting, cached_raw, uncached_raw)
 
-        with {:ok, cached_component, _cached_delta} <-
-               advance_token_component(accounting.cached_input, cached_input),
-             {:ok, uncached_component, _uncached_delta} <-
-               advance_token_component(accounting.uncached_input, uncached_input) do
-          {cached_component, uncached_component, :valid, nil}
-        else
-          {:error, reason} -> failed_uncached_accounting(accounting, reason)
-        end
+      {:error, reason} ->
+        failed_uncached_accounting(accounting, reason)
 
-      cached_input == :invalid or (is_integer(cached_input) and not is_integer(input)) ->
-        failed_uncached_accounting(accounting, :malformed_cached_input_counter)
-
-      is_integer(input) and is_integer(cached_input) and cached_input > input ->
-        failed_uncached_accounting(accounting, :cached_input_exceeds_input)
-
-      token_usage_observed? and guard_enabled? ->
-        failed_uncached_accounting(accounting, :missing_cached_input_counter)
-
-      true ->
-        {
-          accounting.cached_input,
-          accounting.uncached_input,
-          accounting.uncached_integrity,
-          accounting.uncached_failure
-        }
+      :unavailable ->
+        unchanged_uncached_accounting(accounting)
     end
+  end
+
+  defp classify_uncached_input(input, cached_input, _observed?, _guard_enabled?)
+       when is_integer(input) and is_integer(cached_input) and cached_input <= input,
+       do: {:counters, cached_input, input - cached_input}
+
+  defp classify_uncached_input(_input, :invalid, _observed?, _guard_enabled?),
+    do: {:error, :malformed_cached_input_counter}
+
+  defp classify_uncached_input(input, cached_input, _observed?, _guard_enabled?)
+       when is_integer(cached_input) and not is_integer(input),
+       do: {:error, :malformed_cached_input_counter}
+
+  defp classify_uncached_input(input, cached_input, _observed?, _guard_enabled?)
+       when is_integer(input) and is_integer(cached_input) and cached_input > input,
+       do: {:error, :cached_input_exceeds_input}
+
+  defp classify_uncached_input(_input, _cached_input, true, true),
+    do: {:error, :missing_cached_input_counter}
+
+  defp classify_uncached_input(_input, _cached_input, _observed?, _guard_enabled?),
+    do: :unavailable
+
+  defp advance_uncached_counters(accounting, cached_raw, uncached_raw) do
+    with {:ok, cached_component, _cached_delta} <-
+           advance_token_component(accounting.cached_input, cached_raw),
+         {:ok, uncached_component, _uncached_delta} <-
+           advance_token_component(accounting.uncached_input, uncached_raw) do
+      {cached_component, uncached_component, :valid, nil}
+    else
+      {:error, reason} -> failed_uncached_accounting(accounting, reason)
+    end
+  end
+
+  defp unchanged_uncached_accounting(accounting) do
+    {
+      accounting.cached_input,
+      accounting.uncached_input,
+      accounting.uncached_integrity,
+      accounting.uncached_failure
+    }
   end
 
   defp failed_uncached_accounting(accounting, reason) do

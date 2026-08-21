@@ -2678,14 +2678,16 @@ defmodule SymphonyElixir.CoreTest do
     state =
       state
       |> due_dispatch_state(issue.id)
-      |> Map.put(:tracker_update_state_fn, fn issue_id, target_state, _context ->
-        send(parent, {:tracker_state_updated, issue_id, target_state})
-        :ok
-      end)
-      |> Map.put(:tracker_fetch_by_ids_fn, fn issue_ids, _context ->
-        send(parent, {:tracker_issue_read_back, issue_ids})
-        {:ok, [%{issue | state: "Agent Running"}]}
-      end)
+      |> put_tracker_admission_io(
+        update: fn issue_id, target_state, _context ->
+          send(parent, {:tracker_state_updated, issue_id, target_state})
+          :ok
+        end,
+        fetch: fn issue_ids, _context ->
+          send(parent, {:tracker_issue_read_back, issue_ids})
+          {:ok, [%{issue | state: "Agent Running"}]}
+        end
+      )
       |> Map.put(:task_start_fn, fn _task ->
         send(parent, :agent_task_started)
         {:ok, spawn(fn -> Process.sleep(:infinity) end)}
@@ -2743,10 +2745,12 @@ defmodule SymphonyElixir.CoreTest do
     state =
       state
       |> due_dispatch_state(issue.id)
-      |> Map.put(:tracker_update_state_fn, fn _issue_id, _target_state, _context -> :ok end)
-      |> Map.put(:tracker_fetch_by_ids_fn, fn _issue_ids, _context ->
-        {:ok, [%{issue | state: "Agent Running", title: "Concurrent edit"}]}
-      end)
+      |> put_tracker_admission_io(
+        update: fn _issue_id, _target_state, _context -> :ok end,
+        fetch: fn _issue_ids, _context ->
+          {:ok, [%{issue | state: "Agent Running", title: "Concurrent edit"}]}
+        end
+      )
       |> Map.put(:task_start_fn, fn _task ->
         send(parent, :unexpected_agent_task_start)
         {:error, :must_not_start}
@@ -2789,13 +2793,15 @@ defmodule SymphonyElixir.CoreTest do
     state =
       state
       |> due_dispatch_state(issue.id)
-      |> Map.put(:tracker_update_state_fn, fn _issue_id, _target_state, _context ->
-        {:error, :synthetic_tracker_failure}
-      end)
-      |> Map.put(:tracker_fetch_by_ids_fn, fn _issue_ids, _context ->
-        send(parent, :unexpected_admission_readback)
-        {:ok, []}
-      end)
+      |> put_tracker_admission_io(
+        update: fn _issue_id, _target_state, _context ->
+          {:error, :synthetic_tracker_failure}
+        end,
+        fetch: fn _issue_ids, _context ->
+          send(parent, :unexpected_admission_readback)
+          {:ok, []}
+        end
+      )
       |> Map.put(:task_start_fn, fn _task ->
         send(parent, :unexpected_agent_task_start)
         {:error, :must_not_start}
@@ -2824,10 +2830,12 @@ defmodule SymphonyElixir.CoreTest do
 
     state =
       state
-      |> Map.put(:tracker_update_state_fn, fn _issue_id, _target_state, _context ->
-        send(parent, :unexpected_recovery_mutation)
-        :ok
-      end)
+      |> put_tracker_admission_io(
+        update: fn _issue_id, _target_state, _context ->
+          send(parent, :unexpected_recovery_mutation)
+          :ok
+        end
+      )
       |> Map.put(:task_start_fn, fn _task ->
         send(parent, :recovered_agent_task_started)
         {:ok, spawn(fn -> Process.sleep(:infinity) end)}
@@ -2854,7 +2862,7 @@ defmodule SymphonyElixir.CoreTest do
     refute_received :unexpected_recovery_mutation
     assert_receive :recovered_agent_task_started
     assert Map.has_key?(recovered.running, ready_issue.id)
-    refute Map.has_key?(recovered.tracker_admissions, ready_issue.id)
+    refute Map.has_key?(tracker_admissions_for_test(recovered), ready_issue.id)
 
     assert {:ok, events} = RunLedger.read_events(ledger_path)
 
@@ -2882,14 +2890,16 @@ defmodule SymphonyElixir.CoreTest do
 
     state =
       state
-      |> Map.put(:tracker_update_state_fn, fn issue_id, target_state, _context ->
-        send(parent, {:recovery_mutation, issue_id, target_state})
-        :ok
-      end)
-      |> Map.put(:tracker_fetch_by_ids_fn, fn [issue_id], _context ->
-        send(parent, {:recovery_readback, issue_id})
-        {:ok, [%{ready_issue | state: "Agent Running"}]}
-      end)
+      |> put_tracker_admission_io(
+        update: fn issue_id, target_state, _context ->
+          send(parent, {:recovery_mutation, issue_id, target_state})
+          :ok
+        end,
+        fetch: fn [issue_id], _context ->
+          send(parent, {:recovery_readback, issue_id})
+          {:ok, [%{ready_issue | state: "Agent Running"}]}
+        end
+      )
       |> Map.put(:task_start_fn, fn _task ->
         send(parent, :source_recovered_agent_task_started)
         {:ok, spawn(fn -> Process.sleep(:infinity) end)}
@@ -2940,7 +2950,7 @@ defmodule SymphonyElixir.CoreTest do
 
     refute_received :unexpected_conflict_model_start
     assert conflict.parked[issue.id].reason == "tracker_admission_conflict"
-    refute Map.has_key?(conflict.tracker_admissions, issue.id)
+    refute Map.has_key?(tracker_admissions_for_test(conflict), issue.id)
 
     {failed_state, failed_issue, failed_context, _failed_ledger_path} =
       recovered_admission_fixture("read-failed")
@@ -2960,7 +2970,7 @@ defmodule SymphonyElixir.CoreTest do
 
     refute_received :unexpected_failed_model_start
     assert failed.parked[failed_issue.id].reason == "tracker_admission_failed"
-    refute Map.has_key?(failed.tracker_admissions, failed_issue.id)
+    refute Map.has_key?(tracker_admissions_for_test(failed), failed_issue.id)
   end
 
   test "tracker terminal ledger failure blocks worker stop cleanup and claim release" do
@@ -6457,13 +6467,28 @@ defmodule SymphonyElixir.CoreTest do
       run_ledger_path: ledger_path,
       run_ledger_append_fn: &RunLedger.append/2,
       runner_generation: "runner-recovered-admission-#{tag}",
-      tracker_admissions: %{issue.id => recovery_entry},
+      operator_commands: %Orchestrator.OperatorCommandState{
+        tracker_admissions: %{issue.id => recovery_entry}
+      },
       claimed: MapSet.new([issue.id]),
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
     {state, issue, context, ledger_path}
   end
+
+  defp put_tracker_admission_io(state, opts) do
+    operator_commands = %{
+      state.operator_commands
+      | tracker_update_state_fn: Keyword.get(opts, :update, state.operator_commands.tracker_update_state_fn),
+        tracker_fetch_by_ids_fn: Keyword.get(opts, :fetch, state.operator_commands.tracker_fetch_by_ids_fn)
+    }
+
+    %{state | operator_commands: operator_commands}
+  end
+
+  defp tracker_admissions_for_test(state),
+    do: state.operator_commands.tracker_admissions
 
   defp seed_durable_retry_ledger!(path, run_id, issue, workspace, workspace_root) do
     base = %{

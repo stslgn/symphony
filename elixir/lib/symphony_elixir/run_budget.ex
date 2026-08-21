@@ -47,54 +47,57 @@ defmodule SymphonyElixir.RunBudget do
 
   @spec snapshot(limits(), map()) :: map()
   def snapshot(limits, metrics) when is_map(limits) and is_map(metrics) do
-    turns_used = non_negative_integer(Map.get(metrics, :turns))
-    seconds_used = non_negative_integer(Map.get(metrics, :seconds))
+    %{
+      turns:
+        allowance(
+          Map.fetch!(limits, :max_turns),
+          non_negative_integer(Map.get(metrics, :turns))
+        ),
+      tokens: total_token_snapshot(limits, metrics),
+      uncached_input_tokens: uncached_input_snapshot(limits, metrics),
+      time:
+        allowance(
+          Map.get(limits, :max_seconds),
+          non_negative_integer(Map.get(metrics, :seconds))
+        )
+    }
+  end
+
+  defp total_token_snapshot(limits, metrics) do
     reported_observed? = Map.get(metrics, :token_telemetry_observed, false) == true
-    tokens_used = non_negative_integer(Map.get(metrics, :tokens))
-    token_limit = Map.get(limits, :max_tokens)
-    telemetry_integrity = telemetry_integrity(metrics, reported_observed?)
-    integrity_failed? = telemetry_integrity == :failed
-    telemetry_observed? = reported_observed? and telemetry_integrity == :valid
-
-    uncached_reported_observed? =
-      Map.get(metrics, :uncached_input_telemetry_observed, false) == true
-
-    uncached_tokens_used = non_negative_integer(Map.get(metrics, :uncached_input_tokens))
-    uncached_token_limit = Map.get(limits, :max_uncached_input_tokens)
-
-    uncached_telemetry_integrity =
-      uncached_telemetry_integrity(metrics, uncached_reported_observed?)
-
-    uncached_integrity_failed? = uncached_telemetry_integrity == :failed
-
-    uncached_telemetry_observed? =
-      uncached_reported_observed? and uncached_telemetry_integrity == :valid
+    used = non_negative_integer(Map.get(metrics, :tokens))
+    limit = Map.get(limits, :max_tokens)
+    integrity = telemetry_integrity(metrics, reported_observed?)
+    integrity_failed? = integrity == :failed
+    observed? = reported_observed? and integrity == :valid
 
     %{
-      turns: allowance(Map.fetch!(limits, :max_turns), turns_used),
-      tokens: %{
-        limit: token_limit,
-        used: if(telemetry_observed? or integrity_failed?, do: tokens_used),
-        remaining: if(telemetry_observed?, do: remaining(token_limit, tokens_used)),
-        telemetry_observed: telemetry_observed?,
-        telemetry_integrity: Atom.to_string(telemetry_integrity),
-        integrity_error: integrity_error(metrics, integrity_failed?)
-      },
-      uncached_input_tokens: %{
-        limit: uncached_token_limit,
-        used:
-          if(uncached_telemetry_observed? or uncached_integrity_failed?,
-            do: uncached_tokens_used
-          ),
-        remaining:
-          if(uncached_telemetry_observed?,
-            do: remaining(uncached_token_limit, uncached_tokens_used)
-          ),
-        telemetry_observed: uncached_telemetry_observed?,
-        telemetry_integrity: Atom.to_string(uncached_telemetry_integrity),
-        integrity_error: uncached_integrity_error(metrics, uncached_integrity_failed?)
-      },
-      time: allowance(Map.get(limits, :max_seconds), seconds_used)
+      limit: limit,
+      used: if(observed? or integrity_failed?, do: used),
+      remaining: if(observed?, do: remaining(limit, used)),
+      telemetry_observed: observed?,
+      telemetry_integrity: Atom.to_string(integrity),
+      integrity_error: integrity_error(metrics, integrity_failed?)
+    }
+  end
+
+  defp uncached_input_snapshot(limits, metrics) do
+    reported_observed? =
+      Map.get(metrics, :uncached_input_telemetry_observed, false) == true
+
+    used = non_negative_integer(Map.get(metrics, :uncached_input_tokens))
+    limit = Map.get(limits, :max_uncached_input_tokens)
+    integrity = uncached_telemetry_integrity(metrics, reported_observed?)
+    integrity_failed? = integrity == :failed
+    observed? = reported_observed? and integrity == :valid
+
+    %{
+      limit: limit,
+      used: if(observed? or integrity_failed?, do: used),
+      remaining: if(observed?, do: remaining(limit, used)),
+      telemetry_observed: observed?,
+      telemetry_integrity: Atom.to_string(integrity),
+      integrity_error: uncached_integrity_error(metrics, integrity_failed?)
     }
   end
 

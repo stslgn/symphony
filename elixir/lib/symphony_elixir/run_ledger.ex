@@ -970,17 +970,16 @@ defmodule SymphonyElixir.RunLedger do
 
   defp validate_sha256_fields(event, fields) do
     Enum.reduce_while(fields, :ok, fn field, :ok ->
-      case Map.fetch(event, field) do
-        {:ok, value} when is_binary(value) ->
-          if Regex.match?(~r/\A[0-9a-f]{64}\z/, value),
-            do: {:cont, :ok},
-            else: {:halt, {:error, {:invalid_field, field}}}
-
-        _other ->
-          {:halt, {:error, {:invalid_field, field}}}
-      end
+      if valid_sha256?(Map.get(event, field)),
+        do: {:cont, :ok},
+        else: {:halt, {:error, {:invalid_field, field}}}
     end)
   end
+
+  defp valid_sha256?(value) when is_binary(value),
+    do: Regex.match?(~r/\A[0-9a-f]{64}\z/, value)
+
+  defp valid_sha256?(_value), do: false
 
   defp validate_typed_wait(_event, false), do: :ok
 
