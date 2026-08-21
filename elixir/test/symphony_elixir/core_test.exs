@@ -2246,21 +2246,27 @@ defmodule SymphonyElixir.CoreTest do
   test "workspace cleanup timeout stays responsive and requires an operator retry" do
     root = parked_workspace_root("async-cleanup-timeout")
     workspace = Path.join(root, "MT-ASYNC-TIMEOUT")
+    remote_url = install_durable_local_workspace!(workspace)
     fake_bin = Path.join(root, "fake-bin")
     fake_git = Path.join(fake_bin, "git")
     trace_file = Path.join(root, "git.trace")
     process_group_file = Path.join(root, "git-process-group.pid")
     child_pid_file = Path.join(root, "git-child.pid")
+    verifier_root_file = Path.join(root, "git-verifier-root.path")
     issue_id = "issue-async-timeout"
     server_name = Module.concat(__MODULE__, :AsyncCleanupTimeout)
     previous_path = System.get_env("PATH")
+    real_git = System.find_executable("git")
 
-    File.mkdir_p!(workspace)
-    File.write!(Path.join(workspace, "preserve.txt"), "must survive\n")
     File.mkdir_p!(fake_bin)
 
     File.write!(fake_git, """
     #!/bin/sh
+    if [ "$1" != '-C' ] || [ "$3" != 'fetch' ]; then
+      exec '#{real_git}' "$@"
+    fi
+    verifier_root=${2%/repo.git}
+    printf '%s\\n' "$verifier_root" > '#{verifier_root_file}'
     printf 'called\\n' >> '#{trace_file}'
     printf '%s\\n' "$$" > '#{process_group_file}'
     (
@@ -2279,13 +2285,14 @@ defmodule SymphonyElixir.CoreTest do
 
     on_exit(fn ->
       terminate_test_process_group(process_group_file)
+      remove_test_durability_verifier(verifier_root_file)
       restore_env("PATH", previous_path)
     end)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       workspace_root: root,
-      workspace_durability_remote_url: "/srv/git/repo.git",
+      workspace_durability_remote_url: remote_url,
       hook_timeout_ms: 1_000,
       poll_interval_ms: 60_000
     )
@@ -2338,7 +2345,7 @@ defmodule SymphonyElixir.CoreTest do
 
     assert MapSet.member?(preserved.claimed, issue_id)
     refute File.exists?(workspace)
-    assert File.read!(Path.join(workspace <> ".symphony-cleanup", "preserve.txt")) == "must survive\n"
+    assert File.read!(Path.join(workspace <> ".symphony-cleanup", "tracked.txt")) == "durable\n"
     assert File.read!(trace_file) == "called\n"
 
     process_group = process_group_file |> File.read!() |> String.trim() |> String.to_integer()
@@ -2346,6 +2353,9 @@ defmodule SymphonyElixir.CoreTest do
 
     assert_os_process_stopped(process_group)
     assert_os_process_stopped(child_pid)
+
+    verifier_root = verifier_root_file |> File.read!() |> String.trim()
+    assert_path_removed(verifier_root)
 
     send(pid, :start_pending_workspace_cleanups)
     send(pid, :start_pending_workspace_cleanups)
@@ -6777,6 +6787,21 @@ defmodule SymphonyElixir.CoreTest do
     refute os_process_alive?(pid), "expected OS process #{pid} to stop"
   end
 
+  defp assert_path_removed(path, attempts \\ 100)
+
+  defp assert_path_removed(path, attempts) when attempts > 0 do
+    if File.exists?(path) do
+      Process.sleep(10)
+      assert_path_removed(path, attempts - 1)
+    else
+      :ok
+    end
+  end
+
+  defp assert_path_removed(path, 0) do
+    refute File.exists?(path), "expected temporary path #{path} to be removed"
+  end
+
   defp terminate_test_process_group(process_group_file) do
     case File.read(process_group_file) do
       {:ok, raw_pid} ->
@@ -6787,6 +6812,22 @@ defmodule SymphonyElixir.CoreTest do
           ["-KILL", "--", "-#{process_group}"],
           stderr_to_stdout: true
         )
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp remove_test_durability_verifier(verifier_root_file) do
+    case File.read(verifier_root_file) do
+      {:ok, verifier_root} ->
+        verifier_root = String.trim(verifier_root)
+        expected_parent = Path.expand(System.tmp_dir!())
+
+        if Path.dirname(verifier_root) == expected_parent and
+             String.starts_with?(Path.basename(verifier_root), "symphony-durability-") do
+          File.rm_rf(verifier_root)
+        end
 
       {:error, _reason} ->
         :ok

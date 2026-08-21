@@ -503,9 +503,30 @@ defmodule SymphonyElixir.Workspace do
     do: {:error, :workspace_preservation_required}
 
   defp validate_local_head_durable(workspace, remote_url) do
+    owner = self()
+    result_ref = make_ref()
+
+    {validator, validator_ref} =
+      spawn_monitor(fn ->
+        result = run_local_head_durability_validation(workspace, remote_url, owner)
+        send(owner, {result_ref, result})
+      end)
+
+    receive do
+      {^result_ref, result} ->
+        Process.demonitor(validator_ref, [:flush])
+        result
+
+      {:DOWN, ^validator_ref, :process, ^validator, _reason} ->
+        {:error, :workspace_preservation_required}
+    end
+  end
+
+  defp run_local_head_durability_validation(workspace, remote_url, cancellation_owner) do
     verifier_root = Path.join(System.tmp_dir!(), "symphony-durability-" <> cleanup_token())
     verifier_repo = Path.join(verifier_root, "repo.git")
     verifier_home = Path.join(verifier_root, "home")
+    cancellation_ref = Process.monitor(cancellation_owner)
 
     git_env = [
       {"GIT_CONFIG_NOSYSTEM", "1"},
@@ -517,22 +538,28 @@ defmodule SymphonyElixir.Workspace do
     ]
 
     try do
-      with {head_oid, 0} <-
+      with :ok <- continue_local_durability_validation(cancellation_owner, cancellation_ref),
+           {head_oid, 0} <-
              run_bounded_system_command(
                "git",
                ["-C", workspace, "rev-parse", "--verify", "HEAD^{commit}"],
                [stderr_to_stdout: true],
-               Config.settings!().hooks.timeout_ms
+               Config.settings!().hooks.timeout_ms,
+               cancellation_owner
              ),
+           :ok <- continue_local_durability_validation(cancellation_owner, cancellation_ref),
            :ok <- File.mkdir_p(verifier_home),
            :ok <- File.chmod(verifier_root, 0o700),
+           :ok <- continue_local_durability_validation(cancellation_owner, cancellation_ref),
            {_output, 0} <-
              run_bounded_system_command(
                "git",
                ["init", "--quiet", "--bare", verifier_repo],
                [stderr_to_stdout: true, env: git_env],
-               Config.settings!().hooks.timeout_ms
+               Config.settings!().hooks.timeout_ms,
+               cancellation_owner
              ),
+           :ok <- continue_local_durability_validation(cancellation_owner, cancellation_ref),
            {_output, 0} <-
              run_bounded_system_command(
                "git",
@@ -547,8 +574,10 @@ defmodule SymphonyElixir.Workspace do
                  "+refs/heads/*:refs/verify/*"
                ],
                [stderr_to_stdout: true, env: git_env],
-               Config.settings!().hooks.timeout_ms
+               Config.settings!().hooks.timeout_ms,
+               cancellation_owner
              ),
+           :ok <- continue_local_durability_validation(cancellation_owner, cancellation_ref),
            {remote_refs, 0} <-
              run_bounded_system_command(
                "git",
@@ -562,7 +591,8 @@ defmodule SymphonyElixir.Workspace do
                  "refs/verify/"
                ],
                [stderr_to_stdout: true, env: git_env],
-               Config.settings!().hooks.timeout_ms
+               Config.settings!().hooks.timeout_ms,
+               cancellation_owner
              ) do
         if String.trim(remote_refs) == "",
           do: {:error, :workspace_preservation_required},
@@ -571,7 +601,20 @@ defmodule SymphonyElixir.Workspace do
         {_output, _status} -> {:error, :workspace_preservation_required}
       end
     after
+      Process.demonitor(cancellation_ref, [:flush])
       File.rm_rf(verifier_root)
+    end
+  end
+
+  defp continue_local_durability_validation(cancellation_owner, cancellation_ref) do
+    receive do
+      {:DOWN, ^cancellation_ref, :process, ^cancellation_owner, _reason} ->
+        {:error, :workspace_preservation_required}
+    after
+      0 ->
+        if Process.alive?(cancellation_owner),
+          do: :ok,
+          else: {:error, :workspace_preservation_required}
     end
   end
 
@@ -692,6 +735,12 @@ defmodule SymphonyElixir.Workspace do
   defp run_bounded_system_command(command, args, opts, timeout_ms)
        when is_binary(command) and is_list(args) and is_list(opts) and is_integer(timeout_ms) and
               timeout_ms > 0 do
+    run_bounded_system_command(command, args, opts, timeout_ms, nil)
+  end
+
+  defp run_bounded_system_command(command, args, opts, timeout_ms, cancellation_owner)
+       when is_binary(command) and is_list(args) and is_list(opts) and is_integer(timeout_ms) and
+              timeout_ms > 0 and (is_nil(cancellation_owner) or is_pid(cancellation_owner)) do
     case System.find_executable(command) do
       nil ->
         {"", 127}
@@ -702,7 +751,15 @@ defmodule SymphonyElixir.Workspace do
 
         {runner, runner_ref} =
           spawn_monitor(fn ->
-            run_owned_system_command(owner, result_ref, executable, args, opts, timeout_ms)
+            run_owned_system_command(
+              owner,
+              result_ref,
+              executable,
+              args,
+              opts,
+              timeout_ms,
+              cancellation_owner
+            )
           end)
 
         receive do
@@ -716,8 +773,17 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp run_owned_system_command(owner, result_ref, executable, args, opts, timeout_ms) do
+  defp run_owned_system_command(
+         owner,
+         result_ref,
+         executable,
+         args,
+         opts,
+         timeout_ms,
+         cancellation_owner
+       ) do
     owner_ref = Process.monitor(owner)
+    cancellation_ref = monitor_owned_command_cancellation(cancellation_owner, owner)
 
     port_opts =
       [
@@ -741,6 +807,8 @@ defmodule SymphonyElixir.Workspace do
       port,
       owner,
       owner_ref,
+      cancellation_owner,
+      cancellation_ref,
       result_ref,
       timeout_ref,
       os_pid,
@@ -752,6 +820,8 @@ defmodule SymphonyElixir.Workspace do
          port,
          owner,
          owner_ref,
+         cancellation_owner,
+         cancellation_ref,
          result_ref,
          timeout_ref,
          os_pid,
@@ -763,6 +833,8 @@ defmodule SymphonyElixir.Workspace do
           port,
           owner,
           owner_ref,
+          cancellation_owner,
+          cancellation_ref,
           result_ref,
           timeout_ref,
           os_pid,
@@ -772,14 +844,24 @@ defmodule SymphonyElixir.Workspace do
       {^port, {:exit_status, status}} ->
         Process.cancel_timer(timeout_ref)
         Process.demonitor(owner_ref, [:flush])
+        demonitor_owned_command_cancellation(cancellation_ref)
         send(owner, {result_ref, {owned_system_command_output(output_chunks), status}})
 
       {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
         Process.cancel_timer(timeout_ref)
+        demonitor_owned_command_cancellation(cancellation_ref)
         terminate_owned_system_command(port, os_pid)
+
+      {:DOWN, ^cancellation_ref, :process, ^cancellation_owner, _reason}
+      when is_reference(cancellation_ref) ->
+        Process.cancel_timer(timeout_ref)
+        Process.demonitor(owner_ref, [:flush])
+        terminate_owned_system_command(port, os_pid)
+        send(owner, {result_ref, {owned_system_command_output(output_chunks), 124}})
 
       {:owned_command_timeout, ^result_ref} ->
         Process.demonitor(owner_ref, [:flush])
+        demonitor_owned_command_cancellation(cancellation_ref)
         terminate_owned_system_command(port, os_pid)
         send(owner, {result_ref, {owned_system_command_output(output_chunks), 124}})
     end
@@ -802,6 +884,17 @@ defmodule SymphonyElixir.Workspace do
       end)
     )
   end
+
+  defp monitor_owned_command_cancellation(nil, _owner), do: nil
+  defp monitor_owned_command_cancellation(owner, owner), do: nil
+
+  defp monitor_owned_command_cancellation(cancellation_owner, _owner),
+    do: Process.monitor(cancellation_owner)
+
+  defp demonitor_owned_command_cancellation(cancellation_ref) when is_reference(cancellation_ref),
+    do: Process.demonitor(cancellation_ref, [:flush])
+
+  defp demonitor_owned_command_cancellation(_cancellation_ref), do: false
 
   defp terminate_owned_system_command(port, os_pid) do
     group_termination? = terminate_owned_system_command_group(port, os_pid)
