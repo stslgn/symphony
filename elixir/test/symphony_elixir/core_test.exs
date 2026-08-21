@@ -2662,6 +2662,155 @@ defmodule SymphonyElixir.CoreTest do
     Process.cancel_timer(spawn_failed.retry_attempts[spawn_issue.id].timer_ref)
   end
 
+  test "Agent Ready admission is durably read back before an agent task starts" do
+    {state, issue, ledger_path, workspace_root} = pending_dispatch_fixture("tracker-admission")
+    issue = %{issue | state: "Agent Ready", labels: ["zeta", "alpha"]}
+    workspace = Path.join(workspace_root, issue.identifier)
+    parent = self()
+
+    state =
+      state
+      |> due_dispatch_state(issue.id)
+      |> Map.put(:tracker_update_state_fn, fn issue_id, target_state, _context ->
+        send(parent, {:tracker_state_updated, issue_id, target_state})
+        :ok
+      end)
+      |> Map.put(:tracker_fetch_by_ids_fn, fn issue_ids, _context ->
+        send(parent, {:tracker_issue_read_back, issue_ids})
+        {:ok, [%{issue | state: "Agent Running"}]}
+      end)
+      |> Map.put(:task_start_fn, fn _task ->
+        send(parent, :agent_task_started)
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end)
+
+    admitted =
+      Orchestrator.claim_and_start_issue_for_test(
+        state,
+        issue,
+        2,
+        nil,
+        workspace,
+        workspace_root,
+        nil,
+        Tracker.current_poll_context()
+      )
+
+    expected_issue_id = issue.id
+    assert_receive {:tracker_state_updated, ^expected_issue_id, "Agent Running"}
+    assert_receive {:tracker_issue_read_back, [issue_id]}
+    assert issue_id == issue.id
+    assert_receive :agent_task_started
+
+    assert %{issue: %Issue{state: "Agent Running"}, admission: admission} =
+             admitted.running[issue.id]
+
+    assert admission.issue_snapshot_schema == "symphony.issue_snapshot.v1"
+    assert byte_size(admission.issue_snapshot_sha256) == 64
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+
+    assert Enum.map(events, & &1["transition"]) == [
+             "run_claimed",
+             "run_started",
+             "run_failed",
+             "retry_scheduled",
+             "run_claimed",
+             "tracker_admission_io_started",
+             "tracker_admission_completed",
+             "run_started",
+             "operator_cursor_initialized"
+           ]
+
+    running_entry = admitted.running[issue.id]
+    Process.exit(running_entry.pid, :kill)
+    Process.demonitor(running_entry.ref, [:flush])
+  end
+
+  test "admission conflict parks the claim without starting an agent task" do
+    {state, issue, ledger_path, workspace_root} = pending_dispatch_fixture("admission-conflict")
+    issue = %{issue | state: "Agent Ready"}
+    workspace = Path.join(workspace_root, issue.identifier)
+    parent = self()
+
+    state =
+      state
+      |> due_dispatch_state(issue.id)
+      |> Map.put(:tracker_update_state_fn, fn _issue_id, _target_state, _context -> :ok end)
+      |> Map.put(:tracker_fetch_by_ids_fn, fn _issue_ids, _context ->
+        {:ok, [%{issue | state: "Agent Running", title: "Concurrent edit"}]}
+      end)
+      |> Map.put(:task_start_fn, fn _task ->
+        send(parent, :unexpected_agent_task_start)
+        {:error, :must_not_start}
+      end)
+
+    parked =
+      Orchestrator.claim_and_start_issue_for_test(
+        state,
+        issue,
+        2,
+        nil,
+        workspace,
+        workspace_root,
+        nil,
+        Tracker.current_poll_context()
+      )
+
+    refute_received :unexpected_agent_task_start
+    refute Map.has_key?(parked.running, issue.id)
+    refute MapSet.member?(parked.claimed, issue.id)
+
+    assert %{reason: "tracker_admission_conflict", allowed_actions: ["retry", "reject"]} =
+             parked.parked[issue.id]
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+
+    assert Enum.map(Enum.take(events, -3), & &1["transition"]) == [
+             "run_claimed",
+             "tracker_admission_io_started",
+             "run_parked"
+           ]
+  end
+
+  test "admission I/O failure parks the claim without read-back or model start" do
+    {state, issue, _ledger_path, workspace_root} = pending_dispatch_fixture("admission-failed")
+    issue = %{issue | state: "Agent Ready"}
+    workspace = Path.join(workspace_root, issue.identifier)
+    parent = self()
+
+    state =
+      state
+      |> due_dispatch_state(issue.id)
+      |> Map.put(:tracker_update_state_fn, fn _issue_id, _target_state, _context ->
+        {:error, :synthetic_tracker_failure}
+      end)
+      |> Map.put(:tracker_fetch_by_ids_fn, fn _issue_ids, _context ->
+        send(parent, :unexpected_admission_readback)
+        {:ok, []}
+      end)
+      |> Map.put(:task_start_fn, fn _task ->
+        send(parent, :unexpected_agent_task_start)
+        {:error, :must_not_start}
+      end)
+
+    parked =
+      Orchestrator.claim_and_start_issue_for_test(
+        state,
+        issue,
+        2,
+        nil,
+        workspace,
+        workspace_root,
+        nil,
+        Tracker.current_poll_context()
+      )
+
+    refute_received :unexpected_admission_readback
+    refute_received :unexpected_agent_task_start
+    assert parked.parked[issue.id].reason == "tracker_admission_failed"
+  end
+
   test "tracker terminal ledger failure blocks worker stop cleanup and claim release" do
     test_root =
       Path.join(

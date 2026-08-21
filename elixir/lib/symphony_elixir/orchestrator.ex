@@ -19,6 +19,7 @@ defmodule SymphonyElixir.Orchestrator do
     RunLedger,
     StatusDashboard,
     Tracker,
+    TrackerAdmission,
     Workspace
   }
 
@@ -73,6 +74,8 @@ defmodule SymphonyElixir.Orchestrator do
       :run_ledger_path,
       :run_ledger_append_fn,
       :task_start_fn,
+      :tracker_fetch_by_ids_fn,
+      :tracker_update_state_fn,
       :runner_generation,
       poll_generation: 0,
       poll_dirty: false,
@@ -131,6 +134,8 @@ defmodule SymphonyElixir.Orchestrator do
             tick_token: nil,
             run_ledger_path: run_ledger_path,
             run_ledger_append_fn: run_ledger_append_fn,
+            tracker_fetch_by_ids_fn: Keyword.get(opts, :tracker_fetch_by_ids_fn),
+            tracker_update_state_fn: Keyword.get(opts, :tracker_update_state_fn),
             runner_generation: runner_generation,
             dispatch_paused: recovery.dispatch_paused,
             recovered_attempts: recovery.recovered_attempts,
@@ -1887,23 +1892,195 @@ defmodule SymphonyElixir.Orchestrator do
       :ok ->
         state = consume_dispatch_queue(state, issue.id)
 
-        start_issue_task(
-          state,
-          issue,
-          attempt,
-          recipient,
-          worker_host,
-          prepared_workspace,
-          %{
-            run_id: run_id,
-            normalized_attempt: normalized_attempt,
-            tracker_context: tracker_context
-          }
-        )
+        run_context = %{
+          run_id: run_id,
+          normalized_attempt: normalized_attempt,
+          tracker_context: tracker_context,
+          admission: nil
+        }
+
+        if tracker_admission_required?(issue) do
+          admit_and_start_issue(
+            state,
+            issue,
+            attempt,
+            recipient,
+            worker_host,
+            prepared_workspace,
+            run_context
+          )
+        else
+          start_issue_task(
+            state,
+            issue,
+            attempt,
+            recipient,
+            worker_host,
+            prepared_workspace,
+            run_context
+          )
+        end
 
       {:error, reason} ->
         Logger.error("Unable to record durable claim for #{issue_context(issue)}: #{inspect(reason)}")
         defer_pending_dispatch(state, issue.id, reason)
+    end
+  end
+
+  defp tracker_admission_required?(%Issue{state: state}),
+    do: normalize_issue_state(state) == "agent ready"
+
+  defp admit_and_start_issue(
+         state,
+         issue,
+         attempt,
+         recipient,
+         worker_host,
+         prepared_workspace,
+         %{run_id: run_id, normalized_attempt: normalized_attempt, tracker_context: tracker_context} =
+           run_context
+       ) do
+    admission_id = RunLedger.new_id("admission")
+    target_state = "Agent Running"
+
+    with {:ok, admission, snapshot} <-
+           TrackerAdmission.packet(issue, tracker_context, admission_id, target_state),
+         admission_event =
+           tracker_admission_event(
+             issue,
+             worker_host,
+             prepared_workspace,
+             run_id,
+             normalized_attempt,
+             admission
+           ),
+         :ok <-
+           append_run_event(
+             state,
+             Map.put(admission_event, :transition, "tracker_admission_io_started")
+           ),
+         :ok <- tracker_update_issue_state(state, issue.id, target_state, tracker_context),
+         {:ok, issues} <- tracker_fetch_issues_by_ids(state, [issue.id], tracker_context),
+         {:ok, admitted_issue} <-
+           TrackerAdmission.verify_readback(issues, issue.id, snapshot, target_state: target_state),
+         :ok <-
+           append_run_event(
+             state,
+             Map.put(admission_event, :transition, "tracker_admission_completed")
+           ) do
+      start_issue_task(
+        state,
+        admitted_issue,
+        attempt,
+        recipient,
+        worker_host,
+        prepared_workspace,
+        %{run_context | admission: admission}
+      )
+    else
+      {:error, reason} ->
+        parked_reason = tracker_admission_parked_reason(reason)
+
+        Logger.warning("Tracker admission blocked model start for #{issue_context(issue)} reason=#{parked_reason} error_code=#{ObservabilitySanitizer.error_code(reason, "tracker_admission_failed")}")
+
+        park_claimed_issue(
+          state,
+          issue,
+          worker_host,
+          prepared_workspace,
+          run_id,
+          normalized_attempt,
+          parked_reason
+        )
+    end
+  end
+
+  defp tracker_admission_event(
+         issue,
+         worker_host,
+         prepared_workspace,
+         run_id,
+         attempt,
+         admission
+       ) do
+    admission
+    |> Map.merge(%{
+      stage: "admission",
+      run_id: run_id,
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      attempt: attempt,
+      worker_host: worker_host,
+      workspace_path: prepared_workspace.path,
+      workspace_root: prepared_workspace.root
+    })
+  end
+
+  defp tracker_update_issue_state(
+         %State{tracker_update_state_fn: update_fn},
+         issue_id,
+         target_state,
+         tracker_context
+       )
+       when is_function(update_fn, 3),
+       do: update_fn.(issue_id, target_state, tracker_context)
+
+  defp tracker_update_issue_state(_state, issue_id, target_state, tracker_context),
+    do: Tracker.update_issue_state(issue_id, target_state, tracker_context)
+
+  defp tracker_fetch_issues_by_ids(
+         %State{tracker_fetch_by_ids_fn: fetch_fn},
+         issue_ids,
+         tracker_context
+       )
+       when is_function(fetch_fn, 2),
+       do: fetch_fn.(issue_ids, tracker_context)
+
+  defp tracker_fetch_issues_by_ids(_state, issue_ids, tracker_context),
+    do: Tracker.fetch_issue_states_by_ids(issue_ids, tracker_context)
+
+  defp tracker_admission_parked_reason(reason)
+       when reason in [
+              :issue_not_found,
+              :issue_snapshot_conflict,
+              :target_state_not_observed
+            ],
+       do: "tracker_admission_conflict"
+
+  defp tracker_admission_parked_reason(_reason), do: "tracker_admission_failed"
+
+  defp park_claimed_issue(
+         state,
+         issue,
+         worker_host,
+         prepared_workspace,
+         run_id,
+         attempt,
+         reason
+       ) do
+    with {:ok, wait} <-
+           OperatorWait.new(reason, %{
+             issue_id: issue.id,
+             identifier: issue.identifier,
+             run_id: run_id,
+             attempt: attempt,
+             tracker_state: issue.state,
+             worker_host: worker_host,
+             workspace_path: prepared_workspace.path,
+             workspace_root: prepared_workspace.root
+           }),
+         :ok <- append_run_event(state, operator_wait_event(wait, "run_parked")) do
+      %{
+        state
+        | parked: Map.put(state.parked, issue.id, wait),
+          claimed: MapSet.delete(state.claimed, issue.id),
+          retry_attempts: Map.delete(state.retry_attempts, issue.id)
+      }
+    else
+      {:error, error} ->
+        Logger.error("Failed to durably park claimed issue_id=#{issue.id} reason=#{reason}: #{inspect(error)}")
+
+        %{state | claimed: MapSet.put(state.claimed, issue.id)}
     end
   end
 
@@ -1917,7 +2094,8 @@ defmodule SymphonyElixir.Orchestrator do
          %{
            run_id: run_id,
            normalized_attempt: normalized_attempt,
-           tracker_context: tracker_context
+           tracker_context: tracker_context,
+           admission: admission
          }
        ) do
     run_budget = RunBudget.from_agent_config(Config.settings!().agent)
@@ -1933,6 +2111,7 @@ defmodule SymphonyElixir.Orchestrator do
         runner_generation: state.runner_generation,
         stage: "running",
         max_turns: run_budget.max_turns,
+        admission: admission,
         tracker_context: tracker_context
       )
     end
@@ -1954,6 +2133,7 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_root: prepared_workspace.root,
           session_id: nil,
           session_title: nil,
+          admission: admission,
           resolved_model: nil,
           reasoning_effort: nil,
           model_catalog_source: nil,
