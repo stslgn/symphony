@@ -560,6 +560,29 @@ defmodule SymphonyElixir.RunLedgerTest do
     refute File.exists?(path)
   end
 
+  test "accepts the typed uncached-input budget terminal reason" do
+    path = ledger_path()
+    assert :ok = append_claim!(path, "run-uncached", "issue-uncached", "DUD-UNCACHED", 0)
+    assert :ok = append_started!(path, "run-uncached", "issue-uncached", "DUD-UNCACHED", 0)
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "run_parked",
+               stage: "parked",
+               run_id: "run-uncached",
+               issue_id: "issue-uncached",
+               issue_identifier: "DUD-UNCACHED",
+               attempt: 0,
+               wait_id: "wait-uncached",
+               parked_reason: "run_budget_exhausted",
+               allowed_actions: ["retry", "reject"],
+               terminal_reason: "uncached_input_budget_exhausted"
+             })
+
+    assert {:ok, [_claim, _started, parked]} = RunLedger.read_events(path)
+    assert parked["terminal_reason"] == "uncached_input_budget_exhausted"
+  end
+
   test "startup reconciliation restores parked waits until they are resumed" do
     path = ledger_path()
 
