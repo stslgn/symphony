@@ -470,7 +470,7 @@ defmodule SymphonyElixir.Workspace do
     case File.lstat(workspace) do
       {:ok, %File.Stat{type: :directory}} ->
         "git"
-        |> System.cmd(
+        |> run_bounded_system_command(
           [
             "-c",
             "core.fsmonitor=false",
@@ -480,7 +480,8 @@ defmodule SymphonyElixir.Workspace do
             "--porcelain=v1",
             "--untracked-files=normal"
           ],
-          stderr_to_stdout: true
+          [stderr_to_stdout: true],
+          Config.settings!().hooks.timeout_ms
         )
         |> validate_local_git_status(workspace, remote_url)
 
@@ -514,20 +515,23 @@ defmodule SymphonyElixir.Workspace do
 
     try do
       with {head_oid, 0} <-
-             System.cmd(
+             run_bounded_system_command(
                "git",
                ["-C", workspace, "rev-parse", "--verify", "HEAD^{commit}"],
-               stderr_to_stdout: true
+               [stderr_to_stdout: true],
+               Config.settings!().hooks.timeout_ms
              ),
            :ok <- File.mkdir_p(verifier_home),
            :ok <- File.chmod(verifier_root, 0o700),
            {_output, 0} <-
-             System.cmd("git", ["init", "--quiet", "--bare", verifier_repo],
-               stderr_to_stdout: true,
-               env: git_env
+             run_bounded_system_command(
+               "git",
+               ["init", "--quiet", "--bare", verifier_repo],
+               [stderr_to_stdout: true, env: git_env],
+               Config.settings!().hooks.timeout_ms
              ),
            {_output, 0} <-
-             System.cmd(
+             run_bounded_system_command(
                "git",
                [
                  "-C",
@@ -539,11 +543,11 @@ defmodule SymphonyElixir.Workspace do
                  remote_url,
                  "+refs/heads/*:refs/verify/*"
                ],
-               stderr_to_stdout: true,
-               env: git_env
+               [stderr_to_stdout: true, env: git_env],
+               Config.settings!().hooks.timeout_ms
              ),
            {remote_refs, 0} <-
-             System.cmd(
+             run_bounded_system_command(
                "git",
                [
                  "-C",
@@ -554,8 +558,8 @@ defmodule SymphonyElixir.Workspace do
                  String.trim(head_oid),
                  "refs/verify/"
                ],
-               stderr_to_stdout: true,
-               env: git_env
+               [stderr_to_stdout: true, env: git_env],
+               Config.settings!().hooks.timeout_ms
              ) do
         if String.trim(remote_refs) == "",
           do: {:error, :workspace_preservation_required},
@@ -680,6 +684,147 @@ defmodule SymphonyElixir.Workspace do
     12
     |> :crypto.strong_rand_bytes()
     |> Base.encode16(case: :lower)
+  end
+
+  defp run_bounded_system_command(command, args, opts, timeout_ms)
+       when is_binary(command) and is_list(args) and is_list(opts) and is_integer(timeout_ms) and
+              timeout_ms > 0 do
+    case System.find_executable(command) do
+      nil ->
+        {"", 127}
+
+      executable ->
+        owner = self()
+        result_ref = make_ref()
+
+        {runner, runner_ref} =
+          spawn_monitor(fn ->
+            run_owned_system_command(owner, result_ref, executable, args, opts, timeout_ms)
+          end)
+
+        receive do
+          {^result_ref, result} ->
+            Process.demonitor(runner_ref, [:flush])
+            result
+
+          {:DOWN, ^runner_ref, :process, ^runner, _reason} ->
+            {"", 127}
+        end
+    end
+  end
+
+  defp run_owned_system_command(owner, result_ref, executable, args, opts, timeout_ms) do
+    owner_ref = Process.monitor(owner)
+
+    port_opts =
+      [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        args: Enum.map(args, &String.to_charlist/1)
+      ]
+      |> maybe_put_owned_command_env(Keyword.get(opts, :env))
+
+    port = Port.open({:spawn_executable, String.to_charlist(executable)}, port_opts)
+    timeout_ref = Process.send_after(self(), {:owned_command_timeout, result_ref}, timeout_ms)
+
+    os_pid =
+      case Port.info(port, :os_pid) do
+        {:os_pid, pid} when is_integer(pid) -> pid
+        _other -> nil
+      end
+
+    collect_owned_system_command(
+      port,
+      owner,
+      owner_ref,
+      result_ref,
+      timeout_ref,
+      os_pid,
+      []
+    )
+  end
+
+  defp collect_owned_system_command(
+         port,
+         owner,
+         owner_ref,
+         result_ref,
+         timeout_ref,
+         os_pid,
+         output_chunks
+       ) do
+    receive do
+      {^port, {:data, data}} ->
+        collect_owned_system_command(
+          port,
+          owner,
+          owner_ref,
+          result_ref,
+          timeout_ref,
+          os_pid,
+          [data | output_chunks]
+        )
+
+      {^port, {:exit_status, status}} ->
+        Process.cancel_timer(timeout_ref)
+        Process.demonitor(owner_ref, [:flush])
+        send(owner, {result_ref, {owned_system_command_output(output_chunks), status}})
+
+      {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
+        Process.cancel_timer(timeout_ref)
+        terminate_owned_system_command(port, os_pid)
+
+      {:owned_command_timeout, ^result_ref} ->
+        Process.demonitor(owner_ref, [:flush])
+        terminate_owned_system_command(port, os_pid)
+        send(owner, {result_ref, {owned_system_command_output(output_chunks), 124}})
+    end
+  end
+
+  defp owned_system_command_output(output_chunks) do
+    output_chunks
+    |> Enum.reverse()
+    |> IO.iodata_to_binary()
+  end
+
+  defp maybe_put_owned_command_env(port_opts, nil), do: port_opts
+
+  defp maybe_put_owned_command_env(port_opts, env) do
+    Keyword.put(
+      port_opts,
+      :env,
+      Enum.map(env, fn {key, value} ->
+        {String.to_charlist(key), String.to_charlist(value)}
+      end)
+    )
+  end
+
+  defp terminate_owned_system_command(port, os_pid) do
+    if owned_system_command_alive?(port, os_pid) do
+      signal_owned_system_command(os_pid, "TERM")
+      Process.sleep(50)
+
+      if owned_system_command_alive?(port, os_pid) do
+        signal_owned_system_command(os_pid, "KILL")
+      end
+    end
+
+    try do
+      Port.close(port)
+    rescue
+      ArgumentError -> :ok
+    end
+  end
+
+  defp owned_system_command_alive?(port, os_pid) when is_integer(os_pid),
+    do: Port.info(port, :os_pid) == {:os_pid, os_pid}
+
+  defp owned_system_command_alive?(_port, _os_pid), do: false
+
+  defp signal_owned_system_command(os_pid, signal) do
+    System.cmd("/bin/kill", ["-#{signal}", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    :ok
   end
 
   @spec remove_issue_workspaces(term()) :: :ok
