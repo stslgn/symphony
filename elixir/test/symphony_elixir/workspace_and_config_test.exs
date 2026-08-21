@@ -2196,6 +2196,81 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert File.read!(Path.join(quarantine, "README.md")) == "durable remote bytes\n"
   end
 
+  test "remote terminal cleanup ignores output from an unsupported stat dialect" do
+    {:ok, canonical_tmp} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+
+    test_root =
+      Path.join(
+        canonical_tmp,
+        "symphony-elixir-remote-stat-dialect-#{System.unique_integer([:positive])}"
+      )
+
+    worker_host = "worker-stat-dialect"
+    source = Path.join(test_root, "source")
+    remote_root = Path.join(test_root, "remote-workspaces")
+    remote_workspace = Path.join(remote_root, "DUD-158")
+    quarantine = remote_workspace <> ".symphony-cleanup"
+    fake_ssh = Path.join(test_root, "ssh")
+    fake_stat = Path.join(test_root, "stat")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "durable remote bytes\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+    File.mkdir_p!(remote_root)
+    System.cmd("git", ["clone", source, remote_workspace])
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_stat, """
+    #!/bin/sh
+    case "$1" in
+      -c)
+        printf '%s\n' '7:11'
+        exit 0
+        ;;
+      -f)
+        for last_arg do :; done
+        printf 'unsupported-stat-output:%s\n' "$last_arg"
+        exit 1
+        ;;
+      *)
+        exit 64
+        ;;
+    esac
+    """)
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    PATH='#{test_root}':"$PATH"
+    export PATH
+    for last_arg do :; done
+    exec sh -c "$last_arg"
+    """)
+
+    File.chmod!(fake_stat, 0o755)
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: remote_root,
+      workspace_durability_remote_url: source
+    )
+
+    assert {:ok, []} =
+             Workspace.remove_exact_if_durable(remote_workspace, remote_root, worker_host)
+
+    refute File.exists?(remote_workspace)
+    assert File.read!(Path.join(quarantine, "README.md")) == "durable remote bytes\n"
+  end
+
   test "remote terminal cleanup disables worker-controlled fsmonitor" do
     {:ok, canonical_tmp} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
 
