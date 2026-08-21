@@ -239,6 +239,14 @@ Notes:
   and tracker-authority hash. No credential or raw authority value crosses
   this boundary. The worker inherits that completed admission and must not
   repeat the initial mutation/read-back.
+- An admission interrupted by a runner restart retains claim ownership and is
+  exposed under the status snapshot's `admitting` collection. If the exact
+  issue is already in the target state, Symphony completes the same admission
+  without another mutation. If it is still in the exact source state, Symphony
+  retries the mutation once under the same admission ID and reads it back. Any
+  other state, snapshot, or tracker-authority value creates a conflict wait.
+  Tracker read/mutation failure creates a failure wait. Neither recovery path
+  can dispatch a duplicate run or start Codex before durable completion.
 - Managed workflows must use an exact `## Symphony Runtime Prompt` line so
   pickup/watch-loop guidance does not get sent to the worker as task
   instructions.

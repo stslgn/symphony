@@ -107,6 +107,30 @@ defmodule SymphonyElixir.TrackerAdmission do
     end
   end
 
+  @spec verify_recovery_evidence(Issue.t(), PollContext.t(), map()) :: :ok | {:error, term()}
+  def verify_recovery_evidence(
+        %Issue{} = issue,
+        %PollContext{authority_generation: authority_generation},
+        admission
+      )
+      when is_map(admission) do
+    with {:ok, snapshot} <- snapshot(issue),
+         {:ok, current_authority_digest} <- authority_digest(authority_generation),
+         true <-
+           current_authority_digest == Map.get(admission, :tracker_authority_digest) or
+             {:error, :tracker_authority_conflict},
+         true <-
+           (snapshot.schema == Map.get(admission, :issue_snapshot_schema) and
+              snapshot.bytes == Map.get(admission, :issue_snapshot_bytes) and
+              snapshot.sha256 == Map.get(admission, :issue_snapshot_sha256)) or
+             {:error, :issue_snapshot_conflict} do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
+      false -> {:error, :issue_snapshot_conflict}
+    end
+  end
+
   defp authority_digest(nil), do: {:error, :tracker_authority_unavailable}
 
   defp authority_digest(authority_generation) do

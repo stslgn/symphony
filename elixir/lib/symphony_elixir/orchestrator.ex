@@ -87,6 +87,7 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       recovered_attempts: %{},
       recovered_dispatches: %{},
+      tracker_admissions: %{},
       queued_resumes: %{},
       retry_attempts: %{},
       cleanup_pending: %{},
@@ -140,10 +141,15 @@ defmodule SymphonyElixir.Orchestrator do
             dispatch_paused: recovery.dispatch_paused,
             recovered_attempts: recovery.recovered_attempts,
             recovered_dispatches: recovery.recovered_dispatches,
+            tracker_admissions: recovery.tracker_admissions,
             queued_resumes: queued_resumes,
             cleanup_pending: restore_cleanup_pending(recovery.cleanup_pending),
             parked: parked,
-            claimed: recovery.cleanup_pending |> Map.keys() |> MapSet.new(),
+            claimed:
+              recovery.cleanup_pending
+              |> Map.keys()
+              |> Kernel.++(Map.keys(recovery.tracker_admissions))
+              |> MapSet.new(),
             operator_commands: %OperatorCommandState{
               processed_comment_ids: recovery.processed_operator_comment_ids,
               pending_outcomes: restore_pending_operator_outcomes(recovery.pending_operator_outcomes),
@@ -708,6 +714,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     %{
       running_ids: running_ids,
+      admission_ids: Map.keys(state.tracker_admissions),
       parked_ids: Map.keys(state.parked),
       retry_issue_ids: retry_issue_ids,
       comment_requests: operator_comment_requests(state, operator_user_ids),
@@ -723,6 +730,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp blocked_tracker_poll_request do
     %{
       running_ids: [],
+      admission_ids: [],
       parked_ids: [],
       retry_issue_ids: [],
       comment_requests: [],
@@ -751,6 +759,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       request: request,
       running: {:skip, :tracker_authority_invalidated},
+      admissions: {:skip, :tracker_authority_invalidated},
       parked: {:skip, :tracker_authority_invalidated},
       comments: %{},
       dispatch: {:skip, :tracker_authority_invalidated}
@@ -769,6 +778,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       request: request,
       running: fetch_issue_states(request.running_ids, tracker_context),
+      admissions: fetch_issue_states(Map.get(request, :admission_ids, []), tracker_context),
       parked: fetch_issue_states(request.parked_ids, tracker_context),
       comments: fetch_operator_comments(request.comment_requests, tracker_context),
       dispatch: fetch_dispatch_candidates(request.dispatch_paused, tracker_context)
@@ -779,6 +789,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       request: request,
       running: {:skip, reason},
+      admissions: {:skip, reason},
       parked: {:skip, reason},
       comments: %{},
       dispatch: {:skip, reason}
@@ -834,6 +845,10 @@ defmodule SymphonyElixir.Orchestrator do
       effective_operator_user_ids = operator_user_ids(state)
 
       state
+      |> apply_tracker_admission_poll_result(
+        request,
+        Map.get(result, :admissions)
+      )
       |> apply_running_poll_result(
         request.running_ids,
         Map.get(result, :running),
@@ -850,6 +865,226 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp apply_poll_result(%State{} = state, _invalid_result), do: state
+
+  defp apply_tracker_admission_poll_result(
+         %State{} = state,
+         %{tracker_context: %Tracker.PollContext{} = tracker_context},
+         {:ok, issues}
+       )
+       when is_list(issues) do
+    Enum.reduce(Map.keys(state.tracker_admissions), state, fn issue_id, state_acc ->
+      admission = Map.get(state_acc.tracker_admissions, issue_id)
+      issue = find_issue_by_id(issues, issue_id)
+
+      reconcile_recovered_tracker_admission(state_acc, issue, admission, tracker_context)
+    end)
+  end
+
+  defp apply_tracker_admission_poll_result(
+         %State{} = state,
+         _request,
+         {:error, reason}
+       ) do
+    Enum.reduce(state.tracker_admissions, state, fn {_issue_id, admission}, state_acc ->
+      park_recovered_tracker_admission(
+        state_acc,
+        recovered_admission_issue(admission),
+        admission,
+        tracker_admission_parked_reason(reason)
+      )
+    end)
+  end
+
+  defp apply_tracker_admission_poll_result(%State{} = state, _request, _result), do: state
+
+  defp reconcile_recovered_tracker_admission(
+         %State{} = state,
+         %Issue{} = issue,
+         admission,
+         tracker_context
+       )
+       when is_map(admission) do
+    with :ok <- TrackerAdmission.verify_recovery_evidence(issue, tracker_context, admission) do
+      reconcile_recovered_tracker_state(state, issue, admission, tracker_context)
+    else
+      {:error, reason} ->
+        park_recovered_tracker_admission(
+          state,
+          issue,
+          admission,
+          tracker_admission_parked_reason(reason)
+        )
+    end
+  end
+
+  defp reconcile_recovered_tracker_admission(
+         %State{} = state,
+         _missing_issue,
+         admission,
+         _tracker_context
+       )
+       when is_map(admission) do
+    park_recovered_tracker_admission(
+      state,
+      recovered_admission_issue(admission),
+      admission,
+      "tracker_admission_conflict"
+    )
+  end
+
+  defp reconcile_recovered_tracker_admission(state, _issue, _admission, _tracker_context),
+    do: state
+
+  defp reconcile_recovered_tracker_state(state, issue, admission, tracker_context) do
+    cond do
+      issue.state == admission.target_state ->
+        complete_and_start_recovered_admission(state, issue, admission, tracker_context)
+
+      issue.state == admission.source_state and admission.status == "io_started" ->
+        retry_recovered_admission_mutation(state, issue, admission, tracker_context)
+
+      true ->
+        park_recovered_tracker_admission(
+          state,
+          issue,
+          admission,
+          "tracker_admission_conflict"
+        )
+    end
+  end
+
+  defp retry_recovered_admission_mutation(state, issue, admission, tracker_context) do
+    with :ok <-
+           tracker_update_issue_state(
+             state,
+             issue.id,
+             admission.target_state,
+             tracker_context
+           ),
+         {:ok, issues} <- tracker_fetch_issues_by_ids(state, [issue.id], tracker_context),
+         {:ok, admitted_issue} <-
+           TrackerAdmission.verify_readback(
+             issues,
+             issue.id,
+             %{sha256: admission.issue_snapshot_sha256},
+             target_state: admission.target_state
+           ),
+         :ok <-
+           TrackerAdmission.verify_recovery_evidence(
+             admitted_issue,
+             tracker_context,
+             admission
+           ) do
+      complete_and_start_recovered_admission(
+        state,
+        admitted_issue,
+        admission,
+        tracker_context
+      )
+    else
+      {:error, reason} ->
+        park_recovered_tracker_admission(
+          state,
+          issue,
+          admission,
+          tracker_admission_parked_reason(reason)
+        )
+    end
+  end
+
+  defp complete_and_start_recovered_admission(state, issue, admission, tracker_context) do
+    with :ok <- maybe_complete_recovered_admission(state, issue, admission),
+         {:ok, prepared_workspace} <- prepare_recovered_admission_workspace(issue, admission) do
+      start_issue_task(
+        state,
+        issue,
+        admission.attempt,
+        self(),
+        admission.worker_host,
+        prepared_workspace,
+        %{
+          run_id: admission.run_id,
+          normalized_attempt: admission.attempt,
+          tracker_context: tracker_context,
+          admission: recovered_admission_packet(admission)
+        }
+      )
+    else
+      {:error, reason} ->
+        park_recovered_tracker_admission(
+          state,
+          issue,
+          admission,
+          tracker_admission_parked_reason(reason)
+        )
+    end
+  end
+
+  defp maybe_complete_recovered_admission(_state, _issue, %{status: "completed"}), do: :ok
+
+  defp maybe_complete_recovered_admission(state, issue, %{status: "io_started"} = admission) do
+    event =
+      admission
+      |> recovered_admission_packet()
+      |> Map.merge(%{
+        transition: "tracker_admission_completed",
+        stage: "admission",
+        run_id: admission.run_id,
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        attempt: admission.attempt,
+        worker_host: admission.worker_host,
+        workspace_path: admission.workspace_path,
+        workspace_root: admission.workspace_root
+      })
+
+    append_run_event(state, event)
+  end
+
+  defp maybe_complete_recovered_admission(_state, _issue, _admission),
+    do: {:error, :invalid_recovered_admission_status}
+
+  defp prepare_recovered_admission_workspace(issue, admission) do
+    Workspace.prepare_for_issue(issue, admission.worker_host,
+      expected_workspace_path: admission.workspace_path,
+      expected_workspace_root: admission.workspace_root,
+      expected_worker_host: admission.worker_host
+    )
+  end
+
+  defp recovered_admission_packet(admission) do
+    Map.take(admission, [
+      :admission_id,
+      :issue_snapshot_bytes,
+      :issue_snapshot_schema,
+      :issue_snapshot_sha256,
+      :source_state,
+      :target_state,
+      :tracker_authority_digest
+    ])
+  end
+
+  defp recovered_admission_issue(admission) do
+    %Issue{
+      id: admission.issue_id,
+      identifier: admission.identifier,
+      title: admission.identifier,
+      state: admission.source_state,
+      assigned_to_worker: true
+    }
+  end
+
+  defp park_recovered_tracker_admission(state, issue, admission, reason) do
+    park_claimed_issue(
+      state,
+      issue,
+      admission.worker_host,
+      %{path: admission.workspace_path, root: admission.workspace_root},
+      admission.run_id,
+      admission.attempt,
+      reason
+    )
+  end
 
   defp apply_running_poll_result(
          state,
@@ -1167,6 +1402,20 @@ defmodule SymphonyElixir.Orchestrator do
     }
 
     run_test_poll_cycle(state)
+  end
+
+  @doc false
+  @spec reconcile_tracker_admissions_for_test(
+          term(),
+          {:ok, [Issue.t()]} | {:error, term()},
+          Tracker.PollContext.t()
+        ) :: term()
+  def reconcile_tracker_admissions_for_test(
+        %State{} = state,
+        result,
+        %Tracker.PollContext{} = tracker_context
+      ) do
+    apply_tracker_admission_poll_result(state, %{tracker_context: tracker_context}, result)
   end
 
   @doc false
@@ -2074,6 +2323,7 @@ defmodule SymphonyElixir.Orchestrator do
         state
         | parked: Map.put(state.parked, issue.id, wait),
           claimed: MapSet.delete(state.claimed, issue.id),
+          tracker_admissions: Map.delete(state.tracker_admissions, issue.id),
           retry_attempts: Map.delete(state.retry_attempts, issue.id)
       }
     else
@@ -2181,6 +2431,7 @@ defmodule SymphonyElixir.Orchestrator do
                 claimed: MapSet.put(state.claimed, issue.id),
                 recovered_attempts: Map.delete(state.recovered_attempts, issue.id),
                 recovered_dispatches: Map.delete(state.recovered_dispatches, issue.id),
+                tracker_admissions: Map.delete(state.tracker_admissions, issue.id),
                 queued_resumes: Map.delete(state.queued_resumes, issue.id),
                 retry_attempts: Map.delete(state.retry_attempts, issue.id)
             }
@@ -3665,6 +3916,27 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    admitting =
+      Enum.map(state.tracker_admissions, fn {issue_id, admission} ->
+        %{
+          issue_id: issue_id,
+          run_id: admission.run_id,
+          attempt: admission.attempt,
+          stage: "tracker_admission",
+          status: admission.status,
+          identifier: admission.identifier,
+          admission_id: admission.admission_id,
+          source_state: admission.source_state,
+          target_state: admission.target_state,
+          issue_snapshot_schema: admission.issue_snapshot_schema,
+          issue_snapshot_bytes: admission.issue_snapshot_bytes,
+          issue_snapshot_sha256: admission.issue_snapshot_sha256,
+          tracker_authority_digest: admission.tracker_authority_digest,
+          worker_host: admission.worker_host,
+          workspace_path: admission.workspace_path
+        }
+      end)
+
     retrying =
       state.retry_attempts
       |> Enum.map(fn {issue_id, %{attempt: attempt} = retry} ->
@@ -3716,6 +3988,7 @@ defmodule SymphonyElixir.Orchestrator do
        },
        capabilities: capability_snapshot(),
        running: running,
+       admitting: admitting,
        retrying: retrying,
        parked: parked,
        codex_totals: state.codex_totals,

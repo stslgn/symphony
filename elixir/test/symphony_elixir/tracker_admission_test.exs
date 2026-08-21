@@ -2,6 +2,7 @@ defmodule SymphonyElixir.TrackerAdmissionTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.Tracker.PollContext
   alias SymphonyElixir.TrackerAdmission
 
   test "builds deterministic state-independent issue snapshot evidence" do
@@ -44,6 +45,32 @@ defmodule SymphonyElixir.TrackerAdmissionTest do
 
     assert {:error, {:invalid_snapshot_field, :id}} =
              TrackerAdmission.snapshot(issue(id: nil))
+  end
+
+  test "recovery evidence pins snapshot bytes and tracker authority" do
+    context = %PollContext{authority_generation: {:workflow_store, 7}}
+
+    assert {:ok, packet, _snapshot} =
+             TrackerAdmission.packet(
+               issue(),
+               context,
+               "admission-recovery",
+               "Agent Running"
+             )
+
+    assert :ok = TrackerAdmission.verify_recovery_evidence(issue(), context, packet)
+
+    changed_context = %{context | authority_generation: {:workflow_store, 8}}
+
+    assert {:error, :tracker_authority_conflict} =
+             TrackerAdmission.verify_recovery_evidence(issue(), changed_context, packet)
+
+    assert {:error, :issue_snapshot_conflict} =
+             TrackerAdmission.verify_recovery_evidence(
+               issue(title: "Changed"),
+               context,
+               packet
+             )
   end
 
   defp issue(overrides \\ []) do

@@ -2,7 +2,7 @@ defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.AgentRunner, as: RealAgentRunner
-  alias SymphonyElixir.RunLedger
+  alias SymphonyElixir.{RunLedger, TrackerAdmission}
 
   defmodule SnapshotLinearClient do
     def fetch_candidate_issues(context) do
@@ -2816,6 +2816,151 @@ defmodule SymphonyElixir.CoreTest do
     refute_received :unexpected_admission_readback
     refute_received :unexpected_agent_task_start
     assert parked.parked[issue.id].reason == "tracker_admission_failed"
+  end
+
+  test "restart completes an observed target-state admission before one model start" do
+    {state, ready_issue, context, ledger_path} = recovered_admission_fixture("target")
+    parent = self()
+
+    state =
+      state
+      |> Map.put(:tracker_update_state_fn, fn _issue_id, _target_state, _context ->
+        send(parent, :unexpected_recovery_mutation)
+        :ok
+      end)
+      |> Map.put(:task_start_fn, fn _task ->
+        send(parent, :recovered_agent_task_started)
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end)
+
+    assert {:reply, pending_snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, state)
+
+    assert [
+             %{
+               stage: "tracker_admission",
+               status: "io_started",
+               admission_id: "admission-recovered-target"
+             }
+           ] = pending_snapshot.admitting
+
+    recovered =
+      Orchestrator.reconcile_tracker_admissions_for_test(
+        state,
+        {:ok, [%{ready_issue | state: "Agent Running"}]},
+        context
+      )
+
+    refute_received :unexpected_recovery_mutation
+    assert_receive :recovered_agent_task_started
+    assert Map.has_key?(recovered.running, ready_issue.id)
+    refute Map.has_key?(recovered.tracker_admissions, ready_issue.id)
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+
+    assert Enum.count(events, &(&1["transition"] == "tracker_admission_completed")) == 1
+    assert Enum.count(events, &(&1["transition"] == "run_started")) == 1
+
+    repeated =
+      Orchestrator.reconcile_tracker_admissions_for_test(
+        recovered,
+        {:ok, [%{ready_issue | state: "Agent Running"}]},
+        context
+      )
+
+    refute_received :recovered_agent_task_started
+    assert repeated.running[ready_issue.id].run_id == recovered.running[ready_issue.id].run_id
+
+    running_entry = recovered.running[ready_issue.id]
+    Process.exit(running_entry.pid, :kill)
+    Process.demonitor(running_entry.ref, [:flush])
+  end
+
+  test "restart retries source-state admission mutation once under the same admission id" do
+    {state, ready_issue, context, ledger_path} = recovered_admission_fixture("source")
+    parent = self()
+
+    state =
+      state
+      |> Map.put(:tracker_update_state_fn, fn issue_id, target_state, _context ->
+        send(parent, {:recovery_mutation, issue_id, target_state})
+        :ok
+      end)
+      |> Map.put(:tracker_fetch_by_ids_fn, fn [issue_id], _context ->
+        send(parent, {:recovery_readback, issue_id})
+        {:ok, [%{ready_issue | state: "Agent Running"}]}
+      end)
+      |> Map.put(:task_start_fn, fn _task ->
+        send(parent, :source_recovered_agent_task_started)
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end)
+
+    recovered =
+      Orchestrator.reconcile_tracker_admissions_for_test(
+        state,
+        {:ok, [ready_issue]},
+        context
+      )
+
+    expected_issue_id = ready_issue.id
+    assert_receive {:recovery_mutation, ^expected_issue_id, "Agent Running"}
+    assert_receive {:recovery_readback, ^expected_issue_id}
+    assert_receive :source_recovered_agent_task_started
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+
+    assert [completed] =
+             Enum.filter(events, &(&1["transition"] == "tracker_admission_completed"))
+
+    assert completed["admission_id"] == "admission-recovered-source"
+
+    running_entry = recovered.running[ready_issue.id]
+    Process.exit(running_entry.pid, :kill)
+    Process.demonitor(running_entry.ref, [:flush])
+  end
+
+  test "restart parks content conflicts and read failures without a model start" do
+    parent = self()
+
+    {conflict_state, issue, context, _ledger_path} =
+      recovered_admission_fixture("conflict")
+
+    conflict_state =
+      Map.put(conflict_state, :task_start_fn, fn _task ->
+        send(parent, :unexpected_conflict_model_start)
+        {:error, :must_not_start}
+      end)
+
+    conflict =
+      Orchestrator.reconcile_tracker_admissions_for_test(
+        conflict_state,
+        {:ok, [%{issue | state: "Agent Running", title: "Concurrent edit"}]},
+        context
+      )
+
+    refute_received :unexpected_conflict_model_start
+    assert conflict.parked[issue.id].reason == "tracker_admission_conflict"
+    refute Map.has_key?(conflict.tracker_admissions, issue.id)
+
+    {failed_state, failed_issue, failed_context, _failed_ledger_path} =
+      recovered_admission_fixture("read-failed")
+
+    failed_state =
+      Map.put(failed_state, :task_start_fn, fn _task ->
+        send(parent, :unexpected_failed_model_start)
+        {:error, :must_not_start}
+      end)
+
+    failed =
+      Orchestrator.reconcile_tracker_admissions_for_test(
+        failed_state,
+        {:error, :synthetic_tracker_failure},
+        failed_context
+      )
+
+    refute_received :unexpected_failed_model_start
+    assert failed.parked[failed_issue.id].reason == "tracker_admission_failed"
+    refute Map.has_key?(failed.tracker_admissions, failed_issue.id)
   end
 
   test "tracker terminal ledger failure blocks worker stop cleanup and claim release" do
@@ -6235,6 +6380,89 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     {state, issue, ledger_path, workspace_root}
+  end
+
+  defp recovered_admission_fixture(tag) do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-recovered-admission-#{tag}-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    File.mkdir_p!(workspace_root)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    on_exit(fn -> File.rm_rf(test_root) end)
+    {:ok, workspace_root} = SymphonyElixir.PathSafety.canonicalize(workspace_root)
+
+    issue = %Issue{
+      id: "issue-recovered-admission-#{tag}",
+      identifier: "MT-RECOVERED-ADMISSION-#{String.upcase(tag)}",
+      title: "Recovered admission #{tag}",
+      description: "Preserve exact content across restart.",
+      state: "Agent Ready",
+      url: "https://example.org/recovered-admission/#{tag}",
+      labels: ["admission", "restart"],
+      assigned_to_worker: true
+    }
+
+    workspace_path = Path.join(workspace_root, issue.identifier)
+    File.mkdir_p!(workspace_path)
+    ledger_path = Path.join(test_root, "events.jsonl")
+    run_id = "run-recovered-admission-#{tag}"
+    context = Tracker.current_poll_context()
+
+    assert {:ok, packet, _snapshot} =
+             TrackerAdmission.packet(
+               issue,
+               context,
+               "admission-recovered-#{tag}",
+               "Agent Running"
+             )
+
+    base = %{
+      stage: "claimed",
+      run_id: run_id,
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      attempt: 2,
+      workspace_path: workspace_path,
+      workspace_root: workspace_root
+    }
+
+    assert :ok = RunLedger.append(ledger_path, Map.put(base, :transition, "run_claimed"))
+
+    assert :ok =
+             RunLedger.append(
+               ledger_path,
+               base
+               |> Map.merge(packet)
+               |> Map.merge(%{transition: "tracker_admission_io_started", stage: "admission"})
+             )
+
+    recovery_entry =
+      packet
+      |> Map.merge(%{
+        attempt: 2,
+        identifier: issue.identifier,
+        issue_id: issue.id,
+        run_id: run_id,
+        status: "io_started",
+        worker_host: nil,
+        workspace_path: workspace_path,
+        workspace_root: workspace_root
+      })
+
+    state = %Orchestrator.State{
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: &RunLedger.append/2,
+      runner_generation: "runner-recovered-admission-#{tag}",
+      tracker_admissions: %{issue.id => recovery_entry},
+      claimed: MapSet.new([issue.id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    {state, issue, context, ledger_path}
   end
 
   defp seed_durable_retry_ledger!(path, run_id, issue, workspace, workspace_root) do
