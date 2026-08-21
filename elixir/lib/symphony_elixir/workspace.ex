@@ -807,49 +807,44 @@ defmodule SymphonyElixir.Workspace do
         _other -> nil
       end
 
-    collect_owned_system_command(
-      port,
-      owner,
-      owner_ref,
-      cancellation_owner,
-      cancellation_ref,
-      result_ref,
-      timeout_ref,
-      os_pid,
-      0,
-      []
-    )
+    collect_owned_system_command(%{
+      port: port,
+      owner: owner,
+      owner_ref: owner_ref,
+      cancellation_owner: cancellation_owner,
+      cancellation_ref: cancellation_ref,
+      result_ref: result_ref,
+      timeout_ref: timeout_ref,
+      os_pid: os_pid,
+      output_size: 0,
+      output_chunks: []
+    })
   end
 
-  defp collect_owned_system_command(
-         port,
-         owner,
-         owner_ref,
-         cancellation_owner,
-         cancellation_ref,
-         result_ref,
-         timeout_ref,
-         os_pid,
-         output_size,
-         output_chunks
-       ) do
+  defp collect_owned_system_command(state) do
+    %{
+      port: port,
+      owner: owner,
+      owner_ref: owner_ref,
+      cancellation_owner: cancellation_owner,
+      cancellation_ref: cancellation_ref,
+      result_ref: result_ref,
+      timeout_ref: timeout_ref,
+      os_pid: os_pid,
+      output_size: output_size,
+      output_chunks: output_chunks
+    } = state
+
     receive do
       {^port, {:data, data}} ->
         new_output_size = output_size + byte_size(data)
 
         if new_output_size <= @owned_command_output_limit_bytes do
-          collect_owned_system_command(
-            port,
-            owner,
-            owner_ref,
-            cancellation_owner,
-            cancellation_ref,
-            result_ref,
-            timeout_ref,
-            os_pid,
-            new_output_size,
-            [data | output_chunks]
-          )
+          collect_owned_system_command(%{
+            state
+            | output_size: new_output_size,
+              output_chunks: [data | output_chunks]
+          })
         else
           remaining_bytes = @owned_command_output_limit_bytes - output_size
 
