@@ -21,6 +21,11 @@ defmodule SymphonyElixir.TrackerAdmission do
           sha256: String.t()
         }
 
+  @type snapshot_evidence :: %{
+          required(:sha256) => String.t(),
+          optional(atom()) => term()
+        }
+
   @type packet :: %{
           admission_id: String.t(),
           issue_snapshot_bytes: non_neg_integer(),
@@ -83,7 +88,7 @@ defmodule SymphonyElixir.TrackerAdmission do
   def packet(%Issue{}, %PollContext{}, _admission_id, _target_state),
     do: {:error, :invalid_admission_packet}
 
-  @spec verify_readback([Issue.t()], String.t(), snapshot(), keyword()) ::
+  @spec verify_readback([Issue.t()], String.t(), snapshot_evidence(), keyword()) ::
           {:ok, Issue.t()} | {:error, term()}
   def verify_readback(issues, issue_id, expected_snapshot, opts)
       when is_list(issues) and is_binary(issue_id) and is_map(expected_snapshot) and is_list(opts) do
