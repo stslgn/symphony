@@ -942,8 +942,6 @@ defmodule SymphonyElixir.Workspace do
   defp owned_system_command_alive?(port, os_pid) when is_integer(os_pid),
     do: Port.info(port, :os_pid) == {:os_pid, os_pid}
 
-  defp owned_system_command_alive?(_port, _os_pid), do: false
-
   defp terminate_owned_system_command_group(port, os_pid) when is_integer(os_pid) do
     if owned_system_command_alive?(port, os_pid) and system_command_group_alive?(os_pid) do
       signal_owned_system_command_group(os_pid, "TERM")
