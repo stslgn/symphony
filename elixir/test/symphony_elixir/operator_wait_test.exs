@@ -9,6 +9,8 @@ defmodule SymphonyElixir.OperatorWaitTest do
              "operator_stopped",
              "review_cap_reached",
              "run_budget_exhausted",
+             "tracker_admission_conflict",
+             "tracker_admission_failed",
              "waiting_infrastructure",
              "waiting_live_approval",
              "waiting_owner",
@@ -21,6 +23,8 @@ defmodule SymphonyElixir.OperatorWaitTest do
     assert OperatorWait.allowed_actions("waiting_secret") == ["retry", "reject"]
     assert OperatorWait.allowed_actions("run_budget_exhausted") == ["retry", "reject"]
     assert OperatorWait.allowed_actions("operator_stopped") == ["retry", "reject"]
+    assert OperatorWait.allowed_actions("tracker_admission_failed") == ["retry", "reject"]
+    assert OperatorWait.allowed_actions("tracker_admission_conflict") == ["retry", "reject"]
     assert OperatorWait.allowed_actions("unknown") == []
   end
 

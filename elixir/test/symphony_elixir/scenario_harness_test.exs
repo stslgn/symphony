@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.ScenarioHarnessTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.ScenarioHarness
+  alias SymphonyElixir.{RunLedger, ScenarioHarness, TrackerAdmission}
 
   @moduletag :scenario
 
@@ -24,6 +24,100 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
     end)
 
     :ok
+  end
+
+  test "crash after admission mutation reconciles once before the first model start" do
+    root = scenario_root("pre-model-admission-restart")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    raw_workspace_root = Path.join(root, "workspaces")
+    File.mkdir_p!(raw_workspace_root)
+    {:ok, workspace_root} = SymphonyElixir.PathSafety.canonicalize(raw_workspace_root)
+    ledger_path = Path.join(root, "run-ledger.jsonl")
+    fake = ScenarioHarness.write_fake_codex!(root, :live_ok)
+    ready_issue = issue("issue-admission-restart", "SCN-ADMISSION-RESTART")
+    running_issue = %{ready_issue | state: "Agent Running"}
+    workspace_path = Path.join(workspace_root, ready_issue.identifier)
+    File.mkdir_p!(workspace_path)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Agent Ready", "Agent Running"],
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000,
+      max_concurrent_agents: 1,
+      max_turns: 1,
+      codex_command: "#{fake.binary} app-server",
+      prompt: "Admission={{ run.admission.id }} Run={{ run.id }}"
+    )
+
+    tracker_context = Tracker.current_poll_context()
+
+    assert {:ok, admission, _snapshot} =
+             TrackerAdmission.packet(
+               ready_issue,
+               tracker_context,
+               "admission-scenario-restart",
+               "Agent Running"
+             )
+
+    base = %{
+      run_id: "run-admission-scenario-restart",
+      issue_id: ready_issue.id,
+      issue_identifier: ready_issue.identifier,
+      attempt: 0,
+      workspace_path: workspace_path,
+      workspace_root: workspace_root
+    }
+
+    assert :ok =
+             RunLedger.append(
+               ledger_path,
+               Map.merge(base, %{transition: "run_claimed", stage: "claimed"})
+             )
+
+    assert :ok =
+             RunLedger.append(
+               ledger_path,
+               base
+               |> Map.merge(admission)
+               |> Map.merge(%{transition: "tracker_admission_io_started", stage: "admission"})
+             )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [running_issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    harness =
+      ScenarioHarness.start!(
+        Module.concat(__MODULE__, :PreModelAdmissionRestartRunner),
+        ledger_path
+      )
+
+    try do
+      snapshot =
+        ScenarioHarness.await_snapshot(harness, fn snapshot ->
+          length(snapshot.parked) == 1
+        end)
+
+      expected_issue_id = ready_issue.id
+      refute_received {:memory_tracker_state_update, ^expected_issue_id, "Agent Running"}
+      assert snapshot.running == []
+      assert [%{reason: "run_budget_exhausted"}] = snapshot.parked
+
+      events = ScenarioHarness.events(harness)
+      assert count_transition(events, "run_claimed") == 1
+      assert count_transition(events, "tracker_admission_io_started") == 1
+      assert count_transition(events, "tracker_admission_completed") == 1
+      assert count_transition(events, "run_started") == 1
+      assert count_transition(events, "model_resolved") == 1
+
+      trace = File.read!(fake.trace)
+      assert trace =~ "Admission=admission-scenario-restart"
+      assert :ok = ScenarioHarness.assert_consistent!(harness)
+    after
+      ScenarioHarness.stop(harness)
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+    end
   end
 
   test "duplicate wake-ups stay paused, dispatch once, and restore the parked run after restart" do
@@ -216,6 +310,74 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
       assert count_transition(events, "run_parked") == 1
       assert count_transition(events, "run_failed") == 0
       assert count_transition(events, "run_completed") == 0
+      assert :ok = ScenarioHarness.assert_consistent!(harness)
+    after
+      ScenarioHarness.stop(harness)
+    end
+  end
+
+  test "cached input does not consume the uncached-input scenario budget" do
+    root = scenario_root("uncached-token-budget")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    ledger_path = Path.join(root, "run-ledger.jsonl")
+    issue = %{issue("issue-scenario-uncached", "SCN-UNCACHED") | state: "Agent Running"}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Agent Ready", "Agent Running"],
+      workspace_root: Path.join(root, "workspaces"),
+      poll_interval_ms: 60_000,
+      max_run_uncached_input_tokens: 100_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    harness = ScenarioHarness.start!(Module.concat(__MODULE__, :UncachedTokenRunner), ledger_path)
+
+    try do
+      ScenarioHarness.await_poll_idle(harness)
+
+      assert {:ok, %{dispatch_paused: true}} =
+               Orchestrator.set_dispatch_paused(harness.name, true)
+
+      ScenarioHarness.seed_running!(harness, issue,
+        run_id: "run-uncached-token",
+        max_uncached_input_tokens: 100_000
+      )
+
+      assert :ok =
+               ScenarioHarness.report_token_usage(harness, issue, "run-uncached-token", %{
+                 "input_tokens" => 200_000,
+                 "cached_input_tokens" => 125_000,
+                 "output_tokens" => 10_000,
+                 "total_tokens" => 210_000
+               })
+
+      below =
+        ScenarioHarness.await_snapshot(harness, fn snapshot ->
+          case snapshot.running do
+            [%{codex_uncached_input_tokens: 75_000}] -> true
+            _other -> false
+          end
+        end)
+
+      assert below.parked == []
+
+      assert :ok =
+               ScenarioHarness.report_token_usage(harness, issue, "run-uncached-token", %{
+                 "input_tokens" => 300_000,
+                 "cached_input_tokens" => 200_000,
+                 "output_tokens" => 15_000,
+                 "total_tokens" => 315_000
+               })
+
+      crossed =
+        ScenarioHarness.await_snapshot(harness, fn snapshot ->
+          length(snapshot.parked) == 1
+        end)
+
+      assert [%{terminal_reason: "uncached_input_budget_exhausted"}] = crossed.parked
+      assert count_transition(ScenarioHarness.events(harness), "run_parked") == 1
       assert :ok = ScenarioHarness.assert_consistent!(harness)
     after
       ScenarioHarness.stop(harness)

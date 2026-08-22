@@ -19,6 +19,7 @@ defmodule SymphonyElixir.Orchestrator do
     RunLedger,
     StatusDashboard,
     Tracker,
+    TrackerAdmission,
     Workspace
   }
 
@@ -51,7 +52,10 @@ defmodule SymphonyElixir.Orchestrator do
               operator_authority_invalidated: false,
               tracker_authority_generation: nil,
               tracker_authority_invalidated: false,
-              tracker_context: nil
+              tracker_context: nil,
+              tracker_admissions: %{},
+              tracker_fetch_by_ids_fn: nil,
+              tracker_update_state_fn: nil
   end
 
   defmodule State do
@@ -138,14 +142,21 @@ defmodule SymphonyElixir.Orchestrator do
             queued_resumes: queued_resumes,
             cleanup_pending: restore_cleanup_pending(recovery.cleanup_pending),
             parked: parked,
-            claimed: recovery.cleanup_pending |> Map.keys() |> MapSet.new(),
+            claimed:
+              recovery.cleanup_pending
+              |> Map.keys()
+              |> Kernel.++(Map.keys(recovery.tracker_admissions))
+              |> MapSet.new(),
             operator_commands: %OperatorCommandState{
               processed_comment_ids: recovery.processed_operator_comment_ids,
               pending_outcomes: restore_pending_operator_outcomes(recovery.pending_operator_outcomes),
               operator_user_ids_generation: config.tracker.operator_user_ids || [],
               operator_authority_generation: authority_generation,
               tracker_authority_generation: tracker_authority_generation,
-              tracker_context: Tracker.poll_context(config.tracker, tracker_authority_generation)
+              tracker_context: Tracker.poll_context(config.tracker, tracker_authority_generation),
+              tracker_admissions: recovery.tracker_admissions,
+              tracker_fetch_by_ids_fn: Keyword.get(opts, :tracker_fetch_by_ids_fn),
+              tracker_update_state_fn: Keyword.get(opts, :tracker_update_state_fn)
             },
             operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
             codex_totals: @empty_codex_totals,
@@ -703,6 +714,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     %{
       running_ids: running_ids,
+      admission_ids: Map.keys(tracker_admissions(state)),
       parked_ids: Map.keys(state.parked),
       retry_issue_ids: retry_issue_ids,
       comment_requests: operator_comment_requests(state, operator_user_ids),
@@ -718,6 +730,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp blocked_tracker_poll_request do
     %{
       running_ids: [],
+      admission_ids: [],
       parked_ids: [],
       retry_issue_ids: [],
       comment_requests: [],
@@ -725,6 +738,23 @@ defmodule SymphonyElixir.Orchestrator do
       dispatch_paused: true,
       tracker_authority_valid: false
     }
+  end
+
+  defp tracker_admissions(%State{
+         operator_commands: %OperatorCommandState{tracker_admissions: admissions}
+       }),
+       do: admissions
+
+  defp delete_tracker_admission(
+         %State{operator_commands: %OperatorCommandState{} = operator_commands} = state,
+         issue_id
+       ) do
+    operator_commands = %{
+      operator_commands
+      | tracker_admissions: Map.delete(operator_commands.tracker_admissions, issue_id)
+    }
+
+    %{state | operator_commands: operator_commands}
   end
 
   defp operator_comment_requests(_state, []), do: []
@@ -746,6 +776,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       request: request,
       running: {:skip, :tracker_authority_invalidated},
+      admissions: {:skip, :tracker_authority_invalidated},
       parked: {:skip, :tracker_authority_invalidated},
       comments: %{},
       dispatch: {:skip, :tracker_authority_invalidated}
@@ -764,6 +795,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       request: request,
       running: fetch_issue_states(request.running_ids, tracker_context),
+      admissions: fetch_issue_states(Map.get(request, :admission_ids, []), tracker_context),
       parked: fetch_issue_states(request.parked_ids, tracker_context),
       comments: fetch_operator_comments(request.comment_requests, tracker_context),
       dispatch: fetch_dispatch_candidates(request.dispatch_paused, tracker_context)
@@ -774,6 +806,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       request: request,
       running: {:skip, reason},
+      admissions: {:skip, reason},
       parked: {:skip, reason},
       comments: %{},
       dispatch: {:skip, reason}
@@ -829,6 +862,10 @@ defmodule SymphonyElixir.Orchestrator do
       effective_operator_user_ids = operator_user_ids(state)
 
       state
+      |> apply_tracker_admission_poll_result(
+        request,
+        Map.get(result, :admissions)
+      )
       |> apply_running_poll_result(
         request.running_ids,
         Map.get(result, :running),
@@ -845,6 +882,227 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp apply_poll_result(%State{} = state, _invalid_result), do: state
+
+  defp apply_tracker_admission_poll_result(
+         %State{} = state,
+         %{tracker_context: %Tracker.PollContext{} = tracker_context},
+         {:ok, issues}
+       )
+       when is_list(issues) do
+    Enum.reduce(Map.keys(tracker_admissions(state)), state, fn issue_id, state_acc ->
+      admission = Map.get(tracker_admissions(state_acc), issue_id)
+      issue = find_issue_by_id(issues, issue_id)
+
+      reconcile_recovered_tracker_admission(state_acc, issue, admission, tracker_context)
+    end)
+  end
+
+  defp apply_tracker_admission_poll_result(
+         %State{} = state,
+         _request,
+         {:error, reason}
+       ) do
+    Enum.reduce(tracker_admissions(state), state, fn {_issue_id, admission}, state_acc ->
+      park_recovered_tracker_admission(
+        state_acc,
+        recovered_admission_issue(admission),
+        admission,
+        tracker_admission_parked_reason(reason)
+      )
+    end)
+  end
+
+  defp apply_tracker_admission_poll_result(%State{} = state, _request, _result), do: state
+
+  defp reconcile_recovered_tracker_admission(
+         %State{} = state,
+         %Issue{} = issue,
+         admission,
+         tracker_context
+       )
+       when is_map(admission) do
+    case TrackerAdmission.verify_recovery_evidence(issue, tracker_context, admission) do
+      :ok ->
+        reconcile_recovered_tracker_state(state, issue, admission, tracker_context)
+
+      {:error, reason} ->
+        park_recovered_tracker_admission(
+          state,
+          issue,
+          admission,
+          tracker_admission_parked_reason(reason)
+        )
+    end
+  end
+
+  defp reconcile_recovered_tracker_admission(
+         %State{} = state,
+         _missing_issue,
+         admission,
+         _tracker_context
+       )
+       when is_map(admission) do
+    park_recovered_tracker_admission(
+      state,
+      recovered_admission_issue(admission),
+      admission,
+      "tracker_admission_conflict"
+    )
+  end
+
+  defp reconcile_recovered_tracker_admission(state, _issue, _admission, _tracker_context),
+    do: state
+
+  defp reconcile_recovered_tracker_state(state, issue, admission, tracker_context) do
+    cond do
+      issue.state == admission.target_state ->
+        complete_and_start_recovered_admission(state, issue, admission, tracker_context)
+
+      issue.state == admission.source_state and admission.status == "io_started" ->
+        retry_recovered_admission_mutation(state, issue, admission, tracker_context)
+
+      true ->
+        park_recovered_tracker_admission(
+          state,
+          issue,
+          admission,
+          "tracker_admission_conflict"
+        )
+    end
+  end
+
+  defp retry_recovered_admission_mutation(state, issue, admission, tracker_context) do
+    with :ok <-
+           tracker_update_issue_state(
+             state,
+             issue.id,
+             admission.target_state,
+             tracker_context
+           ),
+         {:ok, issues} <- tracker_fetch_issues_by_ids(state, [issue.id], tracker_context),
+         {:ok, admitted_issue} <-
+           TrackerAdmission.verify_readback(
+             issues,
+             issue.id,
+             %{sha256: admission.issue_snapshot_sha256},
+             target_state: admission.target_state
+           ),
+         :ok <-
+           TrackerAdmission.verify_recovery_evidence(
+             admitted_issue,
+             tracker_context,
+             admission
+           ) do
+      complete_and_start_recovered_admission(
+        state,
+        admitted_issue,
+        admission,
+        tracker_context
+      )
+    else
+      {:error, reason} ->
+        park_recovered_tracker_admission(
+          state,
+          issue,
+          admission,
+          tracker_admission_parked_reason(reason)
+        )
+    end
+  end
+
+  defp complete_and_start_recovered_admission(state, issue, admission, tracker_context) do
+    with :ok <- maybe_complete_recovered_admission(state, issue, admission),
+         {:ok, prepared_workspace} <- prepare_recovered_admission_workspace(issue, admission) do
+      start_issue_task(
+        state,
+        issue,
+        admission.attempt,
+        self(),
+        admission.worker_host,
+        prepared_workspace,
+        %{
+          run_id: admission.run_id,
+          normalized_attempt: admission.attempt,
+          tracker_context: tracker_context,
+          admission: recovered_admission_packet(admission)
+        }
+      )
+    else
+      {:error, reason} ->
+        park_recovered_tracker_admission(
+          state,
+          issue,
+          admission,
+          tracker_admission_parked_reason(reason)
+        )
+    end
+  end
+
+  defp maybe_complete_recovered_admission(_state, _issue, %{status: "completed"}), do: :ok
+
+  defp maybe_complete_recovered_admission(state, issue, %{status: "io_started"} = admission) do
+    event =
+      admission
+      |> recovered_admission_packet()
+      |> Map.merge(%{
+        transition: "tracker_admission_completed",
+        stage: "admission",
+        run_id: admission.run_id,
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        attempt: admission.attempt,
+        worker_host: admission.worker_host,
+        workspace_path: admission.workspace_path,
+        workspace_root: admission.workspace_root
+      })
+
+    append_run_event(state, event)
+  end
+
+  defp maybe_complete_recovered_admission(_state, _issue, _admission),
+    do: {:error, :invalid_recovered_admission_status}
+
+  defp prepare_recovered_admission_workspace(issue, admission) do
+    Workspace.prepare_for_issue(issue, admission.worker_host,
+      expected_workspace_path: admission.workspace_path,
+      expected_workspace_root: admission.workspace_root,
+      expected_worker_host: admission.worker_host
+    )
+  end
+
+  defp recovered_admission_packet(admission) do
+    Map.take(admission, [
+      :admission_id,
+      :issue_snapshot_bytes,
+      :issue_snapshot_schema,
+      :issue_snapshot_sha256,
+      :source_state,
+      :target_state,
+      :tracker_authority_digest
+    ])
+  end
+
+  defp recovered_admission_issue(admission) do
+    %Issue{
+      id: admission.issue_id,
+      identifier: admission.identifier,
+      title: admission.identifier,
+      state: admission.source_state,
+      assigned_to_worker: true
+    }
+  end
+
+  defp park_recovered_tracker_admission(state, issue, admission, reason) do
+    park_claimed_issue(
+      state,
+      issue,
+      admission.worker_host,
+      %{path: admission.workspace_path, root: admission.workspace_root},
+      admission.run_id,
+      admission.attempt,
+      reason
+    )
+  end
 
   defp apply_running_poll_result(
          state,
@@ -1162,6 +1420,20 @@ defmodule SymphonyElixir.Orchestrator do
     }
 
     run_test_poll_cycle(state)
+  end
+
+  @doc false
+  @spec reconcile_tracker_admissions_for_test(
+          term(),
+          {:ok, [Issue.t()]} | {:error, term()},
+          Tracker.PollContext.t()
+        ) :: term()
+  def reconcile_tracker_admissions_for_test(
+        %State{} = state,
+        result,
+        %Tracker.PollContext{} = tracker_context
+      ) do
+    apply_tracker_admission_poll_result(state, %{tracker_context: tracker_context}, result)
   end
 
   @doc false
@@ -1887,23 +2159,200 @@ defmodule SymphonyElixir.Orchestrator do
       :ok ->
         state = consume_dispatch_queue(state, issue.id)
 
-        start_issue_task(
-          state,
-          issue,
-          attempt,
-          recipient,
-          worker_host,
-          prepared_workspace,
-          %{
-            run_id: run_id,
-            normalized_attempt: normalized_attempt,
-            tracker_context: tracker_context
-          }
-        )
+        run_context = %{
+          run_id: run_id,
+          normalized_attempt: normalized_attempt,
+          tracker_context: tracker_context,
+          admission: nil
+        }
+
+        if tracker_admission_required?(issue) do
+          admit_and_start_issue(
+            state,
+            issue,
+            attempt,
+            recipient,
+            worker_host,
+            prepared_workspace,
+            run_context
+          )
+        else
+          start_issue_task(
+            state,
+            issue,
+            attempt,
+            recipient,
+            worker_host,
+            prepared_workspace,
+            run_context
+          )
+        end
 
       {:error, reason} ->
         Logger.error("Unable to record durable claim for #{issue_context(issue)}: #{inspect(reason)}")
         defer_pending_dispatch(state, issue.id, reason)
+    end
+  end
+
+  defp tracker_admission_required?(%Issue{state: state}),
+    do: normalize_issue_state(state) == "agent ready"
+
+  defp admit_and_start_issue(
+         state,
+         issue,
+         attempt,
+         recipient,
+         worker_host,
+         prepared_workspace,
+         %{run_id: run_id, normalized_attempt: normalized_attempt, tracker_context: tracker_context} =
+           run_context
+       ) do
+    admission_id = RunLedger.new_id("admission")
+    target_state = "Agent Running"
+
+    with {:ok, admission, snapshot} <-
+           TrackerAdmission.packet(issue, tracker_context, admission_id, target_state),
+         admission_event =
+           tracker_admission_event(
+             issue,
+             worker_host,
+             prepared_workspace,
+             run_id,
+             normalized_attempt,
+             admission
+           ),
+         :ok <-
+           append_run_event(
+             state,
+             Map.put(admission_event, :transition, "tracker_admission_io_started")
+           ),
+         :ok <- tracker_update_issue_state(state, issue.id, target_state, tracker_context),
+         {:ok, issues} <- tracker_fetch_issues_by_ids(state, [issue.id], tracker_context),
+         {:ok, admitted_issue} <-
+           TrackerAdmission.verify_readback(issues, issue.id, snapshot, target_state: target_state),
+         :ok <-
+           append_run_event(
+             state,
+             Map.put(admission_event, :transition, "tracker_admission_completed")
+           ) do
+      start_issue_task(
+        state,
+        admitted_issue,
+        attempt,
+        recipient,
+        worker_host,
+        prepared_workspace,
+        %{run_context | admission: admission}
+      )
+    else
+      {:error, reason} ->
+        parked_reason = tracker_admission_parked_reason(reason)
+
+        Logger.warning("Tracker admission blocked model start for #{issue_context(issue)} reason=#{parked_reason} error_code=#{ObservabilitySanitizer.error_code(reason, "tracker_admission_failed")}")
+
+        park_claimed_issue(
+          state,
+          issue,
+          worker_host,
+          prepared_workspace,
+          run_id,
+          normalized_attempt,
+          parked_reason
+        )
+    end
+  end
+
+  defp tracker_admission_event(
+         issue,
+         worker_host,
+         prepared_workspace,
+         run_id,
+         attempt,
+         admission
+       ) do
+    admission
+    |> Map.merge(%{
+      stage: "admission",
+      run_id: run_id,
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      attempt: attempt,
+      worker_host: worker_host,
+      workspace_path: prepared_workspace.path,
+      workspace_root: prepared_workspace.root
+    })
+  end
+
+  defp tracker_update_issue_state(
+         %State{
+           operator_commands: %OperatorCommandState{tracker_update_state_fn: update_fn}
+         },
+         issue_id,
+         target_state,
+         tracker_context
+       )
+       when is_function(update_fn, 3),
+       do: update_fn.(issue_id, target_state, tracker_context)
+
+  defp tracker_update_issue_state(_state, issue_id, target_state, tracker_context),
+    do: Tracker.update_issue_state(issue_id, target_state, tracker_context)
+
+  defp tracker_fetch_issues_by_ids(
+         %State{
+           operator_commands: %OperatorCommandState{tracker_fetch_by_ids_fn: fetch_fn}
+         },
+         issue_ids,
+         tracker_context
+       )
+       when is_function(fetch_fn, 2),
+       do: fetch_fn.(issue_ids, tracker_context)
+
+  defp tracker_fetch_issues_by_ids(_state, issue_ids, tracker_context),
+    do: Tracker.fetch_issue_states_by_ids(issue_ids, tracker_context)
+
+  defp tracker_admission_parked_reason(reason)
+       when reason in [
+              :issue_not_found,
+              :issue_snapshot_conflict,
+              :target_state_not_observed
+            ],
+       do: "tracker_admission_conflict"
+
+  defp tracker_admission_parked_reason(_reason), do: "tracker_admission_failed"
+
+  defp park_claimed_issue(
+         state,
+         issue,
+         worker_host,
+         prepared_workspace,
+         run_id,
+         attempt,
+         reason
+       ) do
+    with {:ok, wait} <-
+           OperatorWait.new(reason, %{
+             issue_id: issue.id,
+             identifier: issue.identifier,
+             run_id: run_id,
+             attempt: attempt,
+             tracker_state: issue.state,
+             worker_host: worker_host,
+             workspace_path: prepared_workspace.path,
+             workspace_root: prepared_workspace.root
+           }),
+         :ok <- append_run_event(state, operator_wait_event(wait, "run_parked")) do
+      %{
+        state
+        | parked: Map.put(state.parked, issue.id, wait),
+          claimed: MapSet.delete(state.claimed, issue.id),
+          retry_attempts: Map.delete(state.retry_attempts, issue.id)
+      }
+      |> delete_tracker_admission(issue.id)
+    else
+      {:error, error} ->
+        Logger.error("Failed to durably park claimed issue_id=#{issue.id} reason=#{reason}: #{inspect(error)}")
+
+        %{state | claimed: MapSet.put(state.claimed, issue.id)}
     end
   end
 
@@ -1917,7 +2366,8 @@ defmodule SymphonyElixir.Orchestrator do
          %{
            run_id: run_id,
            normalized_attempt: normalized_attempt,
-           tracker_context: tracker_context
+           tracker_context: tracker_context,
+           admission: admission
          }
        ) do
     run_budget = RunBudget.from_agent_config(Config.settings!().agent)
@@ -1933,6 +2383,7 @@ defmodule SymphonyElixir.Orchestrator do
         runner_generation: state.runner_generation,
         stage: "running",
         max_turns: run_budget.max_turns,
+        admission: admission,
         tracker_context: tracker_context
       )
     end
@@ -1954,6 +2405,7 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_root: prepared_workspace.root,
           session_id: nil,
           session_title: nil,
+          admission: admission,
           resolved_model: nil,
           reasoning_effort: nil,
           model_catalog_source: nil,
@@ -1963,9 +2415,13 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_event: nil,
           codex_app_server_pid: nil,
           codex_input_tokens: 0,
+          codex_cached_input_tokens: 0,
+          codex_uncached_input_tokens: 0,
           codex_output_tokens: 0,
           codex_total_tokens: 0,
           codex_last_reported_input_tokens: 0,
+          codex_last_reported_cached_input_tokens: 0,
+          codex_last_reported_uncached_input_tokens: 0,
           codex_last_reported_output_tokens: 0,
           codex_last_reported_total_tokens: 0,
           codex_token_accounting: new_token_accounting(),
@@ -1973,6 +2429,9 @@ defmodule SymphonyElixir.Orchestrator do
           codex_token_telemetry_integrity: :unobserved,
           codex_token_telemetry_failure: nil,
           codex_token_telemetry_epoch: 0,
+          codex_uncached_input_telemetry_observed: false,
+          codex_uncached_input_telemetry_integrity: :unobserved,
+          codex_uncached_input_telemetry_failure: nil,
           turn_count: 0,
           run_budget: run_budget,
           run_budget_timer_ref: nil,
@@ -1997,6 +2456,7 @@ defmodule SymphonyElixir.Orchestrator do
                 queued_resumes: Map.delete(state.queued_resumes, issue.id),
                 retry_attempts: Map.delete(state.retry_attempts, issue.id)
             }
+            |> delete_tracker_admission(issue.id)
             |> initialize_operator_cursor(issue.id, running_entry.started_at)
 
           {:error, reason} ->
@@ -3464,6 +3924,8 @@ defmodule SymphonyElixir.Orchestrator do
           model_catalog: Map.get(metadata, :model_catalog),
           codex_app_server_pid: Map.get(metadata, :codex_app_server_pid),
           codex_input_tokens: Map.get(metadata, :codex_input_tokens, 0),
+          codex_cached_input_tokens: Map.get(metadata, :codex_cached_input_tokens, 0),
+          codex_uncached_input_tokens: Map.get(metadata, :codex_uncached_input_tokens, 0),
           codex_output_tokens: Map.get(metadata, :codex_output_tokens, 0),
           codex_total_tokens: Map.get(metadata, :codex_total_tokens, 0),
           turn_count: Map.get(metadata, :turn_count, 0),
@@ -3473,6 +3935,27 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_message: Map.get(metadata, :last_codex_message),
           last_codex_event: Map.get(metadata, :last_codex_event),
           runtime_seconds: running_seconds(Map.get(metadata, :started_at), now)
+        }
+      end)
+
+    admitting =
+      Enum.map(tracker_admissions(state), fn {issue_id, admission} ->
+        %{
+          issue_id: issue_id,
+          run_id: admission.run_id,
+          attempt: admission.attempt,
+          stage: "tracker_admission",
+          status: admission.status,
+          identifier: admission.identifier,
+          admission_id: admission.admission_id,
+          source_state: admission.source_state,
+          target_state: admission.target_state,
+          issue_snapshot_schema: admission.issue_snapshot_schema,
+          issue_snapshot_bytes: admission.issue_snapshot_bytes,
+          issue_snapshot_sha256: admission.issue_snapshot_sha256,
+          tracker_authority_digest: admission.tracker_authority_digest,
+          worker_host: admission.worker_host,
+          workspace_path: admission.workspace_path
         }
       end)
 
@@ -3527,6 +4010,7 @@ defmodule SymphonyElixir.Orchestrator do
        },
        capabilities: capability_snapshot(),
        running: running,
+       admitting: admitting,
        retrying: retrying,
        parked: parked,
        codex_totals: state.codex_totals,
@@ -3590,9 +4074,13 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: accounting.input.lifetime,
+        codex_cached_input_tokens: accounting.cached_input.lifetime,
+        codex_uncached_input_tokens: accounting.uncached_input.lifetime,
         codex_output_tokens: accounting.output.lifetime,
         codex_total_tokens: accounting.total.lifetime,
         codex_last_reported_input_tokens: accounting.input.last_raw || 0,
+        codex_last_reported_cached_input_tokens: accounting.cached_input.last_raw || 0,
+        codex_last_reported_uncached_input_tokens: accounting.uncached_input.last_raw || 0,
         codex_last_reported_output_tokens: accounting.output.last_raw || 0,
         codex_last_reported_total_tokens: accounting.total.last_raw || 0,
         codex_token_accounting: accounting,
@@ -3600,6 +4088,9 @@ defmodule SymphonyElixir.Orchestrator do
         codex_token_telemetry_integrity: accounting.integrity,
         codex_token_telemetry_failure: accounting.failure,
         codex_token_telemetry_epoch: accounting.total.epoch,
+        codex_uncached_input_telemetry_observed: accounting.uncached_integrity == :valid,
+        codex_uncached_input_telemetry_integrity: accounting.uncached_integrity,
+        codex_uncached_input_telemetry_failure: accounting.uncached_failure,
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
       token_delta
@@ -4934,16 +5425,26 @@ defmodule SymphonyElixir.Orchestrator do
   defp extract_token_delta(running_entry, %{event: _, timestamp: _} = update) do
     accounting = token_accounting(running_entry)
 
+    uncached_guard_enabled? =
+      is_integer(get_in(running_entry, [:run_budget, :max_uncached_input_tokens]))
+
     case canonical_token_usage(extract_token_usage(update)) do
-      {:ok, usage} -> token_delta_from_canonical_usage(accounting, usage)
-      {:error, reason} -> failed_token_delta(accounting, reason)
+      {:ok, usage} ->
+        token_delta_from_canonical_usage(accounting, usage, uncached_guard_enabled?)
+
+      {:error, reason} ->
+        failed_token_delta(accounting, reason)
     end
   end
 
-  defp token_delta_from_canonical_usage(%{integrity: :failed} = accounting, _usage),
-    do: empty_token_delta(accounting)
+  defp token_delta_from_canonical_usage(
+         %{integrity: :failed} = accounting,
+         _usage,
+         _uncached_guard_enabled?
+       ),
+       do: empty_token_delta(accounting)
 
-  defp token_delta_from_canonical_usage(accounting, usage) do
+  defp token_delta_from_canonical_usage(accounting, usage, uncached_guard_enabled?) do
     with {:ok, input, input_delta} <-
            advance_token_component(accounting.input, get_token_usage(usage, :input)),
          {:ok, output, output_delta} <-
@@ -4955,16 +5456,29 @@ defmodule SymphonyElixir.Orchestrator do
           do: :valid,
           else: :unobserved
 
+      {cached_input, uncached_input, uncached_integrity, uncached_failure} =
+        advance_uncached_input_accounting(
+          accounting,
+          usage,
+          uncached_guard_enabled?
+        )
+
       updated_accounting = %{
         integrity: integrity,
         failure: nil,
         input: input,
+        cached_input: cached_input,
+        uncached_input: uncached_input,
+        uncached_integrity: uncached_integrity,
+        uncached_failure: uncached_failure,
         output: output,
         total: total
       }
 
       %{
         input_tokens: input_delta,
+        cached_input_tokens: cached_input.lifetime,
+        uncached_input_tokens: uncached_input.lifetime,
         output_tokens: output_delta,
         total_tokens: total_delta,
         accounting: updated_accounting
@@ -4977,6 +5491,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp empty_token_delta(accounting) do
     %{
       input_tokens: 0,
+      cached_input_tokens: 0,
+      uncached_input_tokens: 0,
       output_tokens: 0,
       total_tokens: 0,
       accounting: accounting
@@ -4999,6 +5515,7 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok,
        %{
          input: input,
+         cached_input: optional_token_component(usage, token_fields(:cached_input)),
          output: output,
          total: canonical_total(explicit_total, derived_total)
        }}
@@ -5022,6 +5539,13 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp optional_token_component(usage, fields) do
+    case normalized_token_component(usage, fields) do
+      {:ok, value} -> value
+      :invalid -> :invalid
+    end
+  end
+
   defp checked_token_sum(input, output) when is_integer(input) and is_integer(output) do
     if input <= @max_cumulative_token_count - output do
       {:ok, input + output}
@@ -5036,6 +5560,91 @@ defmodule SymphonyElixir.Orchestrator do
   defp canonical_total(total, nil), do: total
   defp canonical_total(nil, derived), do: derived
   defp canonical_total(total, derived), do: max(total, derived)
+
+  defp advance_uncached_input_accounting(
+         %{uncached_integrity: :failed} = accounting,
+         _usage,
+         _guard_enabled?
+       ) do
+    {
+      accounting.cached_input,
+      accounting.uncached_input,
+      accounting.uncached_integrity,
+      accounting.uncached_failure
+    }
+  end
+
+  defp advance_uncached_input_accounting(accounting, usage, guard_enabled?) do
+    input = get_token_usage(usage, :input)
+    cached_input = get_token_usage(usage, :cached_input)
+
+    token_usage_observed? =
+      Enum.any?(
+        [input, get_token_usage(usage, :output), get_token_usage(usage, :total)],
+        &is_integer/1
+      )
+
+    case classify_uncached_input(
+           input,
+           cached_input,
+           token_usage_observed?,
+           guard_enabled?
+         ) do
+      {:counters, cached_raw, uncached_raw} ->
+        advance_uncached_counters(accounting, cached_raw, uncached_raw)
+
+      {:error, reason} ->
+        failed_uncached_accounting(accounting, reason)
+
+      :unavailable ->
+        unchanged_uncached_accounting(accounting)
+    end
+  end
+
+  defp classify_uncached_input(input, cached_input, _observed?, _guard_enabled?)
+       when is_integer(input) and is_integer(cached_input) and cached_input <= input,
+       do: {:counters, cached_input, input - cached_input}
+
+  defp classify_uncached_input(_input, :invalid, _observed?, _guard_enabled?),
+    do: {:error, :malformed_cached_input_counter}
+
+  defp classify_uncached_input(input, cached_input, _observed?, _guard_enabled?)
+       when is_integer(cached_input) and not is_integer(input),
+       do: {:error, :malformed_cached_input_counter}
+
+  defp classify_uncached_input(input, cached_input, _observed?, _guard_enabled?)
+       when is_integer(input) and is_integer(cached_input) and cached_input > input,
+       do: {:error, :cached_input_exceeds_input}
+
+  defp classify_uncached_input(_input, _cached_input, true, true),
+    do: {:error, :missing_cached_input_counter}
+
+  defp classify_uncached_input(_input, _cached_input, _observed?, _guard_enabled?),
+    do: :unavailable
+
+  defp advance_uncached_counters(accounting, cached_raw, uncached_raw) do
+    with {:ok, cached_component, _cached_delta} <-
+           advance_token_component(accounting.cached_input, cached_raw),
+         {:ok, uncached_component, _uncached_delta} <-
+           advance_token_component(accounting.uncached_input, uncached_raw) do
+      {cached_component, uncached_component, :valid, nil}
+    else
+      {:error, reason} -> failed_uncached_accounting(accounting, reason)
+    end
+  end
+
+  defp unchanged_uncached_accounting(accounting) do
+    {
+      accounting.cached_input,
+      accounting.uncached_input,
+      accounting.uncached_integrity,
+      accounting.uncached_failure
+    }
+  end
+
+  defp failed_uncached_accounting(accounting, reason) do
+    {accounting.cached_input, accounting.uncached_input, :failed, reason}
+  end
 
   defp advance_token_component(component, nil), do: {:ok, component, 0}
 
@@ -5077,8 +5686,9 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp token_accounting(%{codex_token_accounting: accounting}) when is_map(accounting),
-    do: accounting
+  defp token_accounting(%{codex_token_accounting: accounting} = running_entry)
+       when is_map(accounting),
+       do: normalize_token_accounting(accounting, running_entry)
 
   defp token_accounting(running_entry) do
     observed? = Map.get(running_entry, :codex_token_telemetry_observed, false) == true
@@ -5087,6 +5697,10 @@ defmodule SymphonyElixir.Orchestrator do
       integrity: if(observed?, do: :valid, else: :unobserved),
       failure: Map.get(running_entry, :codex_token_telemetry_failure),
       input: legacy_token_component(running_entry, :input),
+      cached_input: legacy_token_component(running_entry, :cached_input),
+      uncached_input: legacy_token_component(running_entry, :uncached_input),
+      uncached_integrity: Map.get(running_entry, :codex_uncached_input_telemetry_integrity, :unobserved),
+      uncached_failure: Map.get(running_entry, :codex_uncached_input_telemetry_failure),
       output: legacy_token_component(running_entry, :output),
       total: legacy_token_component(running_entry, :total)
     }
@@ -5103,11 +5717,29 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp normalize_token_accounting(accounting, running_entry) do
+    accounting
+    |> Map.put_new(:cached_input, legacy_token_component(running_entry, :cached_input))
+    |> Map.put_new(:uncached_input, legacy_token_component(running_entry, :uncached_input))
+    |> Map.put_new(
+      :uncached_integrity,
+      Map.get(running_entry, :codex_uncached_input_telemetry_integrity, :unobserved)
+    )
+    |> Map.put_new(
+      :uncached_failure,
+      Map.get(running_entry, :codex_uncached_input_telemetry_failure)
+    )
+  end
+
   defp token_lifetime_key(:input), do: :codex_input_tokens
+  defp token_lifetime_key(:cached_input), do: :codex_cached_input_tokens
+  defp token_lifetime_key(:uncached_input), do: :codex_uncached_input_tokens
   defp token_lifetime_key(:output), do: :codex_output_tokens
   defp token_lifetime_key(:total), do: :codex_total_tokens
 
   defp token_last_reported_key(:input), do: :codex_last_reported_input_tokens
+  defp token_last_reported_key(:cached_input), do: :codex_last_reported_cached_input_tokens
+  defp token_last_reported_key(:uncached_input), do: :codex_last_reported_uncached_input_tokens
   defp token_last_reported_key(:output), do: :codex_last_reported_output_tokens
   defp token_last_reported_key(:total), do: :codex_last_reported_total_tokens
 
@@ -5116,6 +5748,10 @@ defmodule SymphonyElixir.Orchestrator do
       integrity: :unobserved,
       failure: nil,
       input: new_token_component(),
+      cached_input: new_token_component(),
+      uncached_input: new_token_component(),
+      uncached_integrity: :unobserved,
+      uncached_failure: nil,
       output: new_token_component(),
       total: new_token_component()
     }
@@ -5246,12 +5882,17 @@ defmodule SymphonyElixir.Orchestrator do
   defp map_at_path(_payload, _path), do: nil
 
   defp token_counter_map?(payload) do
-    token_fields = token_fields(:input) ++ token_fields(:output) ++ token_fields(:total)
+    token_fields =
+      token_fields(:input) ++
+        token_fields(:cached_input) ++ token_fields(:output) ++ token_fields(:total)
+
     Enum.any?(token_fields, &Map.has_key?(payload, &1))
   end
 
   defp get_token_usage(usage, :input),
     do: payload_get(usage, token_fields(:input))
+
+  defp get_token_usage(usage, :cached_input), do: Map.get(usage, :cached_input)
 
   defp get_token_usage(usage, :output),
     do: payload_get(usage, token_fields(:output))
@@ -5270,6 +5911,17 @@ defmodule SymphonyElixir.Orchestrator do
       :promptTokens,
       "inputTokens",
       :inputTokens
+    ]
+  end
+
+  defp token_fields(:cached_input) do
+    [
+      "cached_input_tokens",
+      :cached_input_tokens,
+      "cachedInputTokens",
+      :cachedInputTokens,
+      "cached_prompt_tokens",
+      :cached_prompt_tokens
     ]
   end
 
@@ -5330,12 +5982,21 @@ defmodule SymphonyElixir.Orchestrator do
           if(telemetry_observed?, do: :valid, else: :unobserved)
         ),
       token_telemetry_failure: Map.get(running_entry, :codex_token_telemetry_failure),
+      uncached_input_tokens: Map.get(running_entry, :codex_uncached_input_tokens, 0),
+      uncached_input_telemetry_observed: Map.get(running_entry, :codex_uncached_input_telemetry_observed, false),
+      uncached_input_telemetry_integrity: Map.get(running_entry, :codex_uncached_input_telemetry_integrity, :unobserved),
+      uncached_input_telemetry_failure: Map.get(running_entry, :codex_uncached_input_telemetry_failure),
       seconds: running_seconds(Map.get(running_entry, :started_at), now)
     }
   end
 
   defp disabled_run_budget do
-    %{max_turns: Config.settings!().agent.max_turns, max_tokens: nil, max_seconds: nil}
+    %{
+      max_turns: Config.settings!().agent.max_turns,
+      max_tokens: nil,
+      max_uncached_input_tokens: nil,
+      max_seconds: nil
+    }
   end
 
   defp running_seconds(%DateTime{} = started_at, %DateTime{} = now) do

@@ -15,6 +15,26 @@ defmodule SymphonyElixir.Workspace do
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
   @remote_affinity_marker "__SYMPHONY_AFFINITY__"
   @remote_durability_marker "__SYMPHONY_DURABILITY__"
+  @owned_command_output_limit_bytes 64 * 1_024
+  @owned_command_completion_overhead_bytes 128
+  @owned_command_output_limit_status 125
+  @owned_command_termination_unconfirmed_status 126
+  @owned_command_timeout_status 124
+  @owned_command_start_failure_status 127
+  @owned_command_frame_completion_ms 250
+  @owned_command_termination_wait_ms 1_000
+  @owned_command_termination_poll_ms 10
+  @owned_command_wrapper_script """
+  status_marker=$1
+  shift
+  trap ':' HUP INT TERM
+  "$@" &
+  command_pid=$!
+  wait "$command_pid"
+  command_status=$?
+  printf '\n%s:%s\n' "$status_marker" "$command_status"
+  while :; do sleep 3600; done
+  """
 
   @type worker_host :: String.t() | nil
   @type prepared_workspace :: %{
@@ -470,7 +490,7 @@ defmodule SymphonyElixir.Workspace do
     case File.lstat(workspace) do
       {:ok, %File.Stat{type: :directory}} ->
         "git"
-        |> System.cmd(
+        |> run_bounded_system_command(
           [
             "-c",
             "core.fsmonitor=false",
@@ -480,7 +500,8 @@ defmodule SymphonyElixir.Workspace do
             "--porcelain=v1",
             "--untracked-files=normal"
           ],
-          stderr_to_stdout: true
+          [stderr_to_stdout: true],
+          Config.settings!().hooks.timeout_ms
         )
         |> validate_local_git_status(workspace, remote_url)
 
@@ -499,9 +520,32 @@ defmodule SymphonyElixir.Workspace do
     do: {:error, :workspace_preservation_required}
 
   defp validate_local_head_durable(workspace, remote_url) do
+    owner = self()
+    result_ref = make_ref()
+
+    {validator, validator_ref} =
+      spawn_monitor(fn ->
+        result = run_local_head_durability_validation(workspace, remote_url, owner)
+        send(owner, {result_ref, result})
+      end)
+
+    receive do
+      {^result_ref, result} ->
+        Process.demonitor(validator_ref, [:flush])
+        result
+
+      {:DOWN, ^validator_ref, :process, ^validator, _reason} ->
+        {:error, :workspace_preservation_required}
+    end
+  end
+
+  defp run_local_head_durability_validation(workspace, remote_url, cancellation_owner) do
     verifier_root = Path.join(System.tmp_dir!(), "symphony-durability-" <> cleanup_token())
     verifier_repo = Path.join(verifier_root, "repo.git")
     verifier_home = Path.join(verifier_root, "home")
+    cancellation_ref = Process.monitor(cancellation_owner)
+    termination_state_ref = make_ref()
+    Process.put(termination_state_ref, false)
 
     git_env = [
       {"GIT_CONFIG_NOSYSTEM", "1"},
@@ -513,21 +557,32 @@ defmodule SymphonyElixir.Workspace do
     ]
 
     try do
-      with {head_oid, 0} <-
-             System.cmd(
+      with :ok <- continue_local_durability_validation(cancellation_owner, cancellation_ref),
+           {head_oid, 0} <-
+             run_bounded_verifier_command(
                "git",
                ["-C", workspace, "rev-parse", "--verify", "HEAD^{commit}"],
-               stderr_to_stdout: true
+               [stderr_to_stdout: true],
+               Config.settings!().hooks.timeout_ms,
+               cancellation_owner,
+               termination_state_ref
              ),
+           :ok <- continue_local_durability_validation(cancellation_owner, cancellation_ref),
            :ok <- File.mkdir_p(verifier_home),
            :ok <- File.chmod(verifier_root, 0o700),
+           :ok <- continue_local_durability_validation(cancellation_owner, cancellation_ref),
            {_output, 0} <-
-             System.cmd("git", ["init", "--quiet", "--bare", verifier_repo],
-               stderr_to_stdout: true,
-               env: git_env
+             run_bounded_verifier_command(
+               "git",
+               ["init", "--quiet", "--bare", verifier_repo],
+               [stderr_to_stdout: true, env: git_env],
+               Config.settings!().hooks.timeout_ms,
+               cancellation_owner,
+               termination_state_ref
              ),
+           :ok <- continue_local_durability_validation(cancellation_owner, cancellation_ref),
            {_output, 0} <-
-             System.cmd(
+             run_bounded_verifier_command(
                "git",
                [
                  "-C",
@@ -539,11 +594,14 @@ defmodule SymphonyElixir.Workspace do
                  remote_url,
                  "+refs/heads/*:refs/verify/*"
                ],
-               stderr_to_stdout: true,
-               env: git_env
+               [stderr_to_stdout: true, env: git_env],
+               Config.settings!().hooks.timeout_ms,
+               cancellation_owner,
+               termination_state_ref
              ),
+           :ok <- continue_local_durability_validation(cancellation_owner, cancellation_ref),
            {remote_refs, 0} <-
-             System.cmd(
+             run_bounded_verifier_command(
                "git",
                [
                  "-C",
@@ -554,8 +612,10 @@ defmodule SymphonyElixir.Workspace do
                  String.trim(head_oid),
                  "refs/verify/"
                ],
-               stderr_to_stdout: true,
-               env: git_env
+               [stderr_to_stdout: true, env: git_env],
+               Config.settings!().hooks.timeout_ms,
+               cancellation_owner,
+               termination_state_ref
              ) do
         if String.trim(remote_refs) == "",
           do: {:error, :workspace_preservation_required},
@@ -564,7 +624,49 @@ defmodule SymphonyElixir.Workspace do
         {_output, _status} -> {:error, :workspace_preservation_required}
       end
     after
-      File.rm_rf(verifier_root)
+      Process.demonitor(cancellation_ref, [:flush])
+
+      if Process.delete(termination_state_ref) do
+        Logger.error("Retaining durability verifier after unconfirmed command termination path=#{verifier_root}")
+      else
+        File.rm_rf(verifier_root)
+      end
+    end
+  end
+
+  defp run_bounded_verifier_command(
+         command,
+         args,
+         opts,
+         timeout_ms,
+         cancellation_owner,
+         termination_state_ref
+       ) do
+    {result, termination} =
+      run_bounded_system_command_with_termination(
+        command,
+        args,
+        opts,
+        timeout_ms,
+        cancellation_owner
+      )
+
+    if termination == :unconfirmed do
+      Process.put(termination_state_ref, true)
+    end
+
+    result
+  end
+
+  defp continue_local_durability_validation(cancellation_owner, cancellation_ref) do
+    receive do
+      {:DOWN, ^cancellation_ref, :process, ^cancellation_owner, _reason} ->
+        {:error, :workspace_preservation_required}
+    after
+      0 ->
+        if Process.alive?(cancellation_owner),
+          do: :ok,
+          else: {:error, :workspace_preservation_required}
     end
   end
 
@@ -601,13 +703,20 @@ defmodule SymphonyElixir.Workspace do
         "fi",
         "test ! -e \"$quarantine\" || exit 72",
         "test -d \"$workspace\" && test ! -L \"$workspace\" || exit 73",
-        "source_identity=$(stat -f '%d:%i' \"$workspace\" 2>/dev/null || stat -c '%d:%i' \"$workspace\" 2>/dev/null) || exit 73",
+        "stat_identity() {",
+        "  if stat -c '%d:%i' \"$1\" >/dev/null 2>&1; then",
+        "    stat -c '%d:%i' \"$1\" 2>/dev/null",
+        "  else",
+        "    stat -f '%d:%i' \"$1\" 2>/dev/null",
+        "  fi",
+        "}",
+        "source_identity=$(stat_identity \"$workspace\") || exit 73",
         "mv -- \"$workspace\" \"$quarantine\" || exit 73",
         "restore=1",
         "verifier=",
         "check_identity() {",
         "  test -d \"$quarantine\" && test ! -L \"$quarantine\" || return 74",
-        "  current_identity=$(stat -f '%d:%i' \"$quarantine\" 2>/dev/null || stat -c '%d:%i' \"$quarantine\" 2>/dev/null) || return 74",
+        "  current_identity=$(stat_identity \"$quarantine\") || return 74",
         "  test \"$current_identity\" = \"$source_identity\" || return 74",
         "  current_parent=${quarantine%/*}",
         "  current_canonical_parent=$(CDPATH= cd -P \"$current_parent\" 2>/dev/null && pwd -P) || return 75",
@@ -673,6 +782,417 @@ defmodule SymphonyElixir.Workspace do
     12
     |> :crypto.strong_rand_bytes()
     |> Base.encode16(case: :lower)
+  end
+
+  defp run_bounded_system_command(command, args, opts, timeout_ms)
+       when is_binary(command) and is_list(args) and is_list(opts) and is_integer(timeout_ms) and
+              timeout_ms > 0 do
+    run_bounded_system_command(command, args, opts, timeout_ms, nil)
+  end
+
+  defp run_bounded_system_command(command, args, opts, timeout_ms, cancellation_owner)
+       when is_binary(command) and is_list(args) and is_list(opts) and is_integer(timeout_ms) and
+              timeout_ms > 0 and (is_nil(cancellation_owner) or is_pid(cancellation_owner)) do
+    {result, _termination} =
+      run_bounded_system_command_with_termination(
+        command,
+        args,
+        opts,
+        timeout_ms,
+        cancellation_owner
+      )
+
+    result
+  end
+
+  defp run_bounded_system_command_with_termination(
+         command,
+         args,
+         opts,
+         timeout_ms,
+         cancellation_owner
+       )
+       when is_binary(command) and is_list(args) and is_list(opts) and is_integer(timeout_ms) and
+              timeout_ms > 0 and (is_nil(cancellation_owner) or is_pid(cancellation_owner)) do
+    case System.find_executable(command) do
+      nil ->
+        {{"", @owned_command_start_failure_status}, :confirmed}
+
+      executable ->
+        owner = self()
+        result_ref = make_ref()
+
+        {runner, runner_ref} =
+          spawn_monitor(fn ->
+            run_owned_system_command(
+              owner,
+              result_ref,
+              executable,
+              args,
+              opts,
+              timeout_ms,
+              cancellation_owner
+            )
+          end)
+
+        receive do
+          {^result_ref, result} ->
+            Process.demonitor(runner_ref, [:flush])
+            result
+
+          {:DOWN, ^runner_ref, :process, ^runner, _reason} ->
+            {{"", @owned_command_start_failure_status}, :unconfirmed}
+        end
+    end
+  end
+
+  defp run_owned_system_command(
+         owner,
+         result_ref,
+         executable,
+         args,
+         opts,
+         timeout_ms,
+         cancellation_owner
+       ) do
+    owner_ref = Process.monitor(owner)
+    cancellation_ref = monitor_owned_command_cancellation(cancellation_owner, owner)
+    status_marker = "__SYMPHONY_OWNED_COMMAND_STATUS_#{cleanup_token()}__"
+    shell = System.find_executable("sh") || "/bin/sh"
+
+    wrapper_args =
+      ["-c", @owned_command_wrapper_script, "symphony-command-wrapper", status_marker, executable | args]
+
+    port_opts =
+      [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        args: Enum.map(wrapper_args, &String.to_charlist/1)
+      ]
+      |> maybe_put_owned_command_env(Keyword.get(opts, :env))
+
+    port = Port.open({:spawn_executable, String.to_charlist(shell)}, port_opts)
+    timeout_ref = Process.send_after(self(), {:owned_command_timeout, result_ref}, timeout_ms)
+
+    os_pid =
+      case Port.info(port, :os_pid) do
+        {:os_pid, pid} when is_integer(pid) -> pid
+        _other -> nil
+      end
+
+    collect_owned_system_command(%{
+      port: port,
+      owner: owner,
+      owner_ref: owner_ref,
+      cancellation_owner: cancellation_owner,
+      cancellation_ref: cancellation_ref,
+      result_ref: result_ref,
+      timeout_ref: timeout_ref,
+      os_pid: os_pid,
+      status_marker: status_marker,
+      frame_timeout_ref: nil,
+      output: ""
+    })
+  end
+
+  defp collect_owned_system_command(state) do
+    %{
+      port: port,
+      owner: owner,
+      owner_ref: owner_ref,
+      cancellation_owner: cancellation_owner,
+      cancellation_ref: cancellation_ref,
+      result_ref: result_ref,
+      timeout_ref: timeout_ref,
+      os_pid: os_pid,
+      status_marker: status_marker,
+      frame_timeout_ref: frame_timeout_ref,
+      output: output
+    } = state
+
+    receive do
+      {^port, {:data, data}} ->
+        combined_output = output <> data
+
+        case split_owned_command_completion(combined_output, status_marker) do
+          {:ok, command_output, status}
+          when byte_size(command_output) <= @owned_command_output_limit_bytes ->
+            finish_owned_system_command(state, command_output, status)
+
+          {:ok, command_output, _status} ->
+            finish_owned_system_command(
+              state,
+              binary_part(command_output, 0, @owned_command_output_limit_bytes),
+              @owned_command_output_limit_status
+            )
+
+          :pending ->
+            if pending_owned_command_output_within_limit?(combined_output, status_marker) do
+              state
+              |> Map.put(:output, combined_output)
+              |> maybe_arm_owned_command_frame_timeout()
+              |> collect_owned_system_command()
+            else
+              finish_owned_system_command(
+                state,
+                binary_part(combined_output, 0, @owned_command_output_limit_bytes),
+                @owned_command_output_limit_status
+              )
+            end
+        end
+
+      {^port, {:exit_status, status}} ->
+        finish_owned_system_command(state, output, status)
+
+      {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
+        Process.cancel_timer(timeout_ref)
+        cancel_owned_command_timer(frame_timeout_ref)
+        demonitor_owned_command_cancellation(cancellation_ref)
+        terminate_owned_system_command(port, os_pid)
+
+      {:DOWN, ^cancellation_ref, :process, ^cancellation_owner, _reason}
+      when is_reference(cancellation_ref) ->
+        finish_owned_system_command(state, output, @owned_command_timeout_status)
+
+      {:owned_command_timeout, ^result_ref} ->
+        finish_owned_system_command(state, output, @owned_command_timeout_status)
+
+      {:owned_command_frame_timeout, ^result_ref} ->
+        finish_owned_system_command(state, output, @owned_command_output_limit_status)
+    end
+  end
+
+  defp maybe_arm_owned_command_frame_timeout(%{frame_timeout_ref: nil} = state)
+       when byte_size(state.output) > @owned_command_output_limit_bytes do
+    frame_timeout_ref =
+      Process.send_after(
+        self(),
+        {:owned_command_frame_timeout, state.result_ref},
+        @owned_command_frame_completion_ms
+      )
+
+    %{state | frame_timeout_ref: frame_timeout_ref}
+  end
+
+  defp maybe_arm_owned_command_frame_timeout(state), do: state
+
+  defp split_owned_command_completion(output, status_marker) do
+    prefix = "\n#{status_marker}:"
+
+    with {marker_offset, marker_size} <- :binary.match(output, prefix),
+         status_offset = marker_offset + marker_size,
+         status_and_rest = binary_part(output, status_offset, byte_size(output) - status_offset),
+         {status_size, 1} <- :binary.match(status_and_rest, "\n"),
+         status_binary = binary_part(status_and_rest, 0, status_size),
+         {status, ""} <- Integer.parse(status_binary),
+         true <- status in 0..255 do
+      {:ok, binary_part(output, 0, marker_offset), status}
+    else
+      _other -> :pending
+    end
+  end
+
+  defp pending_owned_command_output_within_limit?(output, _status_marker)
+       when byte_size(output) <= @owned_command_output_limit_bytes,
+       do: true
+
+  defp pending_owned_command_output_within_limit?(output, status_marker)
+       when byte_size(output) <=
+              @owned_command_output_limit_bytes + @owned_command_completion_overhead_bytes do
+    completion_prefix = "\n#{status_marker}:"
+    max_pending_frame_bytes = byte_size(completion_prefix) + 3
+    earliest_marker_offset = max(0, byte_size(output) - max_pending_frame_bytes)
+    latest_marker_offset = min(@owned_command_output_limit_bytes, byte_size(output) - 1)
+
+    if earliest_marker_offset <= latest_marker_offset do
+      Enum.any?(earliest_marker_offset..latest_marker_offset, fn marker_offset ->
+        fragment =
+          binary_part(output, marker_offset, byte_size(output) - marker_offset)
+
+        pending_owned_command_completion_fragment?(fragment, completion_prefix)
+      end)
+    else
+      false
+    end
+  end
+
+  defp pending_owned_command_output_within_limit?(_output, _status_marker), do: false
+
+  defp pending_owned_command_completion_fragment?(fragment, completion_prefix)
+       when byte_size(fragment) <= byte_size(completion_prefix),
+       do: String.starts_with?(completion_prefix, fragment)
+
+  defp pending_owned_command_completion_fragment?(fragment, completion_prefix) do
+    partial_status =
+      binary_part(
+        fragment,
+        byte_size(completion_prefix),
+        byte_size(fragment) - byte_size(completion_prefix)
+      )
+
+    String.starts_with?(fragment, completion_prefix) and
+      byte_size(partial_status) <= 3 and partial_status =~ ~r/^\d*$/
+  end
+
+  @doc false
+  @spec owned_command_output_within_limit_for_test?(binary(), binary()) :: boolean()
+  def owned_command_output_within_limit_for_test?(output, status_marker)
+      when is_binary(output) and is_binary(status_marker),
+      do: pending_owned_command_output_within_limit?(output, status_marker)
+
+  defp finish_owned_system_command(state, output, status) do
+    Process.cancel_timer(state.timeout_ref)
+    cancel_owned_command_timer(state.frame_timeout_ref)
+    Process.demonitor(state.owner_ref, [:flush])
+    demonitor_owned_command_cancellation(state.cancellation_ref)
+    output = bounded_owned_command_output(output)
+
+    {final_status, termination} =
+      case terminate_owned_system_command(state.port, state.os_pid) do
+        :ok ->
+          {status, :confirmed}
+
+        {:error, :termination_unconfirmed} ->
+          {@owned_command_termination_unconfirmed_status, :unconfirmed}
+      end
+
+    send(state.owner, {state.result_ref, {{output, final_status}, termination}})
+  end
+
+  defp bounded_owned_command_output(output)
+       when byte_size(output) > @owned_command_output_limit_bytes,
+       do: binary_part(output, 0, @owned_command_output_limit_bytes)
+
+  defp bounded_owned_command_output(output), do: output
+
+  defp cancel_owned_command_timer(timer_ref) when is_reference(timer_ref),
+    do: Process.cancel_timer(timer_ref)
+
+  defp cancel_owned_command_timer(_timer_ref), do: false
+
+  defp maybe_put_owned_command_env(port_opts, nil), do: port_opts
+
+  defp maybe_put_owned_command_env(port_opts, env) do
+    Keyword.put(
+      port_opts,
+      :env,
+      Enum.map(env, fn {key, value} ->
+        {String.to_charlist(key), String.to_charlist(value)}
+      end)
+    )
+  end
+
+  defp monitor_owned_command_cancellation(nil, _owner), do: nil
+  defp monitor_owned_command_cancellation(owner, owner), do: nil
+
+  defp monitor_owned_command_cancellation(cancellation_owner, _owner),
+    do: Process.monitor(cancellation_owner)
+
+  defp demonitor_owned_command_cancellation(cancellation_ref) when is_reference(cancellation_ref),
+    do: Process.demonitor(cancellation_ref, [:flush])
+
+  defp demonitor_owned_command_cancellation(_cancellation_ref), do: false
+
+  defp terminate_owned_system_command(port, os_pid) do
+    termination = terminate_owned_system_command_group(port, os_pid)
+
+    try do
+      Port.close(port)
+    rescue
+      ArgumentError -> :ok
+    end
+
+    case termination do
+      :signalled ->
+        if wait_for_owned_system_command_group(os_pid),
+          do: :ok,
+          else: {:error, :termination_unconfirmed}
+
+      :already_stopped ->
+        :ok
+
+      :unconfirmed ->
+        {:error, :termination_unconfirmed}
+    end
+  end
+
+  defp owned_system_command_alive?(port, os_pid) when is_integer(os_pid),
+    do: Port.info(port, :os_pid) == {:os_pid, os_pid}
+
+  defp terminate_owned_system_command_group(port, os_pid) when is_integer(os_pid) do
+    cond do
+      owned_system_command_alive?(port, os_pid) and system_command_group_alive?(os_pid) ->
+        stop_and_kill_owned_system_command_group(port, os_pid)
+
+      owned_system_command_alive?(port, os_pid) ->
+        signal_owned_system_command(os_pid, "KILL")
+        :unconfirmed
+
+      system_command_group_alive?(os_pid) ->
+        :unconfirmed
+
+      true ->
+        :already_stopped
+    end
+  end
+
+  defp terminate_owned_system_command_group(port, _os_pid) do
+    try do
+      Port.close(port)
+    rescue
+      ArgumentError -> :ok
+    end
+
+    :unconfirmed
+  end
+
+  defp stop_and_kill_owned_system_command_group(port, os_pid) do
+    with :ok <- signal_owned_system_command_group(os_pid, "STOP"),
+         true <- owned_system_command_alive?(port, os_pid),
+         :ok <- signal_owned_system_command_group(os_pid, "KILL") do
+      :signalled
+    else
+      _other -> :unconfirmed
+    end
+  end
+
+  defp system_command_group_alive?(os_pid) do
+    case System.cmd("/bin/kill", ["-0", "--", "-#{os_pid}"], stderr_to_stdout: true) do
+      {_output, 0} -> true
+      {_output, _status} -> false
+    end
+  end
+
+  defp wait_for_owned_system_command_group(os_pid) do
+    deadline = System.monotonic_time(:millisecond) + @owned_command_termination_wait_ms
+    do_wait_for_owned_system_command_group(os_pid, deadline)
+  end
+
+  defp do_wait_for_owned_system_command_group(os_pid, deadline) do
+    cond do
+      not system_command_group_alive?(os_pid) ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        false
+
+      true ->
+        Process.sleep(@owned_command_termination_poll_ms)
+        do_wait_for_owned_system_command_group(os_pid, deadline)
+    end
+  end
+
+  defp signal_owned_system_command_group(os_pid, signal) do
+    case System.cmd("/bin/kill", ["-#{signal}", "--", "-#{os_pid}"], stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {_output, _status} -> {:error, :termination_unconfirmed}
+    end
+  end
+
+  defp signal_owned_system_command(os_pid, signal) do
+    System.cmd("/bin/kill", ["-#{signal}", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    :ok
   end
 
   @spec remove_issue_workspaces(term()) :: :ok

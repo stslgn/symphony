@@ -31,6 +31,14 @@ rejected.
 Cleanup I/O runs in one supervised deadline-limited task, so a stalled Git
 transport cannot block status or operator controls, and stable preservation
 failures are not retried on every poll.
+Local durability commands run behind a keeper that remains the exact process
+group leader even when the command exits before one of its descendants.
+Completion, timeout, cancellation, or more than 64 KiB of combined output stops
+and kills that identity-anchored group. A partial private completion frame gets
+at most 250 ms to finish before it is treated as excess output. The runner-owned verifier outlives
+cancellation of the outer cleanup task long enough to complete teardown; if
+group disappearance cannot be confirmed, cleanup fails closed and retains the
+verifier for operator recovery.
 Cleanup authorization is also durable. The ledger records request, I/O start,
 operator-required, explicit retry, I/O completion, and final completion as
 separate transitions. A restart after I/O starts never infers that it is safe to

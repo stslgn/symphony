@@ -948,6 +948,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
 
+    assert {:ok, [%Issue{state: "Done"}]} =
+             SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"], context)
+
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
     assert :ok = Memory.create_comment("issue-1", "quiet", context)
     assert :ok = Memory.update_issue_state("issue-1", "Quiet", context)

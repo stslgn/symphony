@@ -2,7 +2,7 @@ defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.AgentRunner, as: RealAgentRunner
-  alias SymphonyElixir.RunLedger
+  alias SymphonyElixir.{RunLedger, TrackerAdmission}
 
   defmodule SnapshotLinearClient do
     def fetch_candidate_issues(context) do
@@ -44,6 +44,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.webhook_secret == nil
     assert config.agent.max_turns == 20
     assert config.agent.max_run_tokens == nil
+    assert config.agent.max_run_uncached_input_tokens == nil
     assert config.agent.max_run_seconds == nil
     assert config.workflow.runtime_prompt_mode == "full_prompt_compat"
     assert config.codex.dynamic_tool_allowlist == []
@@ -94,15 +95,21 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       max_run_tokens: 250_000,
+      max_run_uncached_input_tokens: 100_000,
       max_run_seconds: 7_200
     )
 
     assert Config.settings!().agent.max_run_tokens == 250_000
+    assert Config.settings!().agent.max_run_uncached_input_tokens == 100_000
     assert Config.settings!().agent.max_run_seconds == 7_200
 
     write_workflow_file!(Workflow.workflow_file_path(), max_run_tokens: 0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "agent.max_run_tokens"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_run_uncached_input_tokens: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_run_uncached_input_tokens"
 
     write_workflow_file!(Workflow.workflow_file_path(), max_run_seconds: 0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -2239,33 +2246,53 @@ defmodule SymphonyElixir.CoreTest do
   test "workspace cleanup timeout stays responsive and requires an operator retry" do
     root = parked_workspace_root("async-cleanup-timeout")
     workspace = Path.join(root, "MT-ASYNC-TIMEOUT")
+    remote_url = install_durable_local_workspace!(workspace)
     fake_bin = Path.join(root, "fake-bin")
     fake_git = Path.join(fake_bin, "git")
     trace_file = Path.join(root, "git.trace")
+    process_group_file = Path.join(root, "git-process-group.pid")
+    child_pid_file = Path.join(root, "git-child.pid")
+    verifier_root_file = Path.join(root, "git-verifier-root.path")
     issue_id = "issue-async-timeout"
     server_name = Module.concat(__MODULE__, :AsyncCleanupTimeout)
     previous_path = System.get_env("PATH")
+    real_git = System.find_executable("git")
 
-    File.mkdir_p!(workspace)
-    File.write!(Path.join(workspace, "preserve.txt"), "must survive\n")
     File.mkdir_p!(fake_bin)
 
     File.write!(fake_git, """
     #!/bin/sh
+    if [ "$1" != '-C' ] || [ "$3" != 'fetch' ]; then
+      exec '#{real_git}' "$@"
+    fi
+    verifier_root=${2%/repo.git}
+    printf '%s\\n' "$verifier_root" > '#{verifier_root_file}'
     printf 'called\\n' >> '#{trace_file}'
-    sleep 2
+    /bin/ps -p "$$" -o pgid= | /usr/bin/tr -d ' ' > '#{process_group_file}'
+    (
+      trap '' HUP INT TERM
+      while :; do sleep 1; done
+    ) &
+    child_pid=$!
+    printf '%s\\n' "$child_pid" > '#{child_pid_file}'
+    wait "$child_pid"
     printf 'survived\\n' >> '#{trace_file}'
     exit 1
     """)
 
     File.chmod!(fake_git, 0o755)
     System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
-    on_exit(fn -> restore_env("PATH", previous_path) end)
+
+    on_exit(fn ->
+      terminate_test_process_group(process_group_file)
+      remove_test_durability_verifier(verifier_root_file)
+      restore_env("PATH", previous_path)
+    end)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       workspace_root: root,
-      workspace_durability_remote_url: "/srv/git/repo.git",
+      workspace_durability_remote_url: remote_url,
       hook_timeout_ms: 1_000,
       poll_interval_ms: 60_000
     )
@@ -2318,14 +2345,191 @@ defmodule SymphonyElixir.CoreTest do
 
     assert MapSet.member?(preserved.claimed, issue_id)
     refute File.exists?(workspace)
-    assert File.read!(Path.join(workspace <> ".symphony-cleanup", "preserve.txt")) == "must survive\n"
+    assert File.read!(Path.join(workspace <> ".symphony-cleanup", "tracked.txt")) == "durable\n"
     assert File.read!(trace_file) == "called\n"
+
+    process_group = process_group_file |> File.read!() |> String.trim() |> String.to_integer()
+    child_pid = child_pid_file |> File.read!() |> String.trim() |> String.to_integer()
+
+    assert_os_process_stopped(process_group)
+    assert_os_process_stopped(child_pid)
+
+    verifier_root = verifier_root_file |> File.read!() |> String.trim()
+    assert_path_removed(verifier_root)
 
     send(pid, :start_pending_workspace_cleanups)
     send(pid, :start_pending_workspace_cleanups)
     Process.sleep(1_200)
     assert File.read!(trace_file) == "called\n"
     assert :operator_required == :sys.get_state(pid).cleanup_pending[issue_id].status
+  end
+
+  test "durability verifier removes its temporary repository after a natural exit 126" do
+    root = parked_workspace_root("cleanup-natural-exit-126")
+    workspace = Path.join(root, "MT-CLEANUP-NATURAL-126")
+    remote_url = install_durable_local_workspace!(workspace)
+    fake_bin = Path.join(root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    verifier_root_file = Path.join(root, "git-verifier-root.path")
+    previous_path = System.get_env("PATH")
+    real_git = System.find_executable("git")
+
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    if [ "$1" != '-C' ] || [ "$3" != 'fetch' ]; then
+      exec '#{real_git}' "$@"
+    fi
+    verifier_root=${2%/repo.git}
+    printf '%s\n' "$verifier_root" > '#{verifier_root_file}'
+    exit 126
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    on_exit(fn ->
+      remove_test_durability_verifier(verifier_root_file)
+      restore_env("PATH", previous_path)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      hook_timeout_ms: 5_000,
+      poll_interval_ms: 60_000
+    )
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(workspace, root, nil)
+
+    verifier_root = verifier_root_file |> File.read!() |> String.trim()
+    assert_path_removed(verifier_root)
+    assert File.dir?(workspace)
+  end
+
+  test "unconfirmed durability command teardown retains its temporary verifier" do
+    root = parked_workspace_root("cleanup-unconfirmed-termination")
+    workspace = Path.join(root, "MT-CLEANUP-UNCONFIRMED")
+    remote_url = install_durable_local_workspace!(workspace)
+    fake_bin = Path.join(root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    process_group_file = Path.join(root, "git-process-group.pid")
+    child_pid_file = Path.join(root, "git-child.pid")
+    verifier_root_file = Path.join(root, "git-verifier-root.path")
+    previous_path = System.get_env("PATH")
+    real_git = System.find_executable("git")
+
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    if [ "$1" != '-C' ] || [ "$3" != 'fetch' ]; then
+      exec '#{real_git}' "$@"
+    fi
+    verifier_root=${2%/repo.git}
+    printf '%s\n' "$verifier_root" > '#{verifier_root_file}'
+    /bin/ps -p "$$" -o pgid= | /usr/bin/tr -d ' ' > '#{process_group_file}'
+    (
+      trap '' HUP INT TERM
+      while :; do sleep 1; done
+    ) </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!" > '#{child_pid_file}'
+    /bin/kill -KILL "$PPID"
+    exit 1
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    on_exit(fn ->
+      terminate_test_process_group(process_group_file)
+      remove_test_durability_verifier(verifier_root_file)
+      restore_env("PATH", previous_path)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      hook_timeout_ms: 5_000,
+      poll_interval_ms: 60_000
+    )
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(workspace, root, nil)
+
+    verifier_root = verifier_root_file |> File.read!() |> String.trim()
+    child_pid = child_pid_file |> File.read!() |> String.trim() |> String.to_integer()
+    assert File.dir?(verifier_root)
+    assert os_process_alive?(child_pid)
+    assert File.dir?(workspace)
+  end
+
+  test "owner death cancels the active durability command and removes its verifier" do
+    root = parked_workspace_root("cleanup-owner-death")
+    workspace = Path.join(root, "MT-CLEANUP-OWNER-DEATH")
+    remote_url = install_durable_local_workspace!(workspace)
+    fake_bin = Path.join(root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    process_group_file = Path.join(root, "git-process-group.pid")
+    child_pid_file = Path.join(root, "git-child.pid")
+    verifier_root_file = Path.join(root, "git-verifier-root.path")
+    previous_path = System.get_env("PATH")
+    real_git = System.find_executable("git")
+
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    if [ "$1" != '-C' ] || [ "$3" != 'fetch' ]; then
+      exec '#{real_git}' "$@"
+    fi
+    verifier_root=${2%/repo.git}
+    printf '%s\n' "$verifier_root" > '#{verifier_root_file}'
+    /bin/ps -p "$$" -o pgid= | /usr/bin/tr -d ' ' > '#{process_group_file}'
+    (
+      trap '' HUP INT TERM
+      while :; do sleep 1; done
+    ) &
+    child_pid=$!
+    printf '%s\n' "$child_pid" > '#{child_pid_file}'
+    wait "$child_pid"
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    on_exit(fn ->
+      terminate_test_process_group(process_group_file)
+      remove_test_durability_verifier(verifier_root_file)
+      restore_env("PATH", previous_path)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      hook_timeout_ms: 30_000,
+      poll_interval_ms: 60_000
+    )
+
+    cleanup_owner =
+      Task.async(fn ->
+        Workspace.remove_exact_if_durable(workspace, root, nil)
+      end)
+
+    await_path(child_pid_file)
+    await_path(verifier_root_file)
+    child_pid = child_pid_file |> File.read!() |> String.trim() |> String.to_integer()
+    verifier_root = verifier_root_file |> File.read!() |> String.trim()
+
+    assert nil == Task.shutdown(cleanup_owner, :brutal_kill)
+    assert_os_process_stopped(child_pid)
+    assert_path_removed(verifier_root)
+    assert File.dir?(workspace <> ".symphony-cleanup")
   end
 
   test "completion ledger failure retains claim and blocks continuation until persisted" do
@@ -2660,6 +2864,310 @@ defmodule SymphonyElixir.CoreTest do
     assert start_recovery.recovered_attempts[start_issue.id] == 3
 
     Process.cancel_timer(spawn_failed.retry_attempts[spawn_issue.id].timer_ref)
+  end
+
+  test "Agent Ready admission is durably read back before an agent task starts" do
+    {state, issue, ledger_path, workspace_root} = pending_dispatch_fixture("tracker-admission")
+    issue = %{issue | state: "Agent Ready", labels: ["zeta", "alpha"]}
+    workspace = Path.join(workspace_root, issue.identifier)
+    parent = self()
+
+    state =
+      state
+      |> due_dispatch_state(issue.id)
+      |> put_tracker_admission_io(
+        update: fn issue_id, target_state, _context ->
+          send(parent, {:tracker_state_updated, issue_id, target_state})
+          :ok
+        end,
+        fetch: fn issue_ids, _context ->
+          send(parent, {:tracker_issue_read_back, issue_ids})
+          {:ok, [%{issue | state: "Agent Running"}]}
+        end
+      )
+      |> Map.put(:task_start_fn, fn _task ->
+        send(parent, :agent_task_started)
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end)
+
+    admitted =
+      Orchestrator.claim_and_start_issue_for_test(
+        state,
+        issue,
+        2,
+        nil,
+        workspace,
+        workspace_root,
+        nil,
+        Tracker.current_poll_context()
+      )
+
+    expected_issue_id = issue.id
+    assert_receive {:tracker_state_updated, ^expected_issue_id, "Agent Running"}
+    assert_receive {:tracker_issue_read_back, [issue_id]}
+    assert issue_id == issue.id
+    assert_receive :agent_task_started
+
+    assert %{issue: %Issue{state: "Agent Running"}, admission: admission} =
+             admitted.running[issue.id]
+
+    assert admission.issue_snapshot_schema == "symphony.issue_snapshot.v1"
+    assert byte_size(admission.issue_snapshot_sha256) == 64
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+
+    assert Enum.map(events, & &1["transition"]) == [
+             "run_claimed",
+             "run_started",
+             "run_failed",
+             "retry_scheduled",
+             "run_claimed",
+             "tracker_admission_io_started",
+             "tracker_admission_completed",
+             "run_started",
+             "operator_cursor_initialized"
+           ]
+
+    running_entry = admitted.running[issue.id]
+    Process.exit(running_entry.pid, :kill)
+    Process.demonitor(running_entry.ref, [:flush])
+  end
+
+  test "admission conflict parks the claim without starting an agent task" do
+    {state, issue, ledger_path, workspace_root} = pending_dispatch_fixture("admission-conflict")
+    issue = %{issue | state: "Agent Ready"}
+    workspace = Path.join(workspace_root, issue.identifier)
+    parent = self()
+
+    state =
+      state
+      |> due_dispatch_state(issue.id)
+      |> put_tracker_admission_io(
+        update: fn _issue_id, _target_state, _context -> :ok end,
+        fetch: fn _issue_ids, _context ->
+          {:ok, [%{issue | state: "Agent Running", title: "Concurrent edit"}]}
+        end
+      )
+      |> Map.put(:task_start_fn, fn _task ->
+        send(parent, :unexpected_agent_task_start)
+        {:error, :must_not_start}
+      end)
+
+    parked =
+      Orchestrator.claim_and_start_issue_for_test(
+        state,
+        issue,
+        2,
+        nil,
+        workspace,
+        workspace_root,
+        nil,
+        Tracker.current_poll_context()
+      )
+
+    refute_received :unexpected_agent_task_start
+    refute Map.has_key?(parked.running, issue.id)
+    refute MapSet.member?(parked.claimed, issue.id)
+
+    assert %{reason: "tracker_admission_conflict", allowed_actions: ["retry", "reject"]} =
+             parked.parked[issue.id]
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+
+    assert Enum.map(Enum.take(events, -3), & &1["transition"]) == [
+             "run_claimed",
+             "tracker_admission_io_started",
+             "run_parked"
+           ]
+  end
+
+  test "admission I/O failure parks the claim without read-back or model start" do
+    {state, issue, _ledger_path, workspace_root} = pending_dispatch_fixture("admission-failed")
+    issue = %{issue | state: "Agent Ready"}
+    workspace = Path.join(workspace_root, issue.identifier)
+    parent = self()
+
+    state =
+      state
+      |> due_dispatch_state(issue.id)
+      |> put_tracker_admission_io(
+        update: fn _issue_id, _target_state, _context ->
+          {:error, :synthetic_tracker_failure}
+        end,
+        fetch: fn _issue_ids, _context ->
+          send(parent, :unexpected_admission_readback)
+          {:ok, []}
+        end
+      )
+      |> Map.put(:task_start_fn, fn _task ->
+        send(parent, :unexpected_agent_task_start)
+        {:error, :must_not_start}
+      end)
+
+    parked =
+      Orchestrator.claim_and_start_issue_for_test(
+        state,
+        issue,
+        2,
+        nil,
+        workspace,
+        workspace_root,
+        nil,
+        Tracker.current_poll_context()
+      )
+
+    refute_received :unexpected_admission_readback
+    refute_received :unexpected_agent_task_start
+    assert parked.parked[issue.id].reason == "tracker_admission_failed"
+  end
+
+  test "restart completes an observed target-state admission before one model start" do
+    {state, ready_issue, context, ledger_path} = recovered_admission_fixture("target")
+    parent = self()
+
+    state =
+      state
+      |> put_tracker_admission_io(
+        update: fn _issue_id, _target_state, _context ->
+          send(parent, :unexpected_recovery_mutation)
+          :ok
+        end
+      )
+      |> Map.put(:task_start_fn, fn _task ->
+        send(parent, :recovered_agent_task_started)
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end)
+
+    assert {:reply, pending_snapshot, _state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, state)
+
+    assert [
+             %{
+               stage: "tracker_admission",
+               status: "io_started",
+               admission_id: "admission-recovered-target"
+             }
+           ] = pending_snapshot.admitting
+
+    recovered =
+      Orchestrator.reconcile_tracker_admissions_for_test(
+        state,
+        {:ok, [%{ready_issue | state: "Agent Running"}]},
+        context
+      )
+
+    refute_received :unexpected_recovery_mutation
+    assert_receive :recovered_agent_task_started
+    assert Map.has_key?(recovered.running, ready_issue.id)
+    refute Map.has_key?(tracker_admissions_for_test(recovered), ready_issue.id)
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+
+    assert Enum.count(events, &(&1["transition"] == "tracker_admission_completed")) == 1
+    assert Enum.count(events, &(&1["transition"] == "run_started")) == 1
+
+    repeated =
+      Orchestrator.reconcile_tracker_admissions_for_test(
+        recovered,
+        {:ok, [%{ready_issue | state: "Agent Running"}]},
+        context
+      )
+
+    refute_received :recovered_agent_task_started
+    assert repeated.running[ready_issue.id].run_id == recovered.running[ready_issue.id].run_id
+
+    running_entry = recovered.running[ready_issue.id]
+    Process.exit(running_entry.pid, :kill)
+    Process.demonitor(running_entry.ref, [:flush])
+  end
+
+  test "restart retries source-state admission mutation once under the same admission id" do
+    {state, ready_issue, context, ledger_path} = recovered_admission_fixture("source")
+    parent = self()
+
+    state =
+      state
+      |> put_tracker_admission_io(
+        update: fn issue_id, target_state, _context ->
+          send(parent, {:recovery_mutation, issue_id, target_state})
+          :ok
+        end,
+        fetch: fn [issue_id], _context ->
+          send(parent, {:recovery_readback, issue_id})
+          {:ok, [%{ready_issue | state: "Agent Running"}]}
+        end
+      )
+      |> Map.put(:task_start_fn, fn _task ->
+        send(parent, :source_recovered_agent_task_started)
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end)
+
+    recovered =
+      Orchestrator.reconcile_tracker_admissions_for_test(
+        state,
+        {:ok, [ready_issue]},
+        context
+      )
+
+    expected_issue_id = ready_issue.id
+    assert_receive {:recovery_mutation, ^expected_issue_id, "Agent Running"}
+    assert_receive {:recovery_readback, ^expected_issue_id}
+    assert_receive :source_recovered_agent_task_started
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+
+    assert [completed] =
+             Enum.filter(events, &(&1["transition"] == "tracker_admission_completed"))
+
+    assert completed["admission_id"] == "admission-recovered-source"
+
+    running_entry = recovered.running[ready_issue.id]
+    Process.exit(running_entry.pid, :kill)
+    Process.demonitor(running_entry.ref, [:flush])
+  end
+
+  test "restart parks content conflicts and read failures without a model start" do
+    parent = self()
+
+    {conflict_state, issue, context, _ledger_path} =
+      recovered_admission_fixture("conflict")
+
+    conflict_state =
+      Map.put(conflict_state, :task_start_fn, fn _task ->
+        send(parent, :unexpected_conflict_model_start)
+        {:error, :must_not_start}
+      end)
+
+    conflict =
+      Orchestrator.reconcile_tracker_admissions_for_test(
+        conflict_state,
+        {:ok, [%{issue | state: "Agent Running", title: "Concurrent edit"}]},
+        context
+      )
+
+    refute_received :unexpected_conflict_model_start
+    assert conflict.parked[issue.id].reason == "tracker_admission_conflict"
+    refute Map.has_key?(tracker_admissions_for_test(conflict), issue.id)
+
+    {failed_state, failed_issue, failed_context, _failed_ledger_path} =
+      recovered_admission_fixture("read-failed")
+
+    failed_state =
+      Map.put(failed_state, :task_start_fn, fn _task ->
+        send(parent, :unexpected_failed_model_start)
+        {:error, :must_not_start}
+      end)
+
+    failed =
+      Orchestrator.reconcile_tracker_admissions_for_test(
+        failed_state,
+        {:error, :synthetic_tracker_failure},
+        failed_context
+      )
+
+    refute_received :unexpected_failed_model_start
+    assert failed.parked[failed_issue.id].reason == "tracker_admission_failed"
+    refute Map.has_key?(tracker_admissions_for_test(failed), failed_issue.id)
   end
 
   test "tracker terminal ledger failure blocks worker stop cleanup and claim release" do
@@ -4879,6 +5387,36 @@ defmodule SymphonyElixir.CoreTest do
              "run=run-stable attempt=4 stage=running generation=runner-generation"
   end
 
+  test "prompt builder exposes the sanitized pre-model admission packet" do
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      prompt:
+        "admission={{ run.admission.id }} source={{ run.admission.source_state }} target={{ run.admission.target_state }} snapshot={{ run.admission.issue_snapshot_sha256 }} authority={{ run.admission.tracker_authority_digest }}"
+    )
+
+    issue = %Issue{
+      id: "issue-admission-prompt",
+      identifier: "MT-ADMISSION-PROMPT",
+      title: "Expose admission evidence",
+      state: "Agent Running"
+    }
+
+    admission = %{
+      admission_id: "admission-stable",
+      issue_snapshot_bytes: 144,
+      issue_snapshot_schema: "symphony.issue_snapshot.v1",
+      issue_snapshot_sha256: String.duplicate("a", 64),
+      source_state: "Agent Ready",
+      target_state: "Agent Running",
+      tracker_authority_digest: String.duplicate("b", 64)
+    }
+
+    prompt = PromptBuilder.build_prompt(issue, admission: admission)
+
+    assert prompt ==
+             "admission=admission-stable source=Agent Ready target=Agent Running snapshot=#{String.duplicate("a", 64)} authority=#{String.duplicate("b", 64)}"
+  end
+
   test "prompt builder renders only the runtime prompt section when present" do
     workflow_prompt = """
     # Operator workflow
@@ -5082,7 +5620,19 @@ defmodule SymphonyElixir.CoreTest do
 
     on_exit(fn -> Workflow.set_workflow_file_path(workflow_path) end)
 
-    prompt = PromptBuilder.build_prompt(issue, attempt: 2)
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        attempt: 2,
+        admission: %{
+          admission_id: "admission-runtime-contract",
+          issue_snapshot_bytes: 144,
+          issue_snapshot_schema: "symphony.issue_snapshot.v1",
+          issue_snapshot_sha256: String.duplicate("a", 64),
+          source_state: "Agent Ready",
+          target_state: "Agent Running",
+          tracker_authority_digest: String.duplicate("b", 64)
+        }
+      )
 
     assert prompt =~ "You are working on a Linear ticket `MT-616`"
     assert prompt =~ "Issue context:"
@@ -5097,6 +5647,10 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Do not call `gh pr merge` directly"
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"
+    assert prompt =~ "Pre-model admission is already complete"
+    assert prompt =~ "Admission ID: admission-runtime-contract"
+    assert prompt =~ "Snapshot SHA-256: #{String.duplicate("a", 64)}"
+    assert prompt =~ "Do not repeat the initial state mutation or admission read-back"
   end
 
   test "prompt builder adds continuation guidance for retries" do
@@ -6035,6 +6589,104 @@ defmodule SymphonyElixir.CoreTest do
     {state, issue, ledger_path, workspace_root}
   end
 
+  defp recovered_admission_fixture(tag) do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-recovered-admission-#{tag}-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    File.mkdir_p!(workspace_root)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    on_exit(fn -> File.rm_rf(test_root) end)
+    {:ok, workspace_root} = SymphonyElixir.PathSafety.canonicalize(workspace_root)
+
+    issue = %Issue{
+      id: "issue-recovered-admission-#{tag}",
+      identifier: "MT-RECOVERED-ADMISSION-#{String.upcase(tag)}",
+      title: "Recovered admission #{tag}",
+      description: "Preserve exact content across restart.",
+      state: "Agent Ready",
+      url: "https://example.org/recovered-admission/#{tag}",
+      labels: ["admission", "restart"],
+      assigned_to_worker: true
+    }
+
+    workspace_path = Path.join(workspace_root, issue.identifier)
+    File.mkdir_p!(workspace_path)
+    ledger_path = Path.join(test_root, "events.jsonl")
+    run_id = "run-recovered-admission-#{tag}"
+    context = Tracker.current_poll_context()
+
+    assert {:ok, packet, _snapshot} =
+             TrackerAdmission.packet(
+               issue,
+               context,
+               "admission-recovered-#{tag}",
+               "Agent Running"
+             )
+
+    base = %{
+      stage: "claimed",
+      run_id: run_id,
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      attempt: 2,
+      workspace_path: workspace_path,
+      workspace_root: workspace_root
+    }
+
+    assert :ok = RunLedger.append(ledger_path, Map.put(base, :transition, "run_claimed"))
+
+    assert :ok =
+             RunLedger.append(
+               ledger_path,
+               base
+               |> Map.merge(packet)
+               |> Map.merge(%{transition: "tracker_admission_io_started", stage: "admission"})
+             )
+
+    recovery_entry =
+      packet
+      |> Map.merge(%{
+        attempt: 2,
+        identifier: issue.identifier,
+        issue_id: issue.id,
+        run_id: run_id,
+        status: "io_started",
+        worker_host: nil,
+        workspace_path: workspace_path,
+        workspace_root: workspace_root
+      })
+
+    state = %Orchestrator.State{
+      run_ledger_path: ledger_path,
+      run_ledger_append_fn: &RunLedger.append/2,
+      runner_generation: "runner-recovered-admission-#{tag}",
+      operator_commands: %Orchestrator.OperatorCommandState{
+        tracker_admissions: %{issue.id => recovery_entry}
+      },
+      claimed: MapSet.new([issue.id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    {state, issue, context, ledger_path}
+  end
+
+  defp put_tracker_admission_io(state, opts) do
+    operator_commands = %{
+      state.operator_commands
+      | tracker_update_state_fn: Keyword.get(opts, :update, state.operator_commands.tracker_update_state_fn),
+        tracker_fetch_by_ids_fn: Keyword.get(opts, :fetch, state.operator_commands.tracker_fetch_by_ids_fn)
+    }
+
+    %{state | operator_commands: operator_commands}
+  end
+
+  defp tracker_admissions_for_test(state),
+    do: state.operator_commands.tracker_admissions
+
   defp seed_durable_retry_ledger!(path, run_id, issue, workspace, workspace_root) do
     base = %{
       run_id: run_id,
@@ -6279,6 +6931,88 @@ defmodule SymphonyElixir.CoreTest do
 
   defp await_orchestrator_state(pid, _predicate, 0) do
     flunk("orchestrator state did not reach the expected condition: #{inspect(:sys.get_state(pid))}")
+  end
+
+  defp os_process_alive?(pid) when is_integer(pid) and pid > 0 do
+    case System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {_output, 0} -> true
+      {_output, _status} -> false
+    end
+  end
+
+  defp assert_os_process_stopped(pid, attempts \\ 100)
+
+  defp assert_os_process_stopped(pid, attempts) when attempts > 0 do
+    if os_process_alive?(pid) do
+      Process.sleep(10)
+      assert_os_process_stopped(pid, attempts - 1)
+    else
+      :ok
+    end
+  end
+
+  defp assert_os_process_stopped(pid, 0) do
+    refute os_process_alive?(pid), "expected OS process #{pid} to stop"
+  end
+
+  defp assert_path_removed(path, attempts \\ 100)
+
+  defp assert_path_removed(path, attempts) when attempts > 0 do
+    if File.exists?(path) do
+      Process.sleep(10)
+      assert_path_removed(path, attempts - 1)
+    else
+      :ok
+    end
+  end
+
+  defp assert_path_removed(path, 0) do
+    refute File.exists?(path), "expected temporary path #{path} to be removed"
+  end
+
+  defp await_path(path, attempts \\ 100)
+
+  defp await_path(path, attempts) when attempts > 0 do
+    if File.exists?(path) do
+      :ok
+    else
+      Process.sleep(10)
+      await_path(path, attempts - 1)
+    end
+  end
+
+  defp await_path(path, 0), do: flunk("expected path #{path} to appear")
+
+  defp terminate_test_process_group(process_group_file) do
+    case File.read(process_group_file) do
+      {:ok, raw_pid} ->
+        process_group = raw_pid |> String.trim() |> String.to_integer()
+
+        System.cmd(
+          "/bin/kill",
+          ["-KILL", "--", "-#{process_group}"],
+          stderr_to_stdout: true
+        )
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp remove_test_durability_verifier(verifier_root_file) do
+    case File.read(verifier_root_file) do
+      {:ok, verifier_root} ->
+        verifier_root = String.trim(verifier_root)
+        expected_parent = Path.expand(System.tmp_dir!())
+
+        if Path.dirname(verifier_root) == expected_parent and
+             String.starts_with?(Path.basename(verifier_root), "symphony-durability-") do
+          File.rm_rf(verifier_root)
+        end
+
+      {:error, _reason} ->
+        :ok
+    end
   end
 
   defp blocked_ledger_path do

@@ -405,6 +405,259 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "automatic terminal cleanup bounds local git output before the command deadline" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-output-limit-preservation-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-OUTPUT-LIMIT")
+    fake_bin = Path.join(test_root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    process_group_file = Path.join(test_root, "git-process-group.pid")
+    previous_path = System.get_env("PATH")
+    output_chunk = String.duplicate("x", 1_024)
+
+    on_exit(fn ->
+      case File.read(process_group_file) do
+        {:ok, raw_pid} ->
+          process_group = raw_pid |> String.trim() |> String.to_integer()
+
+          System.cmd(
+            "/bin/kill",
+            ["-KILL", "--", "-#{process_group}"],
+            stderr_to_stdout: true
+          )
+
+        {:error, _reason} ->
+          :ok
+      end
+
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "baseline\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "baseline"])
+    File.mkdir_p!(workspace_root)
+    System.cmd("git", ["clone", source, workspace])
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    /bin/ps -p "$$" -o pgid= | /usr/bin/tr -d ' ' > '#{process_group_file}'
+    output_chunk='#{output_chunk}'
+    index=0
+    while [ "$index" -lt 64 ]; do
+      printf '%s' "$output_chunk"
+      index=$((index + 1))
+    done
+    printf '\n'
+    sleep 30
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      workspace_durability_remote_url: source,
+      hook_timeout_ms: 30_000
+    )
+
+    task =
+      Task.async(fn ->
+        Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+      end)
+
+    result =
+      case Task.yield(task, 3_000) do
+        {:ok, result} ->
+          result
+
+        nil ->
+          Task.shutdown(task, :brutal_kill)
+          flunk("local durability validation exceeded the bounded output deadline")
+      end
+
+    assert {:error, :workspace_preservation_required, ""} = result
+    assert File.dir?(workspace)
+    refute File.exists?(workspace <> ".symphony-cleanup")
+  end
+
+  test "automatic terminal cleanup enforces the completed output boundary exactly" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-output-boundary-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    exact_workspace = Path.join(workspace_root, "DUD-OUTPUT-EXACT")
+    overflow_workspace = Path.join(workspace_root, "DUD-OUTPUT-OVERFLOW")
+    fake_bin = Path.join(test_root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    previous_path = System.get_env("PATH")
+    previous_output_bytes = System.get_env("SYMP_TEST_OUTPUT_BYTES")
+    real_git = System.find_executable("git")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_OUTPUT_BYTES", previous_output_bytes)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "baseline\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "baseline"])
+    File.mkdir_p!(workspace_root)
+    System.cmd("git", ["clone", source, exact_workspace])
+    System.cmd("git", ["clone", source, overflow_workspace])
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    if [ "$1" != '-C' ] || [ "$3" != 'fetch' ]; then
+      exec '#{real_git}' "$@"
+    fi
+    /usr/bin/head -c "$SYMP_TEST_OUTPUT_BYTES" /dev/zero | /usr/bin/tr '\\000' x
+    exec '#{real_git}' "$@"
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      workspace_durability_remote_url: source,
+      hook_timeout_ms: 5_000
+    )
+
+    System.put_env("SYMP_TEST_OUTPUT_BYTES", "65536")
+
+    assert {:ok, []} =
+             Workspace.remove_exact_if_durable(exact_workspace, workspace_root, nil)
+
+    refute File.exists?(exact_workspace)
+    assert File.dir?(exact_workspace <> ".symphony-cleanup")
+
+    System.put_env("SYMP_TEST_OUTPUT_BYTES", "65537")
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(overflow_workspace, workspace_root, nil)
+
+    assert File.dir?(overflow_workspace)
+    refute File.exists?(overflow_workspace <> ".symphony-cleanup")
+  end
+
+  test "owned command completion framing tolerates chunks split before the output limit" do
+    marker = "__SYMPHONY_OWNED_COMMAND_STATUS_test_marker__"
+    completion_prefix = "\n#{marker}:"
+
+    for payload_bytes <- [65_535, 65_536],
+        frame_fragment <- [
+          "\n",
+          binary_part(completion_prefix, 0, 7),
+          completion_prefix,
+          completion_prefix <> "1",
+          completion_prefix <> "126"
+        ] do
+      output = String.duplicate("x", payload_bytes) <> frame_fragment
+
+      assert Workspace.owned_command_output_within_limit_for_test?(output, marker),
+             "expected #{payload_bytes}-byte payload with #{inspect(frame_fragment)} to remain pending"
+    end
+
+    refute Workspace.owned_command_output_within_limit_for_test?(
+             String.duplicate("x", 65_537),
+             marker
+           )
+
+    refute Workspace.owned_command_output_within_limit_for_test?(
+             String.duplicate("x", 65_536) <> "\nnot-the-private-marker",
+             marker
+           )
+  end
+
+  test "automatic terminal cleanup reaps descendants after the command leader exits" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-exited-command-leader-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-EXITED-LEADER")
+    fake_bin = Path.join(test_root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    process_group_file = Path.join(test_root, "git-process-group.pid")
+    child_pid_file = Path.join(test_root, "git-child.pid")
+    previous_path = System.get_env("PATH")
+    real_git = System.find_executable("git")
+
+    on_exit(fn ->
+      terminate_test_process_group(process_group_file)
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "baseline\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "baseline"])
+    File.mkdir_p!(workspace_root)
+    System.cmd("git", ["clone", source, workspace])
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    if [ "$1" != '-C' ] || [ "$3" != 'fetch' ]; then
+      exec '#{real_git}' "$@"
+    fi
+    /bin/ps -p "$$" -o pgid= | /usr/bin/tr -d ' ' > '#{process_group_file}'
+    (
+      trap '' HUP INT TERM
+      while :; do sleep 1; done
+    ) </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!" > '#{child_pid_file}'
+    exit 1
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      workspace_durability_remote_url: source,
+      hook_timeout_ms: 5_000
+    )
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+
+    child_pid = child_pid_file |> File.read!() |> String.trim() |> String.to_integer()
+    assert_os_process_stopped(child_pid)
+    assert File.dir?(workspace)
+    refute File.exists?(workspace <> ".symphony-cleanup")
+  end
+
   test "automatic terminal cleanup quarantines a clean remote-backed workspace" do
     test_root =
       Path.join(
@@ -2196,6 +2449,225 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert File.read!(Path.join(quarantine, "README.md")) == "durable remote bytes\n"
   end
 
+  test "remote terminal cleanup ignores output from an unsupported stat dialect" do
+    {:ok, canonical_tmp} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+
+    test_root =
+      Path.join(
+        canonical_tmp,
+        "symphony-elixir-remote-stat-dialect-#{System.unique_integer([:positive])}"
+      )
+
+    worker_host = "worker-stat-dialect"
+    source = Path.join(test_root, "source")
+    remote_root = Path.join(test_root, "remote-workspaces")
+    remote_workspace = Path.join(remote_root, "DUD-158")
+    quarantine = remote_workspace <> ".symphony-cleanup"
+    fake_ssh = Path.join(test_root, "ssh")
+    fake_stat = Path.join(test_root, "stat")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "durable remote bytes\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+    File.mkdir_p!(remote_root)
+    System.cmd("git", ["clone", source, remote_workspace])
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_stat, """
+    #!/bin/sh
+    case "$1" in
+      -c)
+        printf '%s\n' '7:11'
+        exit 0
+        ;;
+      -f)
+        for last_arg do :; done
+        printf 'unsupported-stat-output:%s\n' "$last_arg"
+        exit 1
+        ;;
+      *)
+        exit 64
+        ;;
+    esac
+    """)
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    PATH='#{test_root}':"$PATH"
+    export PATH
+    for last_arg do :; done
+    exec sh -c "$last_arg"
+    """)
+
+    File.chmod!(fake_stat, 0o755)
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: remote_root,
+      workspace_durability_remote_url: source
+    )
+
+    assert {:ok, []} =
+             Workspace.remove_exact_if_durable(remote_workspace, remote_root, worker_host)
+
+    refute File.exists?(remote_workspace)
+    assert File.read!(Path.join(quarantine, "README.md")) == "durable remote bytes\n"
+  end
+
+  test "remote terminal cleanup falls back to the BSD stat dialect" do
+    {:ok, canonical_tmp} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+
+    test_root =
+      Path.join(
+        canonical_tmp,
+        "symphony-elixir-remote-bsd-stat-#{System.unique_integer([:positive])}"
+      )
+
+    worker_host = "worker-bsd-stat"
+    source = Path.join(test_root, "source")
+    remote_root = Path.join(test_root, "remote-workspaces")
+    remote_workspace = Path.join(remote_root, "DUD-158")
+    quarantine = remote_workspace <> ".symphony-cleanup"
+    fake_ssh = Path.join(test_root, "ssh")
+    fake_stat = Path.join(test_root, "stat")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "durable remote bytes\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+    File.mkdir_p!(remote_root)
+    System.cmd("git", ["clone", source, remote_workspace])
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_stat, """
+    #!/bin/sh
+    case "$1" in
+      -c)
+        printf '%s\n' 'ignored-gnu-stat-output'
+        exit 1
+        ;;
+      -f)
+        printf '%s\n' '7:11'
+        exit 0
+        ;;
+      *)
+        exit 64
+        ;;
+    esac
+    """)
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    PATH='#{test_root}':"$PATH"
+    export PATH
+    for last_arg do :; done
+    exec sh -c "$last_arg"
+    """)
+
+    File.chmod!(fake_stat, 0o755)
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: remote_root,
+      workspace_durability_remote_url: source
+    )
+
+    assert {:ok, []} =
+             Workspace.remove_exact_if_durable(remote_workspace, remote_root, worker_host)
+
+    refute File.exists?(remote_workspace)
+    assert File.read!(Path.join(quarantine, "README.md")) == "durable remote bytes\n"
+  end
+
+  test "remote terminal cleanup preserves the workspace when no stat dialect works" do
+    {:ok, canonical_tmp} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+
+    test_root =
+      Path.join(
+        canonical_tmp,
+        "symphony-elixir-remote-missing-stat-#{System.unique_integer([:positive])}"
+      )
+
+    worker_host = "worker-missing-stat"
+    source = Path.join(test_root, "source")
+    remote_root = Path.join(test_root, "remote-workspaces")
+    remote_workspace = Path.join(remote_root, "DUD-158")
+    quarantine = remote_workspace <> ".symphony-cleanup"
+    fake_ssh = Path.join(test_root, "ssh")
+    fake_stat = Path.join(test_root, "stat")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "durable remote bytes\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "durable baseline"])
+    File.mkdir_p!(remote_root)
+    System.cmd("git", ["clone", source, remote_workspace])
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_stat, """
+    #!/bin/sh
+    case "$1" in
+      -c|-f)
+        printf '%s\n' 'unsupported-stat-output'
+        exit 1
+        ;;
+      *)
+        exit 64
+        ;;
+    esac
+    """)
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    PATH='#{test_root}':"$PATH"
+    export PATH
+    for last_arg do :; done
+    exec sh -c "$last_arg"
+    """)
+
+    File.chmod!(fake_stat, 0o755)
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: remote_root,
+      workspace_durability_remote_url: source
+    )
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(remote_workspace, remote_root, worker_host)
+
+    assert File.read!(Path.join(remote_workspace, "README.md")) == "durable remote bytes\n"
+    refute File.exists?(quarantine)
+  end
+
   test "remote terminal cleanup disables worker-controlled fsmonitor" do
     {:ok, canonical_tmp} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
 
@@ -2597,5 +3069,36 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert local_home != remote_home
     assert File.read!(local_wrong_target_sentinel) == "local-home-target-must-survive"
     assert File.read!(remote_wrong_target_sentinel) == "remote-target-must-survive"
+  end
+
+  defp assert_os_process_stopped(pid, attempts \\ 100)
+
+  defp assert_os_process_stopped(pid, attempts) when attempts > 0 do
+    case System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {_output, 0} ->
+        Process.sleep(10)
+        assert_os_process_stopped(pid, attempts - 1)
+
+      {_output, _status} ->
+        :ok
+    end
+  end
+
+  defp assert_os_process_stopped(pid, 0) do
+    assert {_output, status} =
+             System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
+
+    assert status != 0, "expected OS process #{pid} to stop"
+  end
+
+  defp terminate_test_process_group(process_group_file) do
+    case File.read(process_group_file) do
+      {:ok, raw_pid} ->
+        process_group = raw_pid |> String.trim() |> String.to_integer()
+        System.cmd("/bin/kill", ["-KILL", "--", "-#{process_group}"], stderr_to_stdout: true)
+
+      {:error, _reason} ->
+        :ok
+    end
   end
 end

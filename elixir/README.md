@@ -46,6 +46,14 @@ quarantine artifact; physical deletion remains a separate operator/GC gate.
 The proof runs outside the orchestrator in one supervised task with an overall
 deadline. Stable preservation failures become operator-required and are not
 repeated on each poll.
+Each local Git proof command has the same deadline and a 64 KiB combined-output
+limit. A keeper remains the exact process-group leader after the command exits;
+completion, timeout, cancellation, or excess output stops and kills that
+identity-anchored group. A partial private completion frame gets at most 250 ms
+to finish before it is treated as excess output. A runner-owned validator survives termination of the
+outer cleanup task long enough to complete teardown. It removes its temporary
+bare repository only after group disappearance is confirmed, otherwise it
+retains the verifier for operator recovery and fails closed.
 The ledger records cleanup request, I/O start, operator-required, explicit
 retry, I/O completion, and final completion separately. A restart after I/O
 start stays operator-required; tracker state cannot authorize a replay. Once
@@ -167,6 +175,7 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
   max_run_tokens: 250000
+  max_run_uncached_input_tokens: 100000
   max_run_seconds: 7200
 codex:
   command: codex app-server
@@ -209,6 +218,14 @@ Notes:
   overflow, and ambiguous non-zero decreases permanently fail the attempt's telemetry integrity.
   With a configured token limit, that integrity failure creates a typed durable park instead of
   admitting more work with unknown usage.
+- `agent.max_run_uncached_input_tokens` independently caps cumulative uncached
+  input (`input_tokens - cached_input_tokens`) across the same checked reset
+  epochs. Cached-input telemetry is optional while this guard is disabled and
+  appears as unavailable in status. Once the guard is enabled, a cumulative
+  usage event without a valid cached-input counter fails telemetry integrity
+  closed; reaching the limit parks with
+  `uncached_input_budget_exhausted`. The existing total-token limit remains an
+  independent coarse ceiling.
 - `agent.max_run_seconds` optionally caps wall-clock seconds for one attempt and can stop an
   in-flight turn.
 - Reaching any run budget preserves the workspace and creates a durable
@@ -218,6 +235,29 @@ Notes:
   runtime heading is absent.
 - Prompt templates may read immutable run metadata from `run.id`, `run.attempt`,
   `run.stage`, and `run.runner_generation`.
+- For an `Agent Ready` candidate, the Orchestrator owns the pre-model
+  `Agent Ready` to `Agent Running` mutation. It records the admission I/O
+  intent, performs the tracker mutation, reads the exact issue back, verifies
+  the target state and a state-independent canonical issue snapshot, and only
+  then starts the agent task. Tracker I/O failures and read-back conflicts
+  create typed durable `tracker_admission_failed` or
+  `tracker_admission_conflict` waits; neither path starts Codex.
+- Managed prompt templates receive only the sanitized evidence fields under
+  `run.admission`: `id`, source/target states, snapshot schema/byte count/hash,
+  and tracker-authority hash. No credential or raw authority value crosses
+  this boundary. The worker inherits that completed admission and must not
+  repeat the initial mutation/read-back.
+- An admission interrupted by a runner restart retains claim ownership and is
+  exposed under the status snapshot's `admitting` collection. If the exact
+  issue is already in the target state, Symphony completes the same admission
+  without another mutation. If it is still in the exact source state, Symphony
+  retries the mutation once under the same admission ID and reads it back. Any
+  other state, snapshot, or tracker-authority value creates a conflict wait.
+  Tracker read/mutation failure creates a failure wait. Neither recovery path
+  can dispatch a duplicate run or start Codex before durable completion.
+  The persisted authority hash binds the stable tracker contract rather than a
+  process PID/epoch; live I/O still requires the current generation, while an
+  exact contract can reconcile across a full process restart.
 - Managed workflows must use an exact `## Symphony Runtime Prompt` line so
   pickup/watch-loop guidance does not get sent to the worker as task
   instructions.

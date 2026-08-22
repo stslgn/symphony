@@ -61,6 +61,7 @@ defmodule SymphonyElixir.ScenarioHarness do
   def seed_running!(harness, %Issue{} = issue, opts \\ []) do
     run_id = Keyword.get(opts, :run_id, "run-scenario")
     max_tokens = Keyword.get(opts, :max_tokens)
+    max_uncached_input_tokens = Keyword.get(opts, :max_uncached_input_tokens)
 
     agent_pid =
       spawn(fn ->
@@ -90,14 +91,24 @@ defmodule SymphonyElixir.ScenarioHarness do
       last_codex_event: nil,
       codex_app_server_pid: nil,
       codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
+      codex_uncached_input_tokens: 0,
       codex_output_tokens: 0,
       codex_total_tokens: 0,
       codex_last_reported_input_tokens: 0,
       codex_last_reported_output_tokens: 0,
       codex_last_reported_total_tokens: 0,
       codex_token_telemetry_observed: false,
+      codex_uncached_input_telemetry_observed: false,
+      codex_uncached_input_telemetry_integrity: :unobserved,
+      codex_uncached_input_telemetry_failure: nil,
       turn_count: 1,
-      run_budget: %{max_turns: 20, max_tokens: max_tokens, max_seconds: nil},
+      run_budget: %{
+        max_turns: 20,
+        max_tokens: max_tokens,
+        max_uncached_input_tokens: max_uncached_input_tokens,
+        max_seconds: nil
+      },
       run_budget_timer_ref: nil,
       retry_attempt: 0,
       started_at: started_at
@@ -136,6 +147,15 @@ defmodule SymphonyElixir.ScenarioHarness do
   def report_tokens(harness, %Issue{} = issue, run_id, total_tokens, output_tokens \\ 0) do
     input_tokens = max(total_tokens - output_tokens, 0)
 
+    report_token_usage(harness, issue, run_id, %{
+      "input_tokens" => input_tokens,
+      "output_tokens" => output_tokens,
+      "total_tokens" => total_tokens
+    })
+  end
+
+  @spec report_token_usage(t(), Issue.t(), String.t(), map()) :: :ok
+  def report_token_usage(harness, %Issue{} = issue, run_id, usage) when is_map(usage) do
     send(
       harness.pid,
       {:codex_worker_update, issue.id,
@@ -148,11 +168,7 @@ defmodule SymphonyElixir.ScenarioHarness do
              "msg" => %{
                "payload" => %{
                  "info" => %{
-                   "total_token_usage" => %{
-                     "input_tokens" => input_tokens,
-                     "output_tokens" => output_tokens,
-                     "total_tokens" => total_tokens
-                   }
+                   "total_token_usage" => usage
                  }
                }
              }

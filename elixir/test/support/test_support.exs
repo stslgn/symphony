@@ -99,7 +99,10 @@ defmodule SymphonyElixir.TestSupport do
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
         Application.put_env(:symphony_elixir, :run_ledger_path, run_ledger_path)
-        if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
+
+        :ok = SymphonyElixir.TestSupport.ensure_workflow_store_running()
+        :ok = SymphonyElixir.WorkflowStore.force_reload()
+
         stop_default_http_server()
 
         on_exit(fn ->
@@ -134,6 +137,22 @@ defmodule SymphonyElixir.TestSupport do
 
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
+
+  def ensure_workflow_store_running do
+    case Process.whereis(SymphonyElixir.WorkflowStore) do
+      pid when is_pid(pid) ->
+        :ok
+
+      nil ->
+        case Supervisor.restart_child(
+               SymphonyElixir.Supervisor,
+               SymphonyElixir.WorkflowStore
+             ) do
+          {:ok, _pid} -> :ok
+          {:error, {:already_started, _pid}} -> :ok
+        end
+    end
+  end
 
   def stop_default_http_server do
     case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
@@ -237,6 +256,7 @@ defmodule SymphonyElixir.TestSupport do
           max_concurrent_agents: 10,
           max_turns: 20,
           max_run_tokens: nil,
+          max_run_uncached_input_tokens: nil,
           max_run_seconds: nil,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
@@ -284,6 +304,7 @@ defmodule SymphonyElixir.TestSupport do
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
     max_run_tokens = Keyword.get(config, :max_run_tokens)
+    max_run_uncached_input_tokens = Keyword.get(config, :max_run_uncached_input_tokens)
     max_run_seconds = Keyword.get(config, :max_run_seconds)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
@@ -340,6 +361,7 @@ defmodule SymphonyElixir.TestSupport do
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_run_tokens: #{yaml_value(max_run_tokens)}",
+        "  max_run_uncached_input_tokens: #{yaml_value(max_run_uncached_input_tokens)}",
         "  max_run_seconds: #{yaml_value(max_run_seconds)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
