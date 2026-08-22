@@ -1046,6 +1046,7 @@ defmodule SymphonyElixir.Workspace do
     cancel_owned_command_timer(state.frame_timeout_ref)
     Process.demonitor(state.owner_ref, [:flush])
     demonitor_owned_command_cancellation(state.cancellation_ref)
+    output = bounded_owned_command_output(output)
 
     {final_status, termination} =
       case terminate_owned_system_command(state.port, state.os_pid) do
@@ -1058,6 +1059,12 @@ defmodule SymphonyElixir.Workspace do
 
     send(state.owner, {state.result_ref, {{output, final_status}, termination}})
   end
+
+  defp bounded_owned_command_output(output)
+       when byte_size(output) > @owned_command_output_limit_bytes,
+       do: binary_part(output, 0, @owned_command_output_limit_bytes)
+
+  defp bounded_owned_command_output(output), do: output
 
   defp cancel_owned_command_timer(timer_ref) when is_reference(timer_ref),
     do: Process.cancel_timer(timer_ref)
