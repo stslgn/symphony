@@ -1219,14 +1219,19 @@ normal remote-tracking refs, and any other Git evidence writable by the worker.
 It MUST disable repository-controlled executable Git features, including
 `core.fsmonitor`, while inspecting the quarantined worktree. Production cleanup
 MUST reject mutable path-form and `file://` durability remotes.
-The external verifier MUST be removed after each proof attempt.
+The external verifier MUST be removed after each proof attempt only after every
+owned proof-command process group is confirmed absent. An unconfirmed teardown
+MUST retain the verifier for operator recovery.
 
-Each local durability command MUST run in an owned process group. Timeout,
-cancellation, or exceeding 64 KiB of combined standard output and error output
-MUST terminate and reap that complete group before returning a bounded
-`workspace_preservation_required` result. Cancellation of the outer cleanup
-task MUST propagate to the active proof command without bypassing removal of the
-runner-owned verifier directory.
+Each local durability command MUST run behind a keeper that remains the exact
+process-group leader after the command exits. Completion, timeout, cancellation,
+or exceeding 64 KiB of combined standard output and error output MUST stop and
+kill that identity-anchored group. Cancellation of the outer cleanup task MUST
+propagate to the active proof command without bypassing the validator-owned
+teardown. If group disappearance cannot be confirmed within the bounded
+teardown interval, the result MUST remain `workspace_preservation_required` and
+the verifier MUST be retained rather than removed beneath a potentially live
+process.
 
 If a pre-hook check fails, the implementation MUST NOT run `before_remove`. If
 either verification fails, it MUST attempt to restore the quarantine to the exact

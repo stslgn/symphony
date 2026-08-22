@@ -47,10 +47,12 @@ The proof runs outside the orchestrator in one supervised task with an overall
 deadline. Stable preservation failures become operator-required and are not
 repeated on each poll.
 Each local Git proof command has the same deadline and a 64 KiB combined-output
-limit. Timeout, cancellation, or excess output terminates and reaps the exact
-process group before returning a preservation failure. A runner-owned validator
-also removes its temporary bare repository after the outer cleanup task is
-terminated.
+limit. A keeper remains the exact process-group leader after the command exits;
+completion, timeout, cancellation, or excess output stops and kills that
+identity-anchored group. A runner-owned validator survives termination of the
+outer cleanup task long enough to complete teardown. It removes its temporary
+bare repository only after group disappearance is confirmed, otherwise it
+retains the verifier for operator recovery and fails closed.
 The ledger records cleanup request, I/O start, operator-required, explicit
 retry, I/O completion, and final completion separately. A restart after I/O
 start stays operator-required; tracker state cannot authorize a replay. Once
