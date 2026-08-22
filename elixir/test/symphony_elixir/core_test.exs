@@ -2364,6 +2364,174 @@ defmodule SymphonyElixir.CoreTest do
     assert :operator_required == :sys.get_state(pid).cleanup_pending[issue_id].status
   end
 
+  test "durability verifier removes its temporary repository after a natural exit 126" do
+    root = parked_workspace_root("cleanup-natural-exit-126")
+    workspace = Path.join(root, "MT-CLEANUP-NATURAL-126")
+    remote_url = install_durable_local_workspace!(workspace)
+    fake_bin = Path.join(root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    verifier_root_file = Path.join(root, "git-verifier-root.path")
+    previous_path = System.get_env("PATH")
+    real_git = System.find_executable("git")
+
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    if [ "$1" != '-C' ] || [ "$3" != 'fetch' ]; then
+      exec '#{real_git}' "$@"
+    fi
+    verifier_root=${2%/repo.git}
+    printf '%s\n' "$verifier_root" > '#{verifier_root_file}'
+    exit 126
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    on_exit(fn ->
+      remove_test_durability_verifier(verifier_root_file)
+      restore_env("PATH", previous_path)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      hook_timeout_ms: 5_000,
+      poll_interval_ms: 60_000
+    )
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(workspace, root, nil)
+
+    verifier_root = verifier_root_file |> File.read!() |> String.trim()
+    assert_path_removed(verifier_root)
+    assert File.dir?(workspace)
+  end
+
+  test "unconfirmed durability command teardown retains its temporary verifier" do
+    root = parked_workspace_root("cleanup-unconfirmed-termination")
+    workspace = Path.join(root, "MT-CLEANUP-UNCONFIRMED")
+    remote_url = install_durable_local_workspace!(workspace)
+    fake_bin = Path.join(root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    process_group_file = Path.join(root, "git-process-group.pid")
+    child_pid_file = Path.join(root, "git-child.pid")
+    verifier_root_file = Path.join(root, "git-verifier-root.path")
+    previous_path = System.get_env("PATH")
+    real_git = System.find_executable("git")
+
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    if [ "$1" != '-C' ] || [ "$3" != 'fetch' ]; then
+      exec '#{real_git}' "$@"
+    fi
+    verifier_root=${2%/repo.git}
+    printf '%s\n' "$verifier_root" > '#{verifier_root_file}'
+    /bin/ps -p "$$" -o pgid= | /usr/bin/tr -d ' ' > '#{process_group_file}'
+    (
+      trap '' HUP INT TERM
+      while :; do sleep 1; done
+    ) </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!" > '#{child_pid_file}'
+    /bin/kill -KILL "$PPID"
+    exit 1
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    on_exit(fn ->
+      terminate_test_process_group(process_group_file)
+      remove_test_durability_verifier(verifier_root_file)
+      restore_env("PATH", previous_path)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      hook_timeout_ms: 5_000,
+      poll_interval_ms: 60_000
+    )
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(workspace, root, nil)
+
+    verifier_root = verifier_root_file |> File.read!() |> String.trim()
+    child_pid = child_pid_file |> File.read!() |> String.trim() |> String.to_integer()
+    assert File.dir?(verifier_root)
+    assert os_process_alive?(child_pid)
+    assert File.dir?(workspace)
+  end
+
+  test "owner death cancels the active durability command and removes its verifier" do
+    root = parked_workspace_root("cleanup-owner-death")
+    workspace = Path.join(root, "MT-CLEANUP-OWNER-DEATH")
+    remote_url = install_durable_local_workspace!(workspace)
+    fake_bin = Path.join(root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    process_group_file = Path.join(root, "git-process-group.pid")
+    child_pid_file = Path.join(root, "git-child.pid")
+    verifier_root_file = Path.join(root, "git-verifier-root.path")
+    previous_path = System.get_env("PATH")
+    real_git = System.find_executable("git")
+
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    if [ "$1" != '-C' ] || [ "$3" != 'fetch' ]; then
+      exec '#{real_git}' "$@"
+    fi
+    verifier_root=${2%/repo.git}
+    printf '%s\n' "$verifier_root" > '#{verifier_root_file}'
+    /bin/ps -p "$$" -o pgid= | /usr/bin/tr -d ' ' > '#{process_group_file}'
+    (
+      trap '' HUP INT TERM
+      while :; do sleep 1; done
+    ) &
+    child_pid=$!
+    printf '%s\n' "$child_pid" > '#{child_pid_file}'
+    wait "$child_pid"
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    on_exit(fn ->
+      terminate_test_process_group(process_group_file)
+      remove_test_durability_verifier(verifier_root_file)
+      restore_env("PATH", previous_path)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      hook_timeout_ms: 30_000,
+      poll_interval_ms: 60_000
+    )
+
+    cleanup_owner =
+      Task.async(fn ->
+        Workspace.remove_exact_if_durable(workspace, root, nil)
+      end)
+
+    await_path(child_pid_file)
+    await_path(verifier_root_file)
+    child_pid = child_pid_file |> File.read!() |> String.trim() |> String.to_integer()
+    verifier_root = verifier_root_file |> File.read!() |> String.trim()
+
+    assert nil == Task.shutdown(cleanup_owner, :brutal_kill)
+    assert_os_process_stopped(child_pid)
+    assert_path_removed(verifier_root)
+    assert File.dir?(workspace <> ".symphony-cleanup")
+  end
+
   test "completion ledger failure retains claim and blocks continuation until persisted" do
     issue_id = "issue-terminal-completion"
     ref = make_ref()
@@ -6801,6 +6969,19 @@ defmodule SymphonyElixir.CoreTest do
   defp assert_path_removed(path, 0) do
     refute File.exists?(path), "expected temporary path #{path} to be removed"
   end
+
+  defp await_path(path, attempts \\ 100)
+
+  defp await_path(path, attempts) when attempts > 0 do
+    if File.exists?(path) do
+      :ok
+    else
+      Process.sleep(10)
+      await_path(path, attempts - 1)
+    end
+  end
+
+  defp await_path(path, 0), do: flunk("expected path #{path} to appear")
 
   defp terminate_test_process_group(process_group_file) do
     case File.read(process_group_file) do

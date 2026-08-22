@@ -641,9 +641,16 @@ defmodule SymphonyElixir.Workspace do
          cancellation_owner,
          termination_state_ref
        ) do
-    result = run_bounded_system_command(command, args, opts, timeout_ms, cancellation_owner)
+    {result, termination} =
+      run_bounded_system_command_with_termination(
+        command,
+        args,
+        opts,
+        timeout_ms,
+        cancellation_owner
+      )
 
-    if match?({_output, @owned_command_termination_unconfirmed_status}, result) do
+    if termination == :unconfirmed do
       Process.put(termination_state_ref, true)
     end
 
@@ -785,9 +792,30 @@ defmodule SymphonyElixir.Workspace do
   defp run_bounded_system_command(command, args, opts, timeout_ms, cancellation_owner)
        when is_binary(command) and is_list(args) and is_list(opts) and is_integer(timeout_ms) and
               timeout_ms > 0 and (is_nil(cancellation_owner) or is_pid(cancellation_owner)) do
+    {result, _termination} =
+      run_bounded_system_command_with_termination(
+        command,
+        args,
+        opts,
+        timeout_ms,
+        cancellation_owner
+      )
+
+    result
+  end
+
+  defp run_bounded_system_command_with_termination(
+         command,
+         args,
+         opts,
+         timeout_ms,
+         cancellation_owner
+       )
+       when is_binary(command) and is_list(args) and is_list(opts) and is_integer(timeout_ms) and
+              timeout_ms > 0 and (is_nil(cancellation_owner) or is_pid(cancellation_owner)) do
     case System.find_executable(command) do
       nil ->
-        {"", @owned_command_start_failure_status}
+        {{"", @owned_command_start_failure_status}, :confirmed}
 
       executable ->
         owner = self()
@@ -812,7 +840,7 @@ defmodule SymphonyElixir.Workspace do
             result
 
           {:DOWN, ^runner_ref, :process, ^runner, _reason} ->
-            {"", @owned_command_start_failure_status}
+            {{"", @owned_command_start_failure_status}, :unconfirmed}
         end
     end
   end
@@ -896,17 +924,16 @@ defmodule SymphonyElixir.Workspace do
               @owned_command_output_limit_status
             )
 
-          :pending
-          when byte_size(combined_output) <=
-                 @owned_command_output_limit_bytes + @owned_command_completion_overhead_bytes ->
-            collect_owned_system_command(%{state | output: combined_output})
-
           :pending ->
-            finish_owned_system_command(
-              state,
-              binary_part(combined_output, 0, @owned_command_output_limit_bytes),
-              @owned_command_output_limit_status
-            )
+            if pending_owned_command_output_within_limit?(combined_output, status_marker) do
+              collect_owned_system_command(%{state | output: combined_output})
+            else
+              finish_owned_system_command(
+                state,
+                binary_part(combined_output, 0, @owned_command_output_limit_bytes),
+                @owned_command_output_limit_status
+              )
+            end
         end
 
       {^port, {:exit_status, status}} ->
@@ -942,18 +969,54 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  defp pending_owned_command_output_within_limit?(output, _status_marker)
+       when byte_size(output) <= @owned_command_output_limit_bytes,
+       do: true
+
+  defp pending_owned_command_output_within_limit?(output, status_marker)
+       when byte_size(output) <=
+              @owned_command_output_limit_bytes + @owned_command_completion_overhead_bytes do
+    overflow =
+      binary_part(
+        output,
+        @owned_command_output_limit_bytes,
+        byte_size(output) - @owned_command_output_limit_bytes
+      )
+
+    completion_prefix = "\n#{status_marker}:"
+
+    if byte_size(overflow) <= byte_size(completion_prefix) do
+      String.starts_with?(completion_prefix, overflow)
+    else
+      partial_status =
+        binary_part(
+          overflow,
+          byte_size(completion_prefix),
+          byte_size(overflow) - byte_size(completion_prefix)
+        )
+
+      String.starts_with?(overflow, completion_prefix) and
+        byte_size(partial_status) <= 3 and partial_status =~ ~r/^\d*$/
+    end
+  end
+
+  defp pending_owned_command_output_within_limit?(_output, _status_marker), do: false
+
   defp finish_owned_system_command(state, output, status) do
     Process.cancel_timer(state.timeout_ref)
     Process.demonitor(state.owner_ref, [:flush])
     demonitor_owned_command_cancellation(state.cancellation_ref)
 
-    final_status =
+    {final_status, termination} =
       case terminate_owned_system_command(state.port, state.os_pid) do
-        :ok -> status
-        {:error, :termination_unconfirmed} -> @owned_command_termination_unconfirmed_status
+        :ok ->
+          {status, :confirmed}
+
+        {:error, :termination_unconfirmed} ->
+          {@owned_command_termination_unconfirmed_status, :unconfirmed}
       end
 
-    send(state.owner, {state.result_ref, {output, final_status}})
+    send(state.owner, {state.result_ref, {{output, final_status}, termination}})
   end
 
   defp maybe_put_owned_command_env(port_opts, nil), do: port_opts

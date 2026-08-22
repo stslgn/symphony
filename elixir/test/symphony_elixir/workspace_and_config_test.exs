@@ -456,10 +456,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     /bin/ps -p "$$" -o pgid= | /usr/bin/tr -d ' ' > '#{process_group_file}'
     output_chunk='#{output_chunk}'
     index=0
-    while [ "$index" -lt 128 ]; do
+    while [ "$index" -lt 64 ]; do
       printf '%s' "$output_chunk"
       index=$((index + 1))
     done
+    printf 'x'
     sleep 30
     """)
 
@@ -490,6 +491,76 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:error, :workspace_preservation_required, ""} = result
     assert File.dir?(workspace)
     refute File.exists?(workspace <> ".symphony-cleanup")
+  end
+
+  test "automatic terminal cleanup enforces the completed output boundary exactly" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-output-boundary-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    exact_workspace = Path.join(workspace_root, "DUD-OUTPUT-EXACT")
+    overflow_workspace = Path.join(workspace_root, "DUD-OUTPUT-OVERFLOW")
+    fake_bin = Path.join(test_root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    previous_path = System.get_env("PATH")
+    previous_output_bytes = System.get_env("SYMP_TEST_OUTPUT_BYTES")
+    real_git = System.find_executable("git")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_OUTPUT_BYTES", previous_output_bytes)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "baseline\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "baseline"])
+    File.mkdir_p!(workspace_root)
+    System.cmd("git", ["clone", source, exact_workspace])
+    System.cmd("git", ["clone", source, overflow_workspace])
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    if [ "$1" != '-C' ] || [ "$3" != 'fetch' ]; then
+      exec '#{real_git}' "$@"
+    fi
+    /usr/bin/head -c "$SYMP_TEST_OUTPUT_BYTES" /dev/zero | /usr/bin/tr '\\000' x
+    exec '#{real_git}' "$@"
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      workspace_durability_remote_url: source,
+      hook_timeout_ms: 5_000
+    )
+
+    System.put_env("SYMP_TEST_OUTPUT_BYTES", "65536")
+
+    assert {:ok, []} =
+             Workspace.remove_exact_if_durable(exact_workspace, workspace_root, nil)
+
+    refute File.exists?(exact_workspace)
+    assert File.dir?(exact_workspace <> ".symphony-cleanup")
+
+    System.put_env("SYMP_TEST_OUTPUT_BYTES", "65537")
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(overflow_workspace, workspace_root, nil)
+
+    assert File.dir?(overflow_workspace)
+    refute File.exists?(overflow_workspace <> ".symphony-cleanup")
   end
 
   test "automatic terminal cleanup reaps descendants after the command leader exits" do
