@@ -2268,7 +2268,7 @@ defmodule SymphonyElixir.CoreTest do
     verifier_root=${2%/repo.git}
     printf '%s\\n' "$verifier_root" > '#{verifier_root_file}'
     printf 'called\\n' >> '#{trace_file}'
-    printf '%s\\n' "$$" > '#{process_group_file}'
+    /bin/ps -p "$$" -o pgid= | /usr/bin/tr -d ' ' > '#{process_group_file}'
     (
       trap '' HUP INT TERM
       while :; do sleep 1; done

@@ -453,7 +453,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     File.write!(fake_git, """
     #!/bin/sh
-    printf '%s\\n' "$$" > '#{process_group_file}'
+    /bin/ps -p "$$" -o pgid= | /usr/bin/tr -d ' ' > '#{process_group_file}'
     output_chunk='#{output_chunk}'
     index=0
     while [ "$index" -lt 128 ]; do
@@ -488,6 +488,72 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       end
 
     assert {:error, :workspace_preservation_required, ""} = result
+    assert File.dir?(workspace)
+    refute File.exists?(workspace <> ".symphony-cleanup")
+  end
+
+  test "automatic terminal cleanup reaps descendants after the command leader exits" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-exited-command-leader-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "DUD-EXITED-LEADER")
+    fake_bin = Path.join(test_root, "fake-bin")
+    fake_git = Path.join(fake_bin, "git")
+    process_group_file = Path.join(test_root, "git-process-group.pid")
+    child_pid_file = Path.join(test_root, "git-child.pid")
+    previous_path = System.get_env("PATH")
+    real_git = System.find_executable("git")
+
+    on_exit(fn ->
+      terminate_test_process_group(process_group_file)
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "README.md"), "baseline\n")
+    System.cmd("git", ["-C", source, "init", "-b", "main"])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "baseline"])
+    File.mkdir_p!(workspace_root)
+    System.cmd("git", ["clone", source, workspace])
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_git, """
+    #!/bin/sh
+    if [ "$1" != '-C' ] || [ "$3" != 'fetch' ]; then
+      exec '#{real_git}' "$@"
+    fi
+    /bin/ps -p "$$" -o pgid= | /usr/bin/tr -d ' ' > '#{process_group_file}'
+    (
+      trap '' HUP INT TERM
+      while :; do sleep 1; done
+    ) </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!" > '#{child_pid_file}'
+    exit 1
+    """)
+
+    File.chmod!(fake_git, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      workspace_durability_remote_url: source,
+      hook_timeout_ms: 5_000
+    )
+
+    assert {:error, :workspace_preservation_required, ""} =
+             Workspace.remove_exact_if_durable(workspace, workspace_root, nil)
+
+    child_pid = child_pid_file |> File.read!() |> String.trim() |> String.to_integer()
+    assert_os_process_stopped(child_pid)
     assert File.dir?(workspace)
     refute File.exists?(workspace <> ".symphony-cleanup")
   end
@@ -2903,5 +2969,36 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert local_home != remote_home
     assert File.read!(local_wrong_target_sentinel) == "local-home-target-must-survive"
     assert File.read!(remote_wrong_target_sentinel) == "remote-target-must-survive"
+  end
+
+  defp assert_os_process_stopped(pid, attempts \\ 100)
+
+  defp assert_os_process_stopped(pid, attempts) when attempts > 0 do
+    case System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {_output, 0} ->
+        Process.sleep(10)
+        assert_os_process_stopped(pid, attempts - 1)
+
+      {_output, _status} ->
+        :ok
+    end
+  end
+
+  defp assert_os_process_stopped(pid, 0) do
+    assert {_output, status} =
+             System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
+
+    assert status != 0, "expected OS process #{pid} to stop"
+  end
+
+  defp terminate_test_process_group(process_group_file) do
+    case File.read(process_group_file) do
+      {:ok, raw_pid} ->
+        process_group = raw_pid |> String.trim() |> String.to_integer()
+        System.cmd("/bin/kill", ["-KILL", "--", "-#{process_group}"], stderr_to_stdout: true)
+
+      {:error, _reason} ->
+        :ok
+    end
   end
 end
