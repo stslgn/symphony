@@ -460,7 +460,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       printf '%s' "$output_chunk"
       index=$((index + 1))
     done
-    printf 'x'
+    printf '\n'
     sleep 30
     """)
 

@@ -49,7 +49,8 @@ repeated on each poll.
 Each local Git proof command has the same deadline and a 64 KiB combined-output
 limit. A keeper remains the exact process-group leader after the command exits;
 completion, timeout, cancellation, or excess output stops and kills that
-identity-anchored group. A runner-owned validator survives termination of the
+identity-anchored group. A partial private completion frame gets at most 250 ms
+to finish before it is treated as excess output. A runner-owned validator survives termination of the
 outer cleanup task long enough to complete teardown. It removes its temporary
 bare repository only after group disappearance is confirmed, otherwise it
 retains the verifier for operator recovery and fails closed.

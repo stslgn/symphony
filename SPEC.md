@@ -1226,7 +1226,9 @@ MUST retain the verifier for operator recovery.
 Each local durability command MUST run behind a keeper that remains the exact
 process-group leader after the command exits. Completion, timeout, cancellation,
 or exceeding 64 KiB of combined standard output and error output MUST stop and
-kill that identity-anchored group. Cancellation of the outer cleanup task MUST
+kill that identity-anchored group. An incomplete private completion frame beyond
+that limit MUST receive no more than 250 milliseconds to complete before it is
+treated as excess output. Cancellation of the outer cleanup task MUST
 propagate to the active proof command without bypassing the validator-owned
 teardown. If group disappearance cannot be confirmed within the bounded
 teardown interval, the result MUST remain `workspace_preservation_required` and

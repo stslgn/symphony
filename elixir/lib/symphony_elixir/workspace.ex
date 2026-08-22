@@ -21,6 +21,7 @@ defmodule SymphonyElixir.Workspace do
   @owned_command_termination_unconfirmed_status 126
   @owned_command_timeout_status 124
   @owned_command_start_failure_status 127
+  @owned_command_frame_completion_ms 250
   @owned_command_termination_wait_ms 1_000
   @owned_command_termination_poll_ms 10
   @owned_command_wrapper_script """
@@ -890,6 +891,7 @@ defmodule SymphonyElixir.Workspace do
       timeout_ref: timeout_ref,
       os_pid: os_pid,
       status_marker: status_marker,
+      frame_timeout_ref: nil,
       output: ""
     })
   end
@@ -905,6 +907,7 @@ defmodule SymphonyElixir.Workspace do
       timeout_ref: timeout_ref,
       os_pid: os_pid,
       status_marker: status_marker,
+      frame_timeout_ref: frame_timeout_ref,
       output: output
     } = state
 
@@ -926,7 +929,10 @@ defmodule SymphonyElixir.Workspace do
 
           :pending ->
             if pending_owned_command_output_within_limit?(combined_output, status_marker) do
-              collect_owned_system_command(%{state | output: combined_output})
+              state
+              |> Map.put(:output, combined_output)
+              |> maybe_arm_owned_command_frame_timeout()
+              |> collect_owned_system_command()
             else
               finish_owned_system_command(
                 state,
@@ -941,6 +947,7 @@ defmodule SymphonyElixir.Workspace do
 
       {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
         Process.cancel_timer(timeout_ref)
+        cancel_owned_command_timer(frame_timeout_ref)
         demonitor_owned_command_cancellation(cancellation_ref)
         terminate_owned_system_command(port, os_pid)
 
@@ -950,8 +957,25 @@ defmodule SymphonyElixir.Workspace do
 
       {:owned_command_timeout, ^result_ref} ->
         finish_owned_system_command(state, output, @owned_command_timeout_status)
+
+      {:owned_command_frame_timeout, ^result_ref} ->
+        finish_owned_system_command(state, output, @owned_command_output_limit_status)
     end
   end
+
+  defp maybe_arm_owned_command_frame_timeout(%{frame_timeout_ref: nil} = state)
+       when byte_size(state.output) > @owned_command_output_limit_bytes do
+    frame_timeout_ref =
+      Process.send_after(
+        self(),
+        {:owned_command_frame_timeout, state.result_ref},
+        @owned_command_frame_completion_ms
+      )
+
+    %{state | frame_timeout_ref: frame_timeout_ref}
+  end
+
+  defp maybe_arm_owned_command_frame_timeout(state), do: state
 
   defp split_owned_command_completion(output, status_marker) do
     prefix = "\n#{status_marker}:"
@@ -1019,6 +1043,7 @@ defmodule SymphonyElixir.Workspace do
 
   defp finish_owned_system_command(state, output, status) do
     Process.cancel_timer(state.timeout_ref)
+    cancel_owned_command_timer(state.frame_timeout_ref)
     Process.demonitor(state.owner_ref, [:flush])
     demonitor_owned_command_cancellation(state.cancellation_ref)
 
@@ -1033,6 +1058,11 @@ defmodule SymphonyElixir.Workspace do
 
     send(state.owner, {state.result_ref, {{output, final_status}, termination}})
   end
+
+  defp cancel_owned_command_timer(timer_ref) when is_reference(timer_ref),
+    do: Process.cancel_timer(timer_ref)
+
+  defp cancel_owned_command_timer(_timer_ref), do: false
 
   defp maybe_put_owned_command_env(port_opts, nil), do: port_opts
 
