@@ -563,6 +563,35 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute File.exists?(overflow_workspace <> ".symphony-cleanup")
   end
 
+  test "owned command completion framing tolerates chunks split before the output limit" do
+    marker = "__SYMPHONY_OWNED_COMMAND_STATUS_test_marker__"
+    completion_prefix = "\n#{marker}:"
+
+    for payload_bytes <- [65_535, 65_536],
+        frame_fragment <- [
+          "\n",
+          binary_part(completion_prefix, 0, 7),
+          completion_prefix,
+          completion_prefix <> "1",
+          completion_prefix <> "126"
+        ] do
+      output = String.duplicate("x", payload_bytes) <> frame_fragment
+
+      assert Workspace.owned_command_output_within_limit_for_test?(output, marker),
+             "expected #{payload_bytes}-byte payload with #{inspect(frame_fragment)} to remain pending"
+    end
+
+    refute Workspace.owned_command_output_within_limit_for_test?(
+             String.duplicate("x", 65_537),
+             marker
+           )
+
+    refute Workspace.owned_command_output_within_limit_for_test?(
+             String.duplicate("x", 65_536) <> "\nnot-the-private-marker",
+             marker
+           )
+  end
+
   test "automatic terminal cleanup reaps descendants after the command leader exits" do
     test_root =
       Path.join(

@@ -976,31 +976,46 @@ defmodule SymphonyElixir.Workspace do
   defp pending_owned_command_output_within_limit?(output, status_marker)
        when byte_size(output) <=
               @owned_command_output_limit_bytes + @owned_command_completion_overhead_bytes do
-    overflow =
-      binary_part(
-        output,
-        @owned_command_output_limit_bytes,
-        byte_size(output) - @owned_command_output_limit_bytes
-      )
-
     completion_prefix = "\n#{status_marker}:"
+    max_pending_frame_bytes = byte_size(completion_prefix) + 3
+    earliest_marker_offset = max(0, byte_size(output) - max_pending_frame_bytes)
+    latest_marker_offset = min(@owned_command_output_limit_bytes, byte_size(output) - 1)
 
-    if byte_size(overflow) <= byte_size(completion_prefix) do
-      String.starts_with?(completion_prefix, overflow)
+    if earliest_marker_offset <= latest_marker_offset do
+      Enum.any?(earliest_marker_offset..latest_marker_offset, fn marker_offset ->
+        fragment =
+          binary_part(output, marker_offset, byte_size(output) - marker_offset)
+
+        pending_owned_command_completion_fragment?(fragment, completion_prefix)
+      end)
     else
-      partial_status =
-        binary_part(
-          overflow,
-          byte_size(completion_prefix),
-          byte_size(overflow) - byte_size(completion_prefix)
-        )
-
-      String.starts_with?(overflow, completion_prefix) and
-        byte_size(partial_status) <= 3 and partial_status =~ ~r/^\d*$/
+      false
     end
   end
 
   defp pending_owned_command_output_within_limit?(_output, _status_marker), do: false
+
+  defp pending_owned_command_completion_fragment?(fragment, completion_prefix)
+       when byte_size(fragment) <= byte_size(completion_prefix),
+       do: String.starts_with?(completion_prefix, fragment)
+
+  defp pending_owned_command_completion_fragment?(fragment, completion_prefix) do
+    partial_status =
+      binary_part(
+        fragment,
+        byte_size(completion_prefix),
+        byte_size(fragment) - byte_size(completion_prefix)
+      )
+
+    String.starts_with?(fragment, completion_prefix) and
+      byte_size(partial_status) <= 3 and partial_status =~ ~r/^\d*$/
+  end
+
+  @doc false
+  @spec owned_command_output_within_limit_for_test?(binary(), binary()) :: boolean()
+  def owned_command_output_within_limit_for_test?(output, status_marker)
+      when is_binary(output) and is_binary(status_marker),
+      do: pending_owned_command_output_within_limit?(output, status_marker)
 
   defp finish_owned_system_command(state, output, status) do
     Process.cancel_timer(state.timeout_ref)
