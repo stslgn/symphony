@@ -416,6 +416,41 @@ When an existing parked wait has no operator cursor during the first upgrade to 
 Symphony initializes the cursor at upgrade time. Historical comments are not executed retroactively;
 only comments created after that migration boundary can act as operator commands.
 
+### Fenced merge lanes
+
+Session-coordinated and runner-managed reviewed-PR merges share a separate append-only
+`merge-lane-ledger.jsonl` in the configured logs root. A claim binds the issue, optional wait,
+repository, PR, approved base ref and head SHA, channel, executor, and workflow generation. Claims
+use unique ids and monotonically increasing fencing tokens, never expire by time, and remain
+recoverable only by the same owner through the closed recovery state machine. An active session
+claim makes a matching native runner approval record a bounded conflict and fail closed without
+releasing the wait or entering `Merging`.
+
+The managed runtime exposes a bounded JSON-over-stdin interface without starting the runner:
+
+```console
+symphony merge-lane claim --logs-root /absolute/logs/root
+symphony merge-lane transition --logs-root /absolute/logs/root
+symphony merge-lane recover --logs-root /absolute/logs/root
+symphony merge-lane history --logs-root /absolute/logs/root
+```
+
+`claim` accepts the full binding. `transition` accepts `claim_id`, `fencing_token`, `target_state`,
+and bounded evidence; `recover` accepts the exact claim/fence, a closed-table action, and evidence.
+Every successful command emits one JSON object. Malformed ledgers, conflicting claims, stale fences,
+workflow drift, and an existing operation lock all fail closed. An operation lock is not removed by
+age; recovery requires first proving that no process still owns the logs root.
+
+The runner never invents a repository/PR/base/head binding from tracker state. Until an exact runner
+claim has been admitted by a binding-aware coordinator, a native Human Review approval returns
+`runner_merge_claim_required` and leaves the wait parked.
+
+The provider mutation boundary accepts only an `executing` claim whose current PR snapshot exactly
+matches the approved repository/PR/base/head tuple. It additionally requires provider capability
+evidence for atomic expected-head enforcement plus either atomic base-ref enforcement or proved
+repository controls that make base retargeting impossible. Head-only GitHub matching is rejected as
+`atomic_base_head_unavailable`; no provider merge function is called in that case.
+
 Global dispatch control is available locally through `GET /api/v1/pause` and
 `POST /api/v1/pause` with `{"paused": true}` or `{"paused": false}`. These endpoints accept only
 loopback callers. Pause is durable across restart and blocks new candidate and retry dispatch while

@@ -3,7 +3,7 @@ defmodule SymphonyElixir.CLI do
   Escript entrypoint for running Symphony with an explicit WORKFLOW.md path.
   """
 
-  alias SymphonyElixir.{LogFile, RuntimeIdentity}
+  alias SymphonyElixir.{LogFile, MergeLaneCLI, RuntimeIdentity}
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
   @startup_protocol "3"
@@ -34,6 +34,13 @@ defmodule SymphonyElixir.CLI do
 
       {:error, reason} ->
         halt_runtime_identity(reason)
+    end
+  end
+
+  def main(["merge-lane" | args]) do
+    case admit_runtime_identity() do
+      :ok -> run_merge_lane(args)
+      {:error, reason} -> halt_runtime_identity(reason)
     end
   end
 
@@ -69,6 +76,20 @@ defmodule SymphonyElixir.CLI do
       with {:ok, actual} <- RuntimeIdentity.verify(expected) do
         System.put_env(@verified_runtime_identity_env, actual)
       end
+    end
+  end
+
+  defp run_merge_lane(args) do
+    request_json = IO.read(:stdio, :eof)
+
+    case MergeLaneCLI.run(args, request_json) do
+      {:ok, response} ->
+        IO.puts(Jason.encode!(response))
+        :ok
+
+      {:error, reason} ->
+        IO.puts(:stderr, Jason.encode!(%{error: inspect(reason)}))
+        System.halt(1)
     end
   end
 
