@@ -19,6 +19,32 @@ defmodule SymphonyElixir.CLITest do
              ~r/\Aimage_sha256=[0-9a-f]{64}\nexecution_sha256=[0-9a-f]{64}\n\z/
   end
 
+  test "routes merge-lane commands without starting the runner application" do
+    suffix = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
+    logs_root = Path.join(System.tmp_dir!(), "symphony-cli-merge-lane-#{suffix}")
+
+    request =
+      Jason.encode!(%{
+        issue_id: "issue-1",
+        issue_identifier: "DUD-1",
+        wait_id: "wait-1",
+        repository: "stslgn/example",
+        pull_request: 23,
+        base_ref: "main",
+        head_sha: String.duplicate("a", 40),
+        channel: "session",
+        executor: "codex-session-1",
+        workflow_generation: String.duplicate("b", 64)
+      })
+
+    output =
+      capture_io(request, fn ->
+        assert :ok = CLI.main(["merge-lane", "claim", "--logs-root", logs_root])
+      end)
+
+    assert %{"state" => "claimed", "repository" => "stslgn/example"} = Jason.decode!(output)
+  end
+
   test "returns the guardrails acknowledgement banner when the flag is missing" do
     parent = self()
 

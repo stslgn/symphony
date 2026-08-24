@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{
     AgentRunner,
     Config,
+    MergeLane,
     ObservabilitySanitizer,
     OperatorCommand,
     OperatorWait,
@@ -4576,6 +4577,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp apply_allowed_operator_wait_action(state, wait, action, opts) do
+    case guard_merge_approval(state, wait, action) do
+      :ok -> persist_allowed_operator_wait_action(state, wait, action, opts)
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp persist_allowed_operator_wait_action(state, wait, action, opts) do
     transition = if action == "reject", do: "wait_rejected", else: "resume_queued"
     next_attempt = max(wait.attempt + 1, 1)
 
@@ -4586,6 +4594,10 @@ defmodule SymphonyElixir.Orchestrator do
       |> maybe_put_resumed_attempt(action, next_attempt)
       |> maybe_put_operator_command_context(Keyword.get(opts, :operator_comment), action)
 
+    persist_operator_wait_action(state, wait, action, next_attempt, event)
+  end
+
+  defp persist_operator_wait_action(state, wait, action, next_attempt, event) do
     case append_run_event(state, event) do
       :ok when action == "reject" ->
         {:ok, %{wait: wait, action: action, resumed: false}, state}
@@ -4605,6 +4617,26 @@ defmodule SymphonyElixir.Orchestrator do
         {:error, {:ledger_write_failed, reason}, state}
     end
   end
+
+  defp guard_merge_approval(
+         %State{
+           run_ledger_path: run_ledger_path,
+           runner_generation: runner_generation
+         },
+         %{reason: "waiting_owner", tracker_state: tracker_state} = wait,
+         "approve"
+       )
+       when is_binary(run_ledger_path) and is_binary(runner_generation) do
+    if is_binary(tracker_state) and String.downcase(String.trim(tracker_state)) == "human review" do
+      run_ledger_path
+      |> MergeLane.default_path()
+      |> MergeLane.guard_runner_approval(wait.issue_id, wait.wait_id, runner_generation)
+    else
+      :ok
+    end
+  end
+
+  defp guard_merge_approval(_state, _wait, _action), do: :ok
 
   defp maybe_put_resumed_attempt(event, "reject", _next_attempt), do: event
   defp maybe_put_resumed_attempt(event, _action, next_attempt), do: Map.put(event, :attempt, next_attempt)
