@@ -9,12 +9,13 @@ defmodule SymphonyElixir.MergeLane do
 
   alias SymphonyElixir.RunLedger
 
-  @schema_version 1
+  @schema_version 2
   @binding_fields [
     :issue_id,
     :issue_identifier,
     :wait_id,
     :repository,
+    :repository_id,
     :pull_request,
     :base_ref,
     :head_sha,
@@ -23,9 +24,17 @@ defmodule SymphonyElixir.MergeLane do
     :workflow_generation
   ]
   @claim_fields @binding_fields ++
-                  [:claim_id, :fencing_token, :state, :version, :operator_source_state]
+                  [
+                    :claim_id,
+                    :fencing_token,
+                    :state,
+                    :version,
+                    :operator_source_state,
+                    :owner_capability_sha256
+                  ]
   @evidence_fields [
     :evidence_sha256,
+    :observed_repository_id,
     :observed_base_ref,
     :observed_head_sha,
     :observed_workflow_generation,
@@ -33,6 +42,7 @@ defmodule SymphonyElixir.MergeLane do
     :result,
     :recovery_action
   ]
+  @evidence_digest_fields @evidence_fields -- [:evidence_sha256]
   @terminal_states [
     "invalidated",
     "aborted_no_side_effect",
@@ -61,6 +71,9 @@ defmodule SymphonyElixir.MergeLane do
     channel: 16,
     executor: 128
   }
+  @max_ledger_bytes 8_388_608
+  @max_ledger_events 20_000
+  @history_default_limit 1_000
 
   @spec default_path() :: Path.t()
   def default_path, do: default_path(RunLedger.default_path())
@@ -89,69 +102,156 @@ defmodule SymphonyElixir.MergeLane do
         |> Enum.reject(&terminal?/1)
         |> Enum.find(&same_lane?(&1, binding))
 
-      {:ok, claim}
+      {:ok, redact_claim(claim)}
     end
   end
 
   def active_claim(_path, _binding), do: {:error, :invalid_claim}
 
-  @spec guard_runner_approval(Path.t(), String.t(), String.t(), String.t()) ::
+  @spec guard_runner_approval(Path.t(), String.t(), String.t(), String.t(), String.t()) ::
           :ok | {:error, :runner_merge_claim_required | {:claim_conflict, String.t()} | term()}
-  def guard_runner_approval(path, issue_id, wait_id, executor)
+  def guard_runner_approval(path, issue_id, wait_id, executor, workflow_generation)
       when is_binary(path) and is_binary(issue_id) and is_binary(wait_id) and
-             is_binary(executor) do
+             is_binary(executor) and is_binary(workflow_generation) do
     with_locked_events(
       path,
-      &guard_runner_approval_from_events(path, &1, issue_id, wait_id, executor)
+      &guard_runner_approval_from_events(
+        path,
+        &1,
+        issue_id,
+        wait_id,
+        executor,
+        workflow_generation
+      ),
+      lock_attempts: 1
     )
   end
 
-  def guard_runner_approval(_path, _issue_id, _wait_id, _executor),
+  def guard_runner_approval(_path, _issue_id, _wait_id, _executor, _workflow_generation),
     do: {:error, :invalid_runner_approval}
 
-  @spec transition(Path.t(), String.t(), non_neg_integer(), String.t()) ::
+  @spec transition(Path.t(), String.t(), non_neg_integer(), String.t(), String.t()) ::
           {:ok, map()} | {:error, term()}
-  def transition(path, claim_id, fencing_token, target_state)
+  def transition(path, claim_id, fencing_token, target_state, owner_capability)
       when is_binary(path) and is_binary(claim_id) and is_integer(fencing_token) and
-             is_binary(target_state) do
-    transition(path, claim_id, fencing_token, target_state, %{})
+             is_binary(target_state) and is_binary(owner_capability) do
+    transition(path, claim_id, fencing_token, target_state, owner_capability, %{})
   end
 
-  def transition(_path, _claim_id, _fencing_token, _target_state),
+  def transition(_path, _claim_id, _fencing_token, _target_state, _owner_capability),
     do: {:error, :invalid_transition}
 
-  @spec transition(Path.t(), String.t(), non_neg_integer(), String.t(), map()) ::
+  @spec transition(Path.t(), String.t(), non_neg_integer(), String.t(), String.t(), map()) ::
           {:ok, map()} | {:error, term()}
-  def transition(path, claim_id, fencing_token, target_state, evidence)
+  def transition(path, claim_id, fencing_token, target_state, owner_capability, evidence)
       when is_binary(path) and is_binary(claim_id) and is_integer(fencing_token) and
-             is_binary(target_state) and is_map(evidence) do
+             is_binary(target_state) and is_binary(owner_capability) and is_map(evidence) do
     with_locked_events(
       path,
-      &transition_from_events(path, &1, claim_id, fencing_token, target_state, evidence)
+      &transition_from_events(
+        path,
+        &1,
+        claim_id,
+        fencing_token,
+        target_state,
+        owner_capability,
+        evidence
+      )
     )
   end
 
-  def transition(_path, _claim_id, _fencing_token, _target_state, _evidence),
-    do: {:error, :invalid_transition}
+  def transition(
+        _path,
+        _claim_id,
+        _fencing_token,
+        _target_state,
+        _owner_capability,
+        _evidence
+      ),
+      do: {:error, :invalid_transition}
 
-  @spec recover(Path.t(), String.t(), non_neg_integer(), String.t(), map()) ::
+  @spec recover(Path.t(), String.t(), non_neg_integer(), String.t(), String.t(), map()) ::
           {:ok, map()} | {:error, term()}
-  def recover(path, claim_id, fencing_token, action, evidence)
+  def recover(path, claim_id, fencing_token, action, owner_capability, evidence)
       when is_binary(path) and is_binary(claim_id) and is_integer(fencing_token) and
-             is_binary(action) and is_map(evidence) do
+             is_binary(action) and is_binary(owner_capability) and is_map(evidence) do
     with_locked_events(
       path,
-      &recover_from_events(path, &1, claim_id, fencing_token, action, evidence)
+      &recover_from_events(
+        path,
+        &1,
+        claim_id,
+        fencing_token,
+        action,
+        owner_capability,
+        evidence
+      )
     )
   end
 
-  def recover(_path, _claim_id, _fencing_token, _action, _evidence),
+  def recover(_path, _claim_id, _fencing_token, _action, _owner_capability, _evidence),
     do: {:error, :invalid_recovery}
 
   @spec history(Path.t()) :: {:ok, [map()]} | {:error, term()}
-  def history(path) when is_binary(path), do: read_events(path)
+  def history(path), do: history(path, @history_default_limit)
 
-  def history(_path), do: {:error, :invalid_claim}
+  @spec history(Path.t(), pos_integer()) :: {:ok, [map()]} | {:error, term()}
+  def history(path, limit) when is_binary(path) and is_integer(limit) and limit > 0 do
+    with {:ok, events} <- read_events(path) do
+      {:ok, events |> Enum.take(-min(limit, @history_default_limit)) |> Enum.map(&redact_event/1)}
+    end
+  end
+
+  def history(_path, _limit), do: {:error, :invalid_claim}
+
+  @spec evidence_sha256(map()) :: String.t()
+  def evidence_sha256(evidence) when is_map(evidence) do
+    evidence
+    |> take_fields(@evidence_digest_fields)
+    |> stringify_map_keys()
+    |> Jason.encode!()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  @spec with_current_claim(
+          Path.t(),
+          String.t(),
+          pos_integer(),
+          String.t(),
+          String.t(),
+          (map() -> term())
+        ) :: term()
+  def with_current_claim(
+        path,
+        claim_id,
+        fencing_token,
+        owner_capability,
+        expected_state,
+        operation
+      )
+      when is_binary(path) and is_binary(claim_id) and is_integer(fencing_token) and
+             is_binary(owner_capability) and is_binary(expected_state) and
+             is_function(operation, 1) do
+    with_locked_events(path, fn events ->
+      with {:ok, claim} <- fetch_claim(events, claim_id),
+           :ok <- require_fencing_token(claim, fencing_token),
+           :ok <- require_owner_capability(claim, owner_capability),
+           :ok <- require_state(claim, expected_state) do
+        operation.(redact_claim(claim))
+      end
+    end)
+  end
+
+  def with_current_claim(
+        _path,
+        _claim_id,
+        _fencing_token,
+        _owner_capability,
+        _expected_state,
+        _operation
+      ),
+      do: {:error, :invalid_claim_authorization}
 
   defp claim_from_events(path, events, binding) do
     case conflicting_claim(events, binding) do
@@ -160,7 +260,14 @@ defmodule SymphonyElixir.MergeLane do
     end
   end
 
-  defp guard_runner_approval_from_events(path, events, issue_id, wait_id, executor) do
+  defp guard_runner_approval_from_events(
+         path,
+         events,
+         issue_id,
+         wait_id,
+         executor,
+         workflow_generation
+       ) do
     case active_claim_for_wait(events, issue_id, wait_id) do
       nil ->
         {:error, :runner_merge_claim_required}
@@ -168,7 +275,7 @@ defmodule SymphonyElixir.MergeLane do
       %{
         channel: "runner",
         executor: ^executor,
-        workflow_generation: ^executor,
+        workflow_generation: ^workflow_generation,
         state: "claimed"
       } ->
         :ok
@@ -187,11 +294,13 @@ defmodule SymphonyElixir.MergeLane do
          claim_id,
          fencing_token,
          target_state,
+         owner_capability,
          evidence
        ) do
     with {:ok, claim} <- fetch_claim(events, claim_id),
          :ok <- ensure_nonterminal(claim),
          :ok <- require_fencing_token(claim, fencing_token),
+         :ok <- require_owner_capability(claim, owner_capability),
          :ok <- allow_transition(claim.state, target_state),
          :ok <- validate_transition_evidence(claim, target_state, evidence) do
       next_claim = transition_claim(claim, target_state)
@@ -201,13 +310,24 @@ defmodule SymphonyElixir.MergeLane do
         |> Map.merge(take_fields(evidence, @evidence_fields))
         |> Map.merge(event_metadata(claim, target_state, "state_transitioned"))
 
-      persist_event_result(path, event, next_claim)
+      persist_event_result(path, event, next_claim, owner_capability)
     end
   end
 
-  defp recover_from_events(path, events, claim_id, fencing_token, action, evidence) do
+  defp recover_from_events(
+         path,
+         events,
+         claim_id,
+         fencing_token,
+         action,
+         owner_capability,
+         evidence
+       ) do
+    evidence = Map.put(evidence, :recovery_action, action)
+
     with {:ok, claim} <- fetch_claim(events, claim_id),
          :ok <- require_fencing_token(claim, fencing_token),
+         :ok <- require_owner_capability(claim, owner_capability),
          {:ok, target_state, operator_source_state} <- recovery_target(claim, action, evidence) do
       next_claim = %{
         claim
@@ -223,7 +343,7 @@ defmodule SymphonyElixir.MergeLane do
         |> Map.merge(event_metadata(claim, target_state, "recovery_applied"))
         |> Map.put(:recovery_action, action)
 
-      persist_event_result(path, event, next_claim)
+      persist_event_result(path, event, next_claim, owner_capability)
     end
   end
 
@@ -240,21 +360,28 @@ defmodule SymphonyElixir.MergeLane do
     }
   end
 
-  defp persist_event_result(path, event, claim) do
-    with :ok <- append_event(path, event), do: {:ok, claim}
+  defp persist_event_result(path, event, claim, owner_capability) do
+    with :ok <- append_event(path, event) do
+      {:ok, claim |> redact_claim() |> Map.put(:owner_capability, owner_capability)}
+    end
   end
 
-  defp with_locked_events(path, operation) do
-    with_operation_lock(path, fn ->
-      with {:ok, events} <- read_events(path), do: operation.(events)
-    end)
+  defp with_locked_events(path, operation, opts \\ []) do
+    with_operation_lock(
+      path,
+      fn ->
+        with {:ok, events} <- read_events(path), do: operation.(events)
+      end,
+      opts
+    )
   end
 
-  defp with_operation_lock(path, operation) do
+  defp with_operation_lock(path, operation, opts) do
     lock_path = path <> ".lock"
+    lock_attempts = Keyword.get(opts, :lock_attempts, 100)
 
     with :ok <- File.mkdir_p(Path.dirname(path)),
-         :ok <- acquire_operation_lock(lock_path) do
+         :ok <- acquire_operation_lock(lock_path, lock_attempts) do
       try do
         operation.()
       after
@@ -263,7 +390,7 @@ defmodule SymphonyElixir.MergeLane do
     end
   end
 
-  defp acquire_operation_lock(lock_path, attempts \\ 100)
+  defp acquire_operation_lock(lock_path, attempts)
 
   defp acquire_operation_lock(_lock_path, 0), do: {:error, :operation_locked}
 
@@ -282,13 +409,33 @@ defmodule SymphonyElixir.MergeLane do
   end
 
   defp read_events(path) do
+    with {:ok, size} <- ledger_size(path),
+         :ok <- validate_ledger_size(size),
+         {:ok, contents} <- read_ledger(path),
+         :ok <- validate_ledger_size(byte_size(contents)) do
+      decode_events(contents)
+    end
+  end
+
+  defp read_ledger(path) do
     case File.read(path) do
-      {:ok, ""} -> {:ok, []}
-      {:ok, contents} -> decode_events(contents)
-      {:error, :enoent} -> {:ok, []}
+      {:ok, contents} -> {:ok, contents}
+      {:error, :enoent} -> {:ok, ""}
       {:error, reason} -> {:error, {:ledger_read_failed, reason}}
     end
   end
+
+  defp ledger_size(path) do
+    case File.stat(path) do
+      {:ok, %{type: :regular, size: size}} -> {:ok, size}
+      {:ok, _stat} -> {:ok, 0}
+      {:error, :enoent} -> {:ok, 0}
+      {:error, reason} -> {:error, {:ledger_read_failed, reason}}
+    end
+  end
+
+  defp validate_ledger_size(size) when size <= @max_ledger_bytes, do: :ok
+  defp validate_ledger_size(_size), do: {:error, :merge_lane_ledger_limit_reached}
 
   defp decode_events(contents) do
     contents
@@ -300,13 +447,16 @@ defmodule SymphonyElixir.MergeLane do
       end
     end)
     |> case do
-      {:ok, events} ->
+      {:ok, events} when length(events) <= @max_ledger_events ->
         events = Enum.reverse(events)
 
         case validate_events(events) do
           :ok -> {:ok, events}
           {:error, _reason} -> {:error, :invalid_merge_lane_ledger}
         end
+
+      {:ok, _events} ->
+        {:error, :merge_lane_ledger_limit_reached}
 
       {:error, reason} ->
         {:error, reason}
@@ -315,14 +465,17 @@ defmodule SymphonyElixir.MergeLane do
 
   defp validate_events(events) do
     events
-    |> Enum.reduce_while({:ok, %{claims: %{}, max_fence: 0}}, fn event, {:ok, state} ->
-      with :ok <- validate_event_shape(event),
-           {:ok, next_state} <- validate_ordered_event(event, state) do
-        {:cont, {:ok, next_state}}
-      else
-        _error -> {:halt, {:error, :invalid_event}}
+    |> Enum.reduce_while(
+      {:ok, %{claims: %{}, max_fence: 0, active_issues: %{}, active_pull_requests: %{}}},
+      fn event, {:ok, state} ->
+        with :ok <- validate_event_shape(event),
+             {:ok, next_state} <- validate_ordered_event(event, state) do
+          {:cont, {:ok, next_state}}
+        else
+          _error -> {:halt, {:error, :invalid_event}}
+        end
       end
-    end)
+    )
     |> case do
       {:ok, _state} -> :ok
       {:error, reason} -> {:error, reason}
@@ -331,7 +484,7 @@ defmodule SymphonyElixir.MergeLane do
 
   defp validate_event_shape(event) do
     with true <- MapSet.subset?(MapSet.new(Map.keys(event)), @event_fields),
-         1 <- event["schema_version"],
+         @schema_version <- event["schema_version"],
          true <- valid_string?(event["event_id"]),
          true <- valid_timestamp?(event["occurred_at"]),
          true <- valid_string?(event["claim_id"]),
@@ -339,6 +492,7 @@ defmodule SymphonyElixir.MergeLane do
          true <- is_integer(event["version"]) and event["version"] > 0,
          true <- is_integer(event["fencing_token"]) and event["fencing_token"] > 0,
          true <- is_integer(event["previous_version"]) and event["previous_version"] >= 0,
+         true <- valid_sha256?(event["owner_capability_sha256"]),
          :ok <- validate_binding(event) do
       :ok
     else
@@ -355,6 +509,7 @@ defmodule SymphonyElixir.MergeLane do
 
   defp validate_initial_claim_event(event, state) do
     claim = event_to_claim(event)
+    pull_request_key = pull_request_key(claim)
 
     with "claimed" <- event["transition"],
          "claimed" <- event["state"],
@@ -362,11 +517,15 @@ defmodule SymphonyElixir.MergeLane do
          0 <- event["previous_version"],
          1 <- event["version"],
          true <- event["fencing_token"] > state.max_fence,
-         false <- Enum.any?(Map.values(state.claims), &(!terminal?(&1) and same_lane?(&1, claim))) do
+         false <- Map.has_key?(state.active_issues, claim.issue_id),
+         false <- Map.has_key?(state.active_pull_requests, pull_request_key) do
       {:ok,
        %{
-         claims: Map.put(state.claims, claim.claim_id, claim),
-         max_fence: event["fencing_token"]
+         state
+         | claims: Map.put(state.claims, claim.claim_id, claim),
+           max_fence: event["fencing_token"],
+           active_issues: Map.put(state.active_issues, claim.issue_id, claim.claim_id),
+           active_pull_requests: Map.put(state.active_pull_requests, pull_request_key, claim.claim_id)
        }}
     else
       _other -> {:error, :invalid_initial_claim}
@@ -384,10 +543,25 @@ defmodule SymphonyElixir.MergeLane do
          ^previous_version <- event["previous_version"],
          true <- claim.version == previous.version + 1,
          :ok <- validate_followup_fence(event, claim, previous),
-         :ok <- validate_followup_transition(event, claim, previous) do
-      {:ok, %{state | claims: Map.put(state.claims, claim.claim_id, claim)}}
+         :ok <- validate_followup_transition(event, claim, previous),
+         :ok <- validate_followup_evidence(event, claim, previous) do
+      {:ok, update_projected_claim(state, claim)}
     else
       _other -> {:error, :invalid_followup_claim}
+    end
+  end
+
+  defp update_projected_claim(state, claim) do
+    state = %{state | claims: Map.put(state.claims, claim.claim_id, claim)}
+
+    if terminal?(claim) do
+      %{
+        state
+        | active_issues: Map.delete(state.active_issues, claim.issue_id),
+          active_pull_requests: Map.delete(state.active_pull_requests, pull_request_key(claim))
+      }
+    else
+      state
     end
   end
 
@@ -415,7 +589,7 @@ defmodule SymphonyElixir.MergeLane do
       else: {:error, :invalid_recovery_transition}
   end
 
-  defp validate_followup_transition(event, claim, previous) do
+  defp validate_followup_transition(%{"outcome" => "state_transitioned"} = event, claim, previous) do
     with true <- event["transition"] == claim.state,
          :ok <- allow_transition(previous.state, claim.state) do
       :ok
@@ -423,6 +597,26 @@ defmodule SymphonyElixir.MergeLane do
       _other -> {:error, :invalid_state_transition}
     end
   end
+
+  defp validate_followup_transition(_event, _claim, _previous),
+    do: {:error, :invalid_state_transition}
+
+  defp validate_followup_evidence(%{"transition" => "claim_conflict"}, _claim, _previous),
+    do: :ok
+
+  defp validate_followup_evidence(%{"outcome" => "recovery_applied"} = event, claim, previous) do
+    with {:ok, target_state, operator_source_state} <-
+           recovery_target(previous, event["recovery_action"], event),
+         true <- target_state == claim.state,
+         true <- operator_source_state == claim.operator_source_state do
+      :ok
+    else
+      _other -> {:error, :invalid_recovery_evidence}
+    end
+  end
+
+  defp validate_followup_evidence(event, claim, previous),
+    do: validate_transition_evidence(previous, claim.state, event)
 
   defp recovery_transition?("merge_uncertain", target),
     do: target in ["operator_required", "aborted_no_side_effect"]
@@ -434,13 +628,17 @@ defmodule SymphonyElixir.MergeLane do
 
   defp same_binding?(left, right) do
     Enum.all?(@binding_fields, &(Map.fetch!(left, &1) == Map.fetch!(right, &1))) and
-      left.claim_id == right.claim_id and left.executor == right.executor
+      left.claim_id == right.claim_id and left.executor == right.executor and
+      left.owner_capability_sha256 == right.owner_capability_sha256
   end
 
   defp append_event(path, event) do
-    with :ok <- ensure_private_file(path),
-         {:ok, encoded} <- Jason.encode(event) do
-      File.write(path, encoded <> "\n", [:append, :sync])
+    with {:ok, encoded} <- Jason.encode(event),
+         encoded_line = encoded <> "\n",
+         {:ok, size} <- ledger_size(path),
+         :ok <- validate_ledger_size(size + byte_size(encoded_line)),
+         :ok <- ensure_private_file(path) do
+      File.write(path, encoded_line, [:append, :sync])
     end
   end
 
@@ -462,13 +660,16 @@ defmodule SymphonyElixir.MergeLane do
   end
 
   defp create_claim(path, events, binding) do
+    owner_capability = new_owner_capability()
+
     claim =
       @binding_fields
-      |> Map.new(fn field -> {field, value(binding, field)} end)
+      |> Map.new(fn field -> {field, normalized_binding_value(binding, field)} end)
       |> Map.merge(%{
         claim_id: RunLedger.new_id("merge_claim"),
         fencing_token: next_fencing_token(events),
         operator_source_state: nil,
+        owner_capability_sha256: capability_sha256(owner_capability),
         state: "claimed",
         version: 1
       })
@@ -484,7 +685,9 @@ defmodule SymphonyElixir.MergeLane do
         previous_version: 0
       })
 
-    with :ok <- append_event(path, event), do: {:ok, claim}
+    with :ok <- append_event(path, event) do
+      {:ok, claim |> redact_claim() |> Map.put(:owner_capability, owner_capability)}
+    end
   end
 
   defp record_claim_conflict(path, existing, contender) do
@@ -534,6 +737,17 @@ defmodule SymphonyElixir.MergeLane do
   defp require_fencing_token(%{fencing_token: fencing_token}, fencing_token), do: :ok
   defp require_fencing_token(_claim, _fencing_token), do: {:error, :stale_fencing_token}
 
+  defp require_owner_capability(%{owner_capability_sha256: expected}, owner_capability) do
+    actual = capability_sha256(owner_capability)
+
+    if byte_size(actual) == byte_size(expected) and Plug.Crypto.secure_compare(actual, expected),
+      do: :ok,
+      else: {:error, :claim_owner_mismatch}
+  end
+
+  defp require_state(%{state: state}, state), do: :ok
+  defp require_state(_claim, _state), do: {:error, :claim_state_mismatch}
+
   defp ensure_nonterminal(claim) do
     if terminal?(claim), do: {:error, :claim_terminal}, else: :ok
   end
@@ -557,6 +771,7 @@ defmodule SymphonyElixir.MergeLane do
 
   defp validate_transition_evidence(claim, "merge_observed", evidence) do
     with :ok <- validate_evidence_digest(evidence),
+         true <- value(evidence, :observed_repository_id) == claim.repository_id,
          true <- valid_ref?(value(evidence, :observed_base_ref)),
          true <- valid_head_sha?(value(evidence, :observed_head_sha)),
          true <- value(evidence, :observed_base_ref) == claim.base_ref,
@@ -570,8 +785,9 @@ defmodule SymphonyElixir.MergeLane do
 
   defp validate_transition_evidence(_claim, "invalidated", evidence) do
     with :ok <- validate_evidence_digest(evidence),
-         result when result in ["base_ref_mismatch", "head_sha_mismatch"] <-
+         result when result in ["repository_id_mismatch", "base_ref_mismatch", "head_sha_mismatch"] <-
            value(evidence, :result),
+         true <- is_integer(value(evidence, :observed_repository_id)),
          true <- valid_ref?(value(evidence, :observed_base_ref)),
          true <- valid_head_sha?(value(evidence, :observed_head_sha)) do
       :ok
@@ -617,6 +833,7 @@ defmodule SymphonyElixir.MergeLane do
   defp recovery_target(%{state: "operator_required"} = claim, "reconcile", evidence) do
     with :ok <- validate_evidence_digest(evidence),
          "merged" <- value(evidence, :result),
+         true <- value(evidence, :observed_repository_id) == claim.repository_id,
          true <- value(evidence, :observed_base_ref) == claim.base_ref,
          true <- value(evidence, :observed_head_sha) == claim.head_sha do
       {:ok, "merge_observed", nil}
@@ -625,10 +842,13 @@ defmodule SymphonyElixir.MergeLane do
     end
   end
 
-  defp recovery_target(%{state: state}, "abort", evidence)
+  defp recovery_target(%{state: state} = claim, "abort", evidence)
        when state in ["merge_uncertain", "operator_required"] do
     with :ok <- validate_evidence_digest(evidence),
-         "no_provider_side_effect" <- value(evidence, :result) do
+         "no_provider_side_effect" <- value(evidence, :result),
+         true <- value(evidence, :observed_repository_id) == claim.repository_id,
+         true <- value(evidence, :observed_base_ref) == claim.base_ref,
+         true <- value(evidence, :observed_head_sha) == claim.head_sha do
       {:ok, "aborted_no_side_effect", nil}
     else
       _other -> {:error, :invalid_recovery}
@@ -643,6 +863,7 @@ defmodule SymphonyElixir.MergeLane do
        when source_state in ["claimed", "executing", "acceptance_pending"] do
     with :ok <- validate_evidence_digest(evidence),
          "no_provider_side_effect" <- value(evidence, :result),
+         true <- value(evidence, :observed_repository_id) == claim.repository_id,
          true <- value(evidence, :observed_base_ref) == claim.base_ref,
          true <- value(evidence, :observed_head_sha) == claim.head_sha,
          true <- value(evidence, :observed_workflow_generation) == claim.workflow_generation do
@@ -655,16 +876,22 @@ defmodule SymphonyElixir.MergeLane do
   defp recovery_target(_claim, _action, _evidence), do: {:error, :invalid_recovery}
 
   defp validate_evidence_digest(evidence) do
-    if Regex.match?(~r/\A[0-9a-f]{64}\z/, value(evidence, :evidence_sha256) || ""),
-      do: :ok,
-      else: {:error, :invalid_evidence}
+    supplied = value(evidence, :evidence_sha256)
+
+    if is_binary(supplied) and
+         Regex.match?(~r/\A[0-9a-f]{64}\z/, supplied) and
+         Plug.Crypto.secure_compare(supplied, evidence_sha256(evidence)),
+       do: :ok,
+       else: {:error, :invalid_evidence}
   end
 
   defp same_lane?(claim, binding) do
     claim.issue_id == value(binding, :issue_id) or
-      (claim.repository == value(binding, :repository) and
+      (claim.repository_id == value(binding, :repository_id) and
          claim.pull_request == value(binding, :pull_request))
   end
+
+  defp pull_request_key(claim), do: {claim.repository_id, claim.pull_request}
 
   defp transition_claim(claim, "operator_required") do
     %{
@@ -692,6 +919,7 @@ defmodule SymphonyElixir.MergeLane do
     with :ok <- validate_bounded_binding_fields(binding),
          :ok <- validate_pull_request(value(binding, :pull_request)),
          :ok <- validate_repository(value(binding, :repository)),
+         :ok <- validate_repository_id(value(binding, :repository_id)),
          :ok <- validate_base_ref(value(binding, :base_ref)),
          :ok <- validate_executor(value(binding, :executor)),
          :ok <- validate_channel(value(binding, :channel)),
@@ -718,10 +946,17 @@ defmodule SymphonyElixir.MergeLane do
 
   defp validate_repository(repository) do
     if is_binary(repository) and
-         Regex.match?(~r/\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\z/, repository),
+         repository == String.downcase(repository) and
+         Regex.match?(~r/\A[a-z0-9_.-]+\/[a-z0-9_.-]+\z/, repository),
        do: :ok,
        else: {:error, :invalid_claim_binding}
   end
+
+  defp validate_repository_id(repository_id)
+       when is_integer(repository_id) and repository_id > 0,
+       do: :ok
+
+  defp validate_repository_id(_repository_id), do: {:error, :invalid_claim_binding}
 
   defp validate_base_ref(base_ref) do
     if valid_ref?(base_ref), do: :ok, else: {:error, :invalid_claim_binding}
@@ -749,11 +984,13 @@ defmodule SymphonyElixir.MergeLane do
   end
 
   defp validate_workflow_generation(workflow_generation) do
-    if is_binary(workflow_generation) and
-         Regex.match?(~r/\A[0-9a-f]{64}\z/, workflow_generation),
-       do: :ok,
-       else: {:error, :invalid_claim_binding}
+    if valid_sha256?(workflow_generation),
+      do: :ok,
+      else: {:error, :invalid_claim_binding}
   end
+
+  defp valid_sha256?(value),
+    do: is_binary(value) and Regex.match?(~r/\A[0-9a-f]{64}\z/, value)
 
   defp valid_string?(value), do: is_binary(value) and value != "" and String.valid?(value)
 
@@ -781,6 +1018,12 @@ defmodule SymphonyElixir.MergeLane do
 
   defp value(map, key), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
 
+  defp normalized_binding_value(binding, :repository) do
+    binding |> value(:repository) |> String.downcase()
+  end
+
+  defp normalized_binding_value(binding, field), do: value(binding, field)
+
   defp take_fields(map, fields) do
     fields
     |> Map.new(fn field -> {field, value(map, field)} end)
@@ -790,4 +1033,24 @@ defmodule SymphonyElixir.MergeLane do
   defp occurred_at do
     DateTime.utc_now() |> DateTime.truncate(:millisecond) |> DateTime.to_iso8601()
   end
+
+  defp new_owner_capability do
+    :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false)
+  end
+
+  defp capability_sha256(capability) do
+    :crypto.hash(:sha256, capability) |> Base.encode16(case: :lower)
+  end
+
+  defp redact_claim(nil), do: nil
+  defp redact_claim(claim), do: Map.drop(claim, [:owner_capability_sha256, :owner_capability])
+
+  defp redact_event(event), do: Map.drop(event, ["owner_capability_sha256"])
+
+  defp stringify_map_keys(map) when is_map(map) do
+    Map.new(map, fn {key, item} -> {to_string(key), stringify_map_keys(item)} end)
+  end
+
+  defp stringify_map_keys(list) when is_list(list), do: Enum.map(list, &stringify_map_keys/1)
+  defp stringify_map_keys(value), do: value
 end

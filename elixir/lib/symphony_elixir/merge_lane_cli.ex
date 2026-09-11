@@ -56,6 +56,7 @@ defmodule SymphonyElixir.MergeLaneCLI do
       request["claim_id"],
       request["fencing_token"],
       request["target_state"],
+      request["owner_capability"],
       request["evidence"] || %{}
     )
   end
@@ -66,18 +67,23 @@ defmodule SymphonyElixir.MergeLaneCLI do
       request["claim_id"],
       request["fencing_token"],
       request["action"],
+      request["owner_capability"],
       request["evidence"] || %{}
     )
   end
 
-  defp dispatch("history", path, _request) do
-    case MergeLane.history(path) do
+  defp dispatch("history", path, request) do
+    case MergeLane.history(path, request["limit"] || 1_000) do
       {:ok, events} -> {:ok, %{"events" => events}}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp ledger_path(logs_root), do: Path.join(logs_root, "merge-lane-ledger.jsonl")
+  defp ledger_path(logs_root) do
+    logs_root
+    |> Path.join("run-ledger.jsonl")
+    |> MergeLane.default_path()
+  end
 
   defp validate_request_size(request_json) do
     if byte_size(request_json) <= @max_request_bytes,

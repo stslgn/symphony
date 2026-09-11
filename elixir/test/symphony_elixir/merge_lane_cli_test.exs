@@ -22,6 +22,7 @@ defmodule SymphonyElixir.MergeLaneCLITest do
     transition = %{
       claim_id: claim.claim_id,
       fencing_token: claim.fencing_token,
+      owner_capability: claim.owner_capability,
       target_state: "executing",
       evidence: %{}
     }
@@ -50,6 +51,7 @@ defmodule SymphonyElixir.MergeLaneCLITest do
                Jason.encode!(%{
                  claim_id: claim.claim_id,
                  fencing_token: 1,
+                 owner_capability: claim.owner_capability,
                  target_state: "executing"
                })
              )
@@ -60,8 +62,9 @@ defmodule SymphonyElixir.MergeLaneCLITest do
                Jason.encode!(%{
                  claim_id: claim.claim_id,
                  fencing_token: 1,
+                 owner_capability: claim.owner_capability,
                  target_state: "merge_uncertain",
-                 evidence: %{evidence_sha256: String.duplicate("c", 64)}
+                 evidence: evidence(%{result: "ambiguous"})
                })
              )
 
@@ -71,11 +74,9 @@ defmodule SymphonyElixir.MergeLaneCLITest do
                Jason.encode!(%{
                  claim_id: claim.claim_id,
                  fencing_token: 1,
+                 owner_capability: claim.owner_capability,
                  action: "reconcile",
-                 evidence: %{
-                   result: "ambiguous",
-                   evidence_sha256: String.duplicate("d", 64)
-                 }
+                 evidence: recovery_evidence("reconcile", %{result: "ambiguous"})
                })
              )
 
@@ -116,6 +117,7 @@ defmodule SymphonyElixir.MergeLaneCLITest do
       issue_identifier: "DUD-1",
       wait_id: "wait-1",
       repository: "stslgn/example",
+      repository_id: 12_345,
       pull_request: 23,
       base_ref: "main",
       head_sha: String.duplicate("a", 40),
@@ -123,5 +125,13 @@ defmodule SymphonyElixir.MergeLaneCLITest do
       executor: "codex-session-1",
       workflow_generation: String.duplicate("b", 64)
     }
+  end
+
+  defp evidence(fields) do
+    Map.put(fields, :evidence_sha256, SymphonyElixir.MergeLane.evidence_sha256(fields))
+  end
+
+  defp recovery_evidence(action, fields) do
+    evidence(Map.put(fields, :recovery_action, action))
   end
 end

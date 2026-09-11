@@ -29,6 +29,7 @@ defmodule SymphonyElixir.CLITest do
         issue_identifier: "DUD-1",
         wait_id: "wait-1",
         repository: "stslgn/example",
+        repository_id: 12_345,
         pull_request: 23,
         base_ref: "main",
         head_sha: String.duplicate("a", 40),
