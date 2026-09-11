@@ -283,9 +283,12 @@ Use this only when completion is blocked by missing required tools or missing au
 1. When the issue is in `Human Review`, do not code or change ticket content.
 2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
 3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
-4. If approved, human moves the issue to `Merging`.
-5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
-6. After merge is complete, move the issue to `Done`.
+4. Use exactly one approval channel for a reviewed-PR merge:
+   - A designated session coordinator keeps the issue in `Human Review`, acquires the exact durable session merge-lane claim (including provider-stable repository id), retains its one-time owner capability outside logs, and may execute only through a ledger-bound atomic base-and-head provider gate.
+   - A native allowlisted human approval may acquire the runner lane and move the issue to `Merging` only when the claim matches the current runner generation and separately attested workflow generation and no conflicting session claim exists.
+5. If runner-managed approval moves the issue to `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
+6. A session-coordinated merge must remain in `Human Review` through merge acceptance. A missing/conflicting claim, stale fence, changed repository/PR/base/head tuple, or unavailable atomic base-and-head protection stops without merge and requires fresh approval after revalidation.
+7. After merge and acceptance are complete, move the issue to `Done`.
 
 ## Step 4: Rework handling
 

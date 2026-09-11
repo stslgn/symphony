@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{
     AgentRunner,
     Config,
+    MergeLane,
     ObservabilitySanitizer,
     OperatorCommand,
     OperatorWait,
@@ -55,7 +56,8 @@ defmodule SymphonyElixir.Orchestrator do
               tracker_context: nil,
               tracker_admissions: %{},
               tracker_fetch_by_ids_fn: nil,
-              tracker_update_state_fn: nil
+              tracker_update_state_fn: nil,
+              workflow_generation: nil
   end
 
   defmodule State do
@@ -116,6 +118,11 @@ defmodule SymphonyElixir.Orchestrator do
     run_ledger_path = Keyword.get(opts, :run_ledger_path, RunLedger.default_path())
     run_ledger_append_fn = Keyword.get(opts, :run_ledger_append_fn, &RunLedger.append/2)
     runner_generation = RunLedger.new_id("runner")
+
+    workflow_generation =
+      Keyword.get(opts, :workflow_generation) ||
+        System.get_env("SYMPHONY_EXPECTED_WORKFLOW_SHA256")
+
     restore_parked_waits_fn = Keyword.get(opts, :restore_parked_waits_fn, &restore_parked_waits/1)
 
     case RunLedger.reconcile_startup(run_ledger_path, runner_generation) do
@@ -156,7 +163,8 @@ defmodule SymphonyElixir.Orchestrator do
               tracker_context: Tracker.poll_context(config.tracker, tracker_authority_generation),
               tracker_admissions: recovery.tracker_admissions,
               tracker_fetch_by_ids_fn: Keyword.get(opts, :tracker_fetch_by_ids_fn),
-              tracker_update_state_fn: Keyword.get(opts, :tracker_update_state_fn)
+              tracker_update_state_fn: Keyword.get(opts, :tracker_update_state_fn),
+              workflow_generation: workflow_generation
             },
             operator_comment_cursors: restore_operator_comment_cursors(recovery.operator_comment_cursors),
             codex_totals: @empty_codex_totals,
@@ -4576,6 +4584,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp apply_allowed_operator_wait_action(state, wait, action, opts) do
+    case guard_merge_approval(state, wait, action) do
+      :ok -> persist_allowed_operator_wait_action(state, wait, action, opts)
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp persist_allowed_operator_wait_action(state, wait, action, opts) do
     transition = if action == "reject", do: "wait_rejected", else: "resume_queued"
     next_attempt = max(wait.attempt + 1, 1)
 
@@ -4586,6 +4601,10 @@ defmodule SymphonyElixir.Orchestrator do
       |> maybe_put_resumed_attempt(action, next_attempt)
       |> maybe_put_operator_command_context(Keyword.get(opts, :operator_comment), action)
 
+    persist_operator_wait_action(state, wait, action, next_attempt, event)
+  end
+
+  defp persist_operator_wait_action(state, wait, action, next_attempt, event) do
     case append_run_event(state, event) do
       :ok when action == "reject" ->
         {:ok, %{wait: wait, action: action, resumed: false}, state}
@@ -4605,6 +4624,36 @@ defmodule SymphonyElixir.Orchestrator do
         {:error, {:ledger_write_failed, reason}, state}
     end
   end
+
+  defp guard_merge_approval(
+         %State{
+           run_ledger_path: run_ledger_path,
+           runner_generation: runner_generation,
+           operator_commands: %OperatorCommandState{workflow_generation: workflow_generation}
+         },
+         %{reason: "waiting_owner", tracker_state: tracker_state} = wait,
+         "approve"
+       ) do
+    if OperatorWait.human_review_state?(tracker_state) do
+      if is_binary(run_ledger_path) and is_binary(runner_generation) and
+           is_binary(workflow_generation) do
+        run_ledger_path
+        |> MergeLane.default_path()
+        |> MergeLane.guard_runner_approval(
+          wait.issue_id,
+          wait.wait_id,
+          runner_generation,
+          workflow_generation
+        )
+      else
+        {:error, :runner_merge_identity_unavailable}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp guard_merge_approval(_state, _wait, _action), do: :ok
 
   defp maybe_put_resumed_attempt(event, "reject", _next_attempt), do: event
   defp maybe_put_resumed_attempt(event, _action, next_attempt), do: Map.put(event, :attempt, next_attempt)

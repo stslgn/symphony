@@ -80,6 +80,13 @@ defmodule SymphonyElixir.OperatorWait do
 
   def action_allowed?(_wait, _action), do: false
 
+  @spec human_review_state?(term()) :: boolean()
+  def human_review_state?(state) when is_binary(state) do
+    state |> String.trim() |> String.downcase() == "human review"
+  end
+
+  def human_review_state?(_state), do: false
+
   @spec reason_for_tracker_state(term()) :: String.t() | nil
   def reason_for_tracker_state(state) when is_binary(state) do
     case state |> String.trim() |> String.downcase() do
