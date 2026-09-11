@@ -28,6 +28,7 @@ defmodule SymphonyElixir.RunLedger do
     "run_parked" => ["parked"],
     "run_stopped" => ["released"],
     "retry_scheduled" => ["retry_queued"],
+    "retry_parked" => ["parked"],
     "wait_resumed" => ["parked", "resume_queued"],
     "resume_queued" => ["resume_queued"],
     "wait_rejected" => ["parked"],
@@ -124,6 +125,12 @@ defmodule SymphonyElixir.RunLedger do
       required_strings: ~w(stage run_id issue_id issue_identifier),
       required_attempt: true,
       required_next_attempt: true
+    },
+    "retry_parked" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason),
+      required_attempt: true,
+      typed_wait: true,
+      optional_operator_context: true
     },
     "wait_resumed" => %{
       required_strings: ~w(stage run_id issue_id issue_identifier wait_id parked_reason),
@@ -492,8 +499,8 @@ defmodule SymphonyElixir.RunLedger do
 
   defp unfinished_run?({_run_id, state}), do: state.started and not state.terminal
 
-  defp update_parked_state(%{"transition" => "run_parked", "issue_id" => issue_id} = event, acc)
-       when is_binary(issue_id) do
+  defp update_parked_state(%{"transition" => transition, "issue_id" => issue_id} = event, acc)
+       when transition in ["run_parked", "retry_parked"] and is_binary(issue_id) do
     Map.put(acc, issue_id, event)
   end
 
@@ -521,7 +528,7 @@ defmodule SymphonyElixir.RunLedger do
          %{"transition" => transition, "issue_id" => issue_id},
          acc
        )
-       when transition in ["run_claimed", "run_started", "run_parked", "wait_released"] and
+       when transition in ["run_claimed", "run_started", "run_parked", "retry_parked", "wait_released"] and
               is_binary(issue_id) do
     Map.delete(acc, issue_id)
   end
@@ -574,7 +581,7 @@ defmodule SymphonyElixir.RunLedger do
          %{"transition" => transition, "issue_id" => issue_id},
          acc
        )
-       when transition in ["run_claimed", "run_started", "run_parked", "wait_released"] and
+       when transition in ["run_claimed", "run_started", "run_parked", "retry_parked", "wait_released"] and
               is_binary(issue_id) do
     Map.delete(acc, issue_id)
   end
@@ -784,7 +791,7 @@ defmodule SymphonyElixir.RunLedger do
          } = event,
          pending
        )
-       when transition in ["run_parked", "resume_queued", "wait_rejected"] and
+       when transition in ["run_parked", "retry_parked", "resume_queued", "wait_rejected"] and
               is_binary(comment_id) and is_binary(created_at) and
               is_binary(operator_command) do
     Map.put(pending, comment_id, event)
@@ -1056,7 +1063,7 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp validate_terminal_reason(%{"transition" => transition} = event)
-       when transition in ["run_parked", "wait_resumed", "resume_queued", "wait_rejected", "wait_released"] do
+       when transition in ["run_parked", "retry_parked", "wait_resumed", "resume_queued", "wait_rejected", "wait_released"] do
     case event["terminal_reason"] do
       nil -> :ok
       reason -> if MapSet.member?(@park_terminal_reasons, reason), do: :ok, else: {:error, {:invalid_field, "terminal_reason"}}
@@ -1390,6 +1397,18 @@ defmodule SymphonyElixir.RunLedger do
          :ok <- validate_retry_affinity(run, event),
          {:ok, run} <- record_retry_event(run, event) do
       {:ok, put_run(state, event["run_id"], run)}
+    end
+  end
+
+  defp validate_ordered_event(%{"transition" => "retry_parked"} = event, state) do
+    with :ok <- validate_retry_dispatch(event, state.dispatches),
+         :ok <- ensure_wait_available(state.waits, event) do
+      wait = wait_identity(event)
+
+      state
+      |> Map.update!(:dispatches, &Map.delete(&1, event["issue_id"]))
+      |> Map.update!(:waits, &Map.put(&1, event["issue_id"], wait))
+      |> maybe_record_operator_action_context(event)
     end
   end
 
@@ -1883,6 +1902,24 @@ defmodule SymphonyElixir.RunLedger do
             identity_value_matches?(dispatch.workspace_root, event["workspace_root"])
 
         if fields_match?, do: :ok, else: {:error, :dispatch_identity_mismatch}
+    end
+  end
+
+  defp validate_retry_dispatch(event, dispatches) do
+    case Map.get(dispatches, event["issue_id"]) do
+      nil ->
+        {:error, :missing_retry_dispatch}
+
+      dispatch ->
+        fields_match? =
+          dispatch.attempt == event["attempt"] and
+            dispatch.issue_identifier == event["issue_identifier"] and
+            dispatch.previous_run_id == event["run_id"] and
+            identity_value_matches?(dispatch.worker_host, event["worker_host"]) and
+            identity_value_matches?(dispatch.workspace_path, event["workspace_path"]) and
+            identity_value_matches?(dispatch.workspace_root, event["workspace_root"])
+
+        if fields_match?, do: :ok, else: {:error, :retry_dispatch_identity_mismatch}
     end
   end
 

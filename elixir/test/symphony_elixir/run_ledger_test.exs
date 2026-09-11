@@ -698,6 +698,89 @@ defmodule SymphonyElixir.RunLedgerTest do
     assert next_recovery.parked == %{}
   end
 
+  test "queued retry can be durably parked without creating a synthetic run" do
+    path = ledger_path()
+    run_id = "run-retry-stop"
+    issue_id = "issue-retry-stop"
+    identifier = "DUD-RETRY-STOP"
+    workspace_root = "/tmp/workspaces"
+    workspace = Path.join(workspace_root, identifier)
+
+    assert :ok = append_claim!(path, run_id, issue_id, identifier, 1)
+    assert :ok = append_started!(path, run_id, issue_id, identifier, 1)
+
+    terminal = %{
+      run_id: run_id,
+      issue_id: issue_id,
+      issue_identifier: identifier,
+      attempt: 1,
+      worker_host: nil,
+      workspace_path: workspace,
+      workspace_root: workspace_root,
+      next_action: "retry",
+      next_attempt: 2
+    }
+
+    assert :ok =
+             RunLedger.append(
+               path,
+               Map.merge(terminal, %{
+                 transition: "run_failed",
+                 stage: "released",
+                 terminal_reason: "worker_exit"
+               })
+             )
+
+    assert :ok =
+             RunLedger.append(
+               path,
+               Map.merge(terminal, %{transition: "retry_scheduled", stage: "retry_queued"})
+             )
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "retry_parked",
+               stage: "parked",
+               run_id: run_id,
+               issue_id: issue_id,
+               issue_identifier: identifier,
+               attempt: 2,
+               wait_id: "wait-retry-stop",
+               parked_reason: "operator_stopped",
+               allowed_actions: ["retry", "reject"],
+               terminal_reason: "operator_stop",
+               workspace_path: workspace,
+               workspace_root: workspace_root
+             })
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(path, "runner-after-retry-stop")
+    assert recovery.parked[issue_id]["wait_id"] == "wait-retry-stop"
+    assert recovery.parked[issue_id]["attempt"] == 2
+    assert recovery.recovered_dispatches == %{}
+    assert recovery.recovered_attempts == %{}
+  end
+
+  test "queued retry park requires the exact durable dispatch identity" do
+    path = ledger_path()
+
+    assert :ok =
+             RunLedger.append(path, %{
+               transition: "retry_parked",
+               stage: "parked",
+               run_id: "missing-run",
+               issue_id: "missing-issue",
+               issue_identifier: "DUD-MISSING",
+               attempt: 2,
+               wait_id: "wait-missing-retry",
+               parked_reason: "operator_stopped",
+               allowed_actions: ["retry", "reject"],
+               terminal_reason: "operator_stop"
+             })
+
+    assert {:error, {:invalid_ledger_record, 1, {:invalid_transition_sequence, "retry_parked", :missing_retry_dispatch}}} =
+             RunLedger.read_events(path)
+  end
+
   test "accepts and restores a token telemetry integrity park" do
     path = ledger_path()
     run_id = "run-token-integrity"

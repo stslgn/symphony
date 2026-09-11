@@ -4739,6 +4739,74 @@ defmodule SymphonyElixir.CoreTest do
     assert Enum.count(events, &(&1["transition"] == "operator_command_applied")) == 1
   end
 
+  test "Linear stop command durably parks a queued retry and preserves its workspace" do
+    {state, issue, ledger_path, workspace_root} = pending_dispatch_fixture("operator-stop")
+    workspace = Path.join(workspace_root, issue.identifier)
+    sentinel = Path.join(workspace, "preserved-user-work")
+    File.mkdir_p!(workspace)
+    File.write!(sentinel, "keep\n")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_operator_user_ids: ["operator-1"],
+      workspace_root: workspace_root
+    )
+
+    cursor_at = DateTime.utc_now()
+
+    comment = %SymphonyElixir.Linear.Comment{
+      id: "comment-stop-queued-retry",
+      body: "$stop",
+      created_at: DateTime.add(cursor_at, 1, :second),
+      author_id: "operator-1"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue.id => [comment]})
+
+    retry = state.retry_attempts[issue.id]
+    timer_ref = Process.send_after(self(), {:retry_issue, issue.id, retry.retry_token}, 60_000)
+
+    state = %{
+      state
+      | dispatch_paused: true,
+        retry_attempts: %{issue.id => %{retry | timer_ref: timer_ref}},
+        operator_comment_cursors: %{
+          issue.id => %{created_at: cursor_at, comment_ids: MapSet.new()}
+        }
+    }
+
+    stopped_state = Orchestrator.run_poll_cycle_for_test(state, Tracker.current_poll_context())
+
+    refute Map.has_key?(stopped_state.retry_attempts, issue.id)
+    refute MapSet.member?(stopped_state.claimed, issue.id)
+    assert stopped_state.parked[issue.id].reason == "operator_stopped"
+    assert stopped_state.parked[issue.id].attempt == 2
+    assert Process.read_timer(timer_ref) == false
+
+    assert {:ok, events} = RunLedger.read_events(ledger_path)
+    assert Enum.count(events, &(&1["transition"] == "retry_parked")) == 1
+    assert Enum.count(events, &(&1["transition"] == "operator_command_applied")) == 1
+    refute Enum.any?(events, &String.starts_with?(&1["transition"], "workspace_cleanup_"))
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(ledger_path, "runner-after-stop")
+    assert recovery.parked[issue.id]["parked_reason"] == "operator_stopped"
+    assert recovery.recovered_dispatches == %{}
+
+    terminal_state =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %{issue | state: "Done"},
+        stopped_state
+      )
+
+    assert terminal_state.parked[issue.id].reason == "operator_stopped"
+    assert File.read!(sentinel) == "keep\n"
+    refute Map.has_key?(terminal_state.cleanup_pending, issue.id)
+
+    if is_reference(terminal_state.tick_timer_ref),
+      do: Process.cancel_timer(terminal_state.tick_timer_ref)
+  end
+
   test "select_worker_host_for_test skips full ssh hosts under the shared per-host cap" do
     write_workflow_file!(Workflow.workflow_file_path(),
       worker_ssh_hosts: ["worker-a", "worker-b"],

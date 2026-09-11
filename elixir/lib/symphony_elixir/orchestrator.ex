@@ -1265,7 +1265,15 @@ defmodule SymphonyElixir.Orchestrator do
     do: Logger.error("Failed to fetch from tracker: #{inspect(reason)}")
 
   defp reconcile_parked_issue(%Issue{} = issue, %State{} = state) do
+    wait = Map.get(state.parked, issue.id)
+
     cond do
+      is_map(wait) and Map.get(wait, :reason) == "operator_stopped" ->
+        update_in(state.parked[issue.id], fn
+          nil -> nil
+          parked_wait -> %{parked_wait | tracker_state: issue.state, identifier: issue.identifier}
+        end)
+
       terminal_issue_state?(issue.state, terminal_state_set()) ->
         release_terminal_parked_issue(state, issue.id)
 
@@ -2816,14 +2824,11 @@ defmodule SymphonyElixir.Orchestrator do
 
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
-        Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; cleaning recorded workspace")
+        Logger.info(
+          "Issue state is terminal while retry is pending: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; preserving recorded workspace and bounded dispatch visibility"
+        )
 
-        cleanup_metadata =
-          metadata
-          |> Map.put(:identifier, issue.identifier)
-          |> Map.put(:issue_id, issue_id)
-
-        {:noreply, request_workspace_cleanup(state, issue_id, cleanup_metadata, "tracker_terminal")}
+        {:noreply, defer_pending_dispatch(state, issue_id, :retry_issue_terminal)}
 
       retry_candidate_issue?(issue, active_states, terminal_states) ->
         handle_active_retry(
@@ -4642,6 +4647,7 @@ defmodule SymphonyElixir.Orchestrator do
     |> Map.keys()
     |> Enum.concat(Map.keys(state.parked))
     |> Enum.concat(Map.keys(state.cleanup_pending))
+    |> Enum.concat(Map.keys(state.retry_attempts))
     |> MapSet.new()
   end
 
@@ -4801,13 +4807,7 @@ defmodule SymphonyElixir.Orchestrator do
         end
 
       _running ->
-        record_operator_command_outcome(
-          state,
-          issue_id,
-          comment,
-          "stop",
-          "operator_command_rejected"
-        )
+        apply_operator_retry_stop(state, issue_id, comment)
     end
   end
 
@@ -4841,6 +4841,69 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_operator_comment(state, issue_id, comment, action) do
     apply_operator_wait_comment(state, issue_id, comment, action)
+  end
+
+  defp apply_operator_retry_stop(state, issue_id, comment) do
+    updated_state = park_retry_attempt(state, issue_id, comment)
+
+    if Map.has_key?(updated_state.parked, issue_id) do
+      record_operator_command_outcome(
+        updated_state,
+        issue_id,
+        comment,
+        "stop",
+        "operator_command_applied"
+      )
+    else
+      record_operator_command_outcome(
+        state,
+        issue_id,
+        comment,
+        "stop",
+        "operator_command_rejected"
+      )
+    end
+  end
+
+  defp park_retry_attempt(%State{} = state, issue_id, comment) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{previous_run_id: run_id, identifier: identifier} = retry
+      when is_binary(run_id) and is_binary(identifier) ->
+        with {:ok, wait} <-
+               OperatorWait.new("operator_stopped", %{
+                 issue_id: issue_id,
+                 identifier: identifier,
+                 run_id: run_id,
+                 attempt: retry.attempt,
+                 terminal_reason: "operator_stop",
+                 worker_host: Map.get(retry, :worker_host),
+                 workspace_path: Map.get(retry, :workspace_path),
+                 workspace_root: Map.get(retry, :workspace_root)
+               }),
+             park_event =
+               wait
+               |> operator_wait_event("retry_parked")
+               |> maybe_put_operator_command_context(comment, "stop"),
+             :ok <- append_run_event(state, park_event) do
+          if is_reference(retry.timer_ref), do: Process.cancel_timer(retry.timer_ref)
+
+          Logger.info("Queued retry parked for operator action: issue_id=#{issue_id} issue_identifier=#{identifier} reason=operator_stopped wait_id=#{wait.wait_id}")
+
+          %{
+            state
+            | parked: Map.put(state.parked, issue_id, wait),
+              claimed: MapSet.delete(state.claimed, issue_id),
+              retry_attempts: Map.delete(state.retry_attempts, issue_id)
+          }
+        else
+          {:error, error} ->
+            Logger.error("Failed to durably park queued retry issue_id=#{issue_id}: #{inspect(error)}")
+            state
+        end
+
+      _retry ->
+        state
+    end
   end
 
   defp apply_operator_wait_comment(state, issue_id, comment, action) do
