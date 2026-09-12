@@ -1202,7 +1202,8 @@ defmodule SymphonyElixir.CoreTest do
 
     assert Enum.any?(events, fn event ->
              event["transition"] == "wait_released" and
-               event["release_reason"] == "tracker_terminal_preserved"
+               event["release_reason"] == "tracker_terminal_preserved" and
+               event["tracker_state"] == "Closed"
            end)
 
     refute Enum.any?(events, &String.starts_with?(&1["transition"], "workspace_cleanup_"))

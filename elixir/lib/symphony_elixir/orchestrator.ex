@@ -1276,7 +1276,9 @@ defmodule SymphonyElixir.Orchestrator do
 
       terminal_issue_state?(issue.state, terminal_state_set()) ->
         if preserve_terminal_parked_issue?(issue.id) do
-          release_parked_issue(state, issue.id, "tracker_terminal_preserved")
+          state
+          |> update_in([Access.key(:parked), issue.id], &Map.put(&1, :tracker_state, issue.state))
+          |> release_parked_issue(issue.id, "tracker_terminal_preserved")
         else
           release_terminal_parked_issue(state, issue.id)
         end
