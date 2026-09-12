@@ -29,6 +29,13 @@ Symphony stops the active agent for that issue and requests cleanup of its exact
 recorded workspace. Human/operator wait states win over a conflicting legacy
 `terminal_states` entry and never request cleanup.
 
+An owner may set `workspace.preserve_terminal_parked_issue_ids` to exact Linear
+issue UUIDs when an accepted parked issue must enter a terminal tracker state
+without even a temporary quarantine rename. The runner durably records
+`wait_released` with `tracker_terminal_preserved` and retains the workspace;
+it does not create a cleanup request. This exception is empty by default and
+does not apply to running or other parked issues.
+
 Automatic terminal cleanup is Git-durability-gated. The workspace must have no
 modified, staged, or non-ignored untracked files,
 `workspace.durability_remote_url` must be set, and
@@ -168,6 +175,7 @@ tracker:
 workspace:
   root: ~/code/workspaces
   durability_remote_url: git@github.com:your-org/your-repo.git
+  preserve_terminal_parked_issue_ids: []
 hooks:
   after_create: |
     git clone git@github.com:your-org/your-repo.git .

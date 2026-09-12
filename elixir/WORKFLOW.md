@@ -21,6 +21,7 @@ polling:
 workspace:
   root: ~/code/symphony-workspaces
   durability_remote_url: https://github.com/openai/symphony.git
+  preserve_terminal_parked_issue_ids: []
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .

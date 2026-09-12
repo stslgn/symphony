@@ -1172,6 +1172,51 @@ defmodule SymphonyElixir.CoreTest do
     assert Enum.any?(events, &(&1["transition"] == "workspace_cleanup_completed"))
   end
 
+  test "allowlisted terminal parked issue releases durably without cleanup I/O" do
+    issue_id = "64db41c4-417a-4a72-a6ac-95057507f5d1"
+    root = parked_workspace_root("terminal-preserved")
+    workspace = Path.join(root, "DUD-154")
+    remote_url = install_durable_local_workspace!(workspace, %{"keep-me" => "accepted"})
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: root,
+      workspace_durability_remote_url: remote_url,
+      workspace_preserve_terminal_parked_issue_ids: [issue_id]
+    )
+
+    {state, _wait} =
+      parked_reconcile_state("terminal-preserved", workspace, root, nil, issue_id, "run_budget_exhausted")
+
+    reconciled =
+      Orchestrator.reconcile_parked_issue_for_test(
+        %Issue{id: issue_id, identifier: "DUD-154", state: "Closed"},
+        state
+      )
+
+    assert File.read!(Path.join(workspace, "keep-me")) == "accepted"
+    refute File.exists?(workspace <> ".symphony-cleanup")
+    refute Map.has_key?(reconciled.parked, issue_id)
+    refute Map.has_key?(reconciled.cleanup_pending, issue_id)
+
+    assert {:ok, events} = RunLedger.read_events(state.run_ledger_path)
+
+    assert Enum.any?(events, fn event ->
+             event["transition"] == "wait_released" and
+               event["release_reason"] == "tracker_terminal_preserved"
+           end)
+
+    refute Enum.any?(events, &String.starts_with?(&1["transition"], "workspace_cleanup_"))
+
+    assert {:ok, recovery} = RunLedger.reconcile_startup(state.run_ledger_path, "runner-after-preserve")
+    refute Map.has_key?(recovery.cleanup_pending, issue_id)
+    assert File.read!(Path.join(workspace, "keep-me")) == "accepted"
+
+    assert {:ok, restarted} = Orchestrator.init(run_ledger_path: state.run_ledger_path)
+    if is_reference(restarted.tick_timer_ref), do: Process.cancel_timer(restarted.tick_timer_ref)
+    refute Map.has_key?(restarted.cleanup_pending, issue_id)
+    assert File.read!(Path.join(workspace, "keep-me")) == "accepted"
+  end
+
   test "restored human clarification wait survives a legacy terminal-state overlap" do
     root = parked_workspace_root("human-clarification-overlap")
     workspace = Path.join(root, "DUD-152")
@@ -6852,8 +6897,15 @@ defmodule SymphonyElixir.CoreTest do
     }
   end
 
-  defp parked_reconcile_state(tag, workspace_path, workspace_root, worker_host) do
-    issue_id = "issue-parked-#{tag}"
+  defp parked_reconcile_state(
+         tag,
+         workspace_path,
+         workspace_root,
+         worker_host,
+         explicit_issue_id \\ nil,
+         reason \\ "waiting_owner"
+       ) do
+    issue_id = explicit_issue_id || "issue-parked-#{tag}"
 
     wait = %{
       issue_id: issue_id,
@@ -6861,11 +6913,11 @@ defmodule SymphonyElixir.CoreTest do
       attempt: 2,
       identifier: "MT-PARKED-#{String.upcase(tag)}",
       wait_id: "wait-parked-#{tag}",
-      reason: "waiting_owner",
-      allowed_actions: ["approve", "reject"],
+      reason: reason,
+      allowed_actions: SymphonyElixir.OperatorWait.allowed_actions(reason),
       stage: "parked",
-      tracker_state: "Human Review",
-      terminal_reason: nil,
+      tracker_state: if(reason == "run_budget_exhausted", do: "Agent Running", else: "Human Review"),
+      terminal_reason: if(reason == "run_budget_exhausted", do: "token_budget_exhausted"),
       worker_host: worker_host,
       workspace_path: workspace_path,
       workspace_root: workspace_root,

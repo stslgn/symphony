@@ -60,7 +60,7 @@ defmodule SymphonyElixir.RunLedger do
       ]),
     "workspace_cleanup_requested" => MapSet.new(["tracker_terminal"])
   }
-  @release_reasons MapSet.new(["tracker_terminal", "worker_route_removed"])
+  @release_reasons MapSet.new(["tracker_terminal", "tracker_terminal_preserved", "worker_route_removed"])
   @park_terminal_reasons MapSet.new([
                            "operator_stop",
                            "time_budget_exhausted",

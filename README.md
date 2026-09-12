@@ -28,6 +28,10 @@ operator recovery. Repository-controlled executable Git features such as
 `core.fsmonitor` are disabled during the proof. Production cleanup accepts only
 credential-free network Git remotes; mutable path and `file://` remotes are
 rejected.
+An owner-approved exact Linear issue UUID in
+`workspace.preserve_terminal_parked_issue_ids` instead releases an already
+parked terminal wait with `tracker_terminal_preserved`, without a cleanup
+request or quarantine rename. Running and other parked issues are unaffected.
 Cleanup I/O runs in one supervised deadline-limited task, so a stalled Git
 transport cannot block status or operator controls, and stable preservation
 failures are not retried on every poll.
