@@ -150,14 +150,33 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
       field(:durability_remote_url, :string)
+      field(:preserve_terminal_parked_issue_ids, {:array, :string}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root, :durability_remote_url], empty_values: [])
+      |> cast(attrs, [:root, :durability_remote_url, :preserve_terminal_parked_issue_ids], empty_values: [])
       |> validate_change(:durability_remote_url, &validate_durability_remote_url/2)
+      |> validate_change(:preserve_terminal_parked_issue_ids, fn field, issue_ids ->
+        if valid_preserved_issue_ids?(issue_ids) do
+          []
+        else
+          [{field, "must contain unique canonical lowercase Linear issue UUIDs"}]
+        end
+      end)
       |> validate_durability_remote_boundary()
+    end
+
+    defp valid_preserved_issue_ids?(issue_ids) do
+      Enum.uniq(issue_ids) == issue_ids and Enum.all?(issue_ids, &canonical_uuid?/1)
+    end
+
+    defp canonical_uuid?(issue_id) do
+      case Ecto.UUID.cast(issue_id) do
+        {:ok, ^issue_id} -> true
+        _other -> false
+      end
     end
 
     defp validate_durability_remote_url(field, value) do

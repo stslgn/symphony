@@ -1275,7 +1275,13 @@ defmodule SymphonyElixir.Orchestrator do
         end)
 
       terminal_issue_state?(issue.state, terminal_state_set()) ->
-        release_terminal_parked_issue(state, issue.id)
+        if preserve_terminal_parked_issue?(issue.id) do
+          state
+          |> update_in([Access.key(:parked), issue.id], &Map.put(&1, :tracker_state, issue.state))
+          |> release_parked_issue(issue.id, "tracker_terminal_preserved")
+        else
+          release_terminal_parked_issue(state, issue.id)
+        end
 
       !issue_routable_to_worker?(issue) ->
         release_parked_issue(state, issue.id, "worker_route_removed")
@@ -1666,6 +1672,10 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, state} ->
         state
     end
+  end
+
+  defp preserve_terminal_parked_issue?(issue_id) when is_binary(issue_id) do
+    issue_id in Config.settings!().workspace.preserve_terminal_parked_issue_ids
   end
 
   defp release_parked_issue(%State{} = state, issue_id, release_reason) do

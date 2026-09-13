@@ -482,6 +482,11 @@ Fields:
   - Absolute paths, relative paths, and `file://` URLs MUST be rejected outside
     test-only fixtures because a same-host source cannot provide an immutable
     durability boundary.
+- `preserve_terminal_parked_issue_ids` (unique Linear issue UUIDs, default `[]`)
+  - An explicit owner-scoped exception for an already parked issue. When that
+    exact issue enters a terminal tracker state, the runner durably releases
+    its wait as `tracker_terminal_preserved` without requesting cleanup I/O or
+    quarantining its workspace. Running and other parked issues are unaffected.
 
 #### 5.3.4 `hooks` (object)
 
@@ -1037,8 +1042,10 @@ Part B: Tracker state refresh
   - If tracker state is still active: update the in-memory issue snapshot.
   - If tracker state is any other non-active/non-terminal state: terminate worker without workspace
     cleanup.
-- Refresh parked issue states separately. Terminal or unrouted issues release their wait; all other
-  parked issues remain ineligible until explicitly resumed.
+- Refresh parked issue states separately. Exact allowlisted terminal parked
+  issues release without cleanup; other terminal issues use durability-gated
+  cleanup. Unrouted issues release without cleanup. All other parked issues
+  remain ineligible until explicitly resumed.
 - If state refresh fails, keep workers running and try again on the next tick.
 
 ### 8.6 Operator Commands and Global Dispatch Pause
