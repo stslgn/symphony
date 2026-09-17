@@ -393,11 +393,17 @@ webhook delivery.
 
 ### Operator commands and global pause
 
-For running or parked issues, Symphony recognizes this bounded vocabulary only when it appears at
+For running, parked, or queued-retry issues (including retries restored after restart),
+Symphony recognizes this bounded vocabulary only when it appears at
 the start of a native Linear issue comment authored by a configured `tracker.operator_user_ids`
 actor:
 
-- `$stop` durably parks an active run as `operator_stopped` and preserves its workspace.
+- `$stop` durably parks an active run or queued retry as `operator_stopped` and preserves its
+  workspace, including when the tracker issue is terminal. Recovered retries are polled for
+  commands even when dispatch is paused. The exact run, attempt, and workspace affinity must
+  match; conflicting live/recovered entries or a competing queued resume fail closed. Only a
+  successful `retry_parked` ledger append retires the retry and recovery entries and cancels any
+  live retry timer. A failed append retains the queue and workspace; no worker or cleanup is started.
 - `$retry` resolves a matching wait that allows retry, or explicitly authorizes
   one new attempt for an operator-required workspace cleanup.
 - `$approve`, `$approved`, or a standalone `👍` resolves a matching wait that allows approval.
@@ -412,7 +418,7 @@ If the configured operator authority changes after startup, comment command reco
 closed until the runner restarts with the new generation. Poll completion rechecks the generation
 before applying fetched comments.
 
-When an existing parked wait has no operator cursor during the first upgrade to this feature,
+When an existing parked wait or recovered retry has no operator cursor during the first upgrade to this feature,
 Symphony initializes the cursor at upgrade time. Historical comments are not executed retroactively;
 only comments created after that migration boundary can act as operator commands.
 

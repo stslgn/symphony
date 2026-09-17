@@ -4648,6 +4648,7 @@ defmodule SymphonyElixir.Orchestrator do
     |> Enum.concat(Map.keys(state.parked))
     |> Enum.concat(Map.keys(state.cleanup_pending))
     |> Enum.concat(Map.keys(state.retry_attempts))
+    |> Enum.concat(Map.keys(state.recovered_dispatches))
     |> MapSet.new()
   end
 
@@ -4866,7 +4867,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp park_retry_attempt(%State{} = state, issue_id, comment) do
-    case Map.get(state.retry_attempts, issue_id) do
+    case operator_stop_retry(state, issue_id) do
       %{previous_run_id: run_id, identifier: identifier} = retry
       when is_binary(run_id) and is_binary(identifier) ->
         with {:ok, wait} <-
@@ -4885,7 +4886,7 @@ defmodule SymphonyElixir.Orchestrator do
                |> operator_wait_event("retry_parked")
                |> maybe_put_operator_command_context(comment, "stop"),
              :ok <- append_run_event(state, park_event) do
-          if is_reference(retry.timer_ref), do: Process.cancel_timer(retry.timer_ref)
+          cancel_retry_timer(Map.get(retry, :timer_ref))
 
           Logger.info("Queued retry parked for operator action: issue_id=#{issue_id} issue_identifier=#{identifier} reason=operator_stopped wait_id=#{wait.wait_id}")
 
@@ -4893,7 +4894,9 @@ defmodule SymphonyElixir.Orchestrator do
             state
             | parked: Map.put(state.parked, issue_id, wait),
               claimed: MapSet.delete(state.claimed, issue_id),
-              retry_attempts: Map.delete(state.retry_attempts, issue_id)
+              retry_attempts: Map.delete(state.retry_attempts, issue_id),
+              recovered_dispatches: Map.delete(state.recovered_dispatches, issue_id),
+              recovered_attempts: Map.delete(state.recovered_attempts, issue_id)
           }
         else
           {:error, error} ->
@@ -4904,6 +4907,36 @@ defmodule SymphonyElixir.Orchestrator do
       _retry ->
         state
     end
+  end
+
+  defp operator_stop_retry(state, issue_id) do
+    retry = Map.get(state.retry_attempts, issue_id)
+    recovered = Map.get(state.recovered_dispatches, issue_id)
+
+    # Resume authorization is a separate lifecycle; never partially consume it.
+    case {Map.has_key?(state.queued_resumes, issue_id), retry, recovered} do
+      {true, _, _} ->
+        nil
+
+      {false, nil, recovered} ->
+        recovered
+
+      {false, retry, nil} ->
+        retry
+
+      {false, retry, recovered} ->
+        if retry_dispatch_identity(retry) == retry_dispatch_identity(recovered), do: retry
+    end
+  end
+
+  defp cancel_retry_timer(timer_ref) when is_reference(timer_ref), do: Process.cancel_timer(timer_ref)
+  defp cancel_retry_timer(_timer_ref), do: false
+
+  defp retry_dispatch_identity(dispatch) do
+    Enum.map(
+      [:previous_run_id, :identifier, :attempt, :worker_host, :workspace_path, :workspace_root],
+      &Map.get(dispatch, &1)
+    )
   end
 
   defp apply_operator_wait_comment(state, issue_id, comment, action) do
