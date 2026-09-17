@@ -129,6 +129,9 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
 
     issue = issue("issue-scenario-wake", "SCN-1")
 
+    # Worker startup may legitimately exceed the generic 2s snapshot wait on CI.
+    # Exercise that boundary on both dispatch and resume, without weakening any
+    # state/ledger assertions or extending production timeouts.
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       tracker_active_states: ["Agent Ready", "Agent Running"],
@@ -137,7 +140,8 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
       max_concurrent_agents: 1,
       max_turns: 1,
       codex_command: "#{fake.binary} app-server",
-      prompt: "Attempt={{ run.attempt }} Run={{ run.id }}"
+      prompt: "Attempt={{ run.attempt }} Run={{ run.id }}",
+      hook_before_run: "sleep 3"
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
@@ -166,9 +170,11 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
                Orchestrator.set_dispatch_paused(harness.name, false)
 
       snapshot =
-        ScenarioHarness.await_snapshot(harness, fn snapshot ->
-          length(snapshot.parked) == 1
-        end)
+        ScenarioHarness.await_snapshot(
+          harness,
+          fn snapshot -> length(snapshot.parked) == 1 end,
+          10_000
+        )
 
       assert snapshot.running == []
       assert snapshot.retrying == []
@@ -199,12 +205,16 @@ defmodule SymphonyElixir.ScenarioHarnessTest do
                Orchestrator.resolve_wait(harness.name, issue.id, wait.wait_id, "retry")
 
       resumed_snapshot =
-        ScenarioHarness.await_snapshot(harness, fn snapshot ->
-          case snapshot.parked do
-            [%{run_id: run_id, attempt: 1}] when run_id != first_run_id -> true
-            _other -> false
-          end
-        end)
+        ScenarioHarness.await_snapshot(
+          harness,
+          fn snapshot ->
+            case snapshot.parked do
+              [%{run_id: run_id, attempt: 1}] when run_id != first_run_id -> true
+              _other -> false
+            end
+          end,
+          10_000
+        )
 
       assert [%{run_id: resumed_run_id, attempt: 1}] = resumed_snapshot.parked
       refute resumed_run_id == first_run_id

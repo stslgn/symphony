@@ -430,6 +430,54 @@ When an existing parked wait or recovered retry has no operator cursor during th
 Symphony initializes the cursor at upgrade time. Historical comments are not executed retroactively;
 only comments created after that migration boundary can act as operator commands.
 
+### Offline cursor adoption planning
+
+`SymphonyElixir.OperatorCursorMigration.prepare/2` is a read-only library helper,
+not a CLI, startup hook, or live migration writer. It accepts a ledger path and an
+expected SHA-256, last `runner_generation`, exact set of recovered `issue_ids`, and
+UTC ISO-8601 `boundary` strictly later than their existing cursors. Missing cursors,
+unfinished runs, mismatched identities, and malformed ledgers fail closed.
+The caller must independently establish a stopped generation and choose the
+boundary after all historical comments to be excluded; no Linear access occurs.
+
+The plan binds the original byte prefix, file identity, queues, waits, outcomes,
+cursors, and intended `operator_cursor_initialized` events. These contain no
+fabricated comment ID or owner command. `remaining/2` returns only the unappended
+portion of an exact batch, including after a whole-event partial application;
+a completed batch returns an empty list. Unexpected appends, changed prefix,
+truncated records, replacement files and mutated plans are rejected without repair.
+The plan digest detects accidental drift; it is not an authorization signature.
+
+`SymphonyElixir.OperatorCursorApply.request/2` builds a read-only request from the
+plan and exact workflow path. Its digest also binds workflow bytes and filesystem
+identities. `apply/2` accepts that request and the separately owner-approved request
+digest. The caller is responsible for recording real approval; a digest alone is
+not authentication. This is an offline library API, not a startup hook or HTTP route.
+
+The macOS adapter accepts only the managed `logs/log/run-ledger.jsonl` layout,
+private owned state directories and a single-link private ledger. It creates the
+same `start-controller.lock` directory used by managed start, with private owner
+metadata binding PID, process start and request digest. Existing locks (even dead
+owners) are never stolen. Fresh process snapshots, PID-file checks, workflow and
+ledger checks run before appends. Both lock and owner inodes are pinned. Events
+use `RunLedger.append/2`; exact-prefix validation runs after application. Success
+removes only the adapter's validated owner file and empty lock directory.
+
+Any error after lock acquisition, append failure, or task/process crash retains
+the lock and ledger for explicit recovery. Complete-event partial batches can be
+resumed after separately authorized lock recovery. Partial JSON records are never
+truncated, repaired or reset. Repetition after success is a no-op, but still requires
+the stopped-project guard. No workspace, command, image or attestation is removed.
+
+This is a cooperative single-user managed-controller protocol: all starts and
+ledger writers must obey the controller lock. It cannot fence malicious same-user
+or privileged writers bypassing it. Such access must be excluded by the operational
+single-writer window, not assumed away by a hash check. Deployment, live application
+and subsequent preflight/start remain separate owner gates. Tests mutate synthetic
+fixtures only; no ad-hoc append loop is an approved alternative.
+
+### Dispatch pause
+
 Global dispatch control is available locally through `GET /api/v1/pause` and
 `POST /api/v1/pause` with `{"paused": true}` or `{"paused": false}`. These endpoints accept only
 loopback callers. Pause is durable across restart and blocks new candidate and retry dispatch while

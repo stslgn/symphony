@@ -3,6 +3,49 @@ defmodule SymphonyElixir.RecoveredOperatorStopTest do
 
   alias SymphonyElixir.{Linear.Comment, RunLedger}
 
+  test "explicit adoption boundary excludes history across restarts and admits only fresh owner stop" do
+    {state, issue, original_ledger, workspace} = restored_retry_fixture()
+    state_dir = Path.join(Path.dirname(original_ledger), "managed-adoption")
+    File.mkdir_p!(Path.join(state_dir, "logs/log"))
+    {:ok, state_dir} = SymphonyElixir.PathSafety.canonicalize(state_dir)
+    for dir <- [state_dir, Path.join(state_dir, "logs"), Path.join(state_dir, "logs/log")], do: File.chmod!(dir, 0o700)
+    ledger = Path.join(state_dir, "logs/log/run-ledger.jsonl")
+    File.cp!(original_ledger, ledger)
+    File.chmod!(ledger, 0o600)
+    bytes = File.read!(ledger)
+    before_status = System.cmd("git", ["status", "--porcelain"], cd: workspace)
+    boundary = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+
+    expected = %{
+      sha256: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower),
+      runner_generation: state.runner_generation,
+      issue_ids: [issue.id],
+      boundary: DateTime.to_iso8601(boundary)
+    }
+
+    assert {:ok, plan} = SymphonyElixir.OperatorCursorMigration.prepare(ledger, expected)
+    {:ok, workflow} = SymphonyElixir.PathSafety.canonicalize(Workflow.workflow_file_path())
+    assert {:ok, request} = SymphonyElixir.OperatorCursorApply.request(plan, workflow)
+    assert {:ok, %{appended: 1}} = SymphonyElixir.OperatorCursorApply.apply(request, request.sha256)
+    assert String.starts_with?(File.read!(ledger), bytes)
+    historical = stop_comment("historical-before-adoption", DateTime.add(boundary, -1, :second))
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue.id => [historical]})
+    first = start_state(ledger) |> poll()
+    second = start_state(ledger) |> poll()
+    assert first.recovered_dispatches == state.recovered_dispatches
+    assert second.recovered_dispatches == state.recovered_dispatches
+    assert second.parked == %{}
+    assert second.operator_comment_cursors[issue.id].created_at == boundary
+
+    fresh = stop_comment("fresh-after-adoption", DateTime.add(boundary, 1, :second))
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue.id => [historical, fresh]})
+    assert poll(second).parked[issue.id].reason == "operator_stopped"
+    assert start_state(ledger).parked[issue.id].reason == "operator_stopped"
+    assert System.cmd("git", ["status", "--porcelain"], cd: workspace) == before_status
+    assert {:ok, recorded} = RunLedger.read_events(ledger)
+    assert Enum.filter(recorded, &(&1["transition"] == "operator_command_applied")) |> Enum.map(& &1["comment_id"]) == [fresh.id]
+  end
+
   test "fresh owner stop parks a restored retry across two startups without touching user work" do
     {state, issue, ledger, workspace} = restored_retry_fixture()
     before_status = System.cmd("git", ["status", "--porcelain"], cd: workspace)
