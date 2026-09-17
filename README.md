@@ -53,6 +53,10 @@ completion.
 The Elixir implementation also supports durable operator commands and a global
 dispatch pause so operators can stop or resume work without losing restart
 reconciliation or bypassing normal eligibility checks.
+Fresh allowlisted operator stop commands also cover retries recovered from the
+durable ledger after restart. Stopping them persists a parked wait before
+retiring the queue entry, preserves the workspace, and never implies cleanup
+or permission to replay historical comments.
 
 At worker startup it discovers the authenticated Codex model catalog from the
 live app-server, records the model and reasoning effort actually selected for

@@ -1065,14 +1065,17 @@ Operator comment input is untrusted. Implementations that support comment comman
 - never persist or log the raw comment body; and
 - process comments in stable creation-time/id order from a durable per-issue cursor.
 
-When upgrading an existing ledger that contains parked waits but no operator cursors, the
+When upgrading an existing ledger that contains parked waits or recovered retries but no operator cursors, the
 implementation MUST initialize each missing cursor at upgrade/runtime observation time. It MUST NOT
 execute historical comments retroactively.
 
 The bounded vocabulary is:
 
 - `$stop`: durably park a matching active run as `operator_stopped`, terminate its worker, and
-  preserve its workspace;
+  preserve its workspace; for a queued retry, including one recovered after restart, persist
+  `retry_parked` before retiring the exact queue identity and cancelling any live timer.
+  Conflicting live/recovered identities or a competing queued resume MUST remain unchanged.
+  This action MUST NOT start a worker, change the tracker state, or authorize workspace cleanup;
 - `$retry`: resolve only a parked wait whose allowed actions contain `retry`;
 - `$approve` or `$approved`: resolve only a parked wait whose allowed actions contain `approve`;
 - standalone thumbs-up: equivalent to approve; and
@@ -2553,6 +2556,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Human Clarification, Human Review, Deploy Ready, and Blocked remain typed
   waits even when a legacy `terminal_states` list overlaps them
 - `$stop` parks a matching active run with `operator_stopped` and preserves its workspace
+- Fresh owner `$stop` parks a recovered retry while dispatch is paused, survives a second
+  restart, preserves dirty/untracked files and terminal tracker state, and rejects identity conflicts
 - Parked issues are excluded from dispatch until a matching wait is resumed
 - Unresolved waits are restored from the run ledger after restart
 - Native operator comments accept only the bounded approve/retry/reject/stop vocabulary
