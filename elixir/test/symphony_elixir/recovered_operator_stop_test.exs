@@ -4,7 +4,14 @@ defmodule SymphonyElixir.RecoveredOperatorStopTest do
   alias SymphonyElixir.{Linear.Comment, RunLedger}
 
   test "explicit adoption boundary excludes history across restarts and admits only fresh owner stop" do
-    {state, issue, ledger, workspace} = restored_retry_fixture()
+    {state, issue, original_ledger, workspace} = restored_retry_fixture()
+    state_dir = Path.join(Path.dirname(original_ledger), "managed-adoption")
+    File.mkdir_p!(Path.join(state_dir, "logs/log"))
+    {:ok, state_dir} = SymphonyElixir.PathSafety.canonicalize(state_dir)
+    for dir <- [state_dir, Path.join(state_dir, "logs"), Path.join(state_dir, "logs/log")], do: File.chmod!(dir, 0o700)
+    ledger = Path.join(state_dir, "logs/log/run-ledger.jsonl")
+    File.cp!(original_ledger, ledger)
+    File.chmod!(ledger, 0o600)
     bytes = File.read!(ledger)
     before_status = System.cmd("git", ["status", "--porcelain"], cd: workspace)
     boundary = DateTime.utc_now() |> DateTime.truncate(:millisecond)
@@ -17,10 +24,9 @@ defmodule SymphonyElixir.RecoveredOperatorStopTest do
     }
 
     assert {:ok, plan} = SymphonyElixir.OperatorCursorMigration.prepare(ledger, expected)
-    assert {:ok, events} = SymphonyElixir.OperatorCursorMigration.remaining(ledger, plan)
-    # Test-only application using the existing validated durable append primitive.
-    # There is deliberately no production apply entrypoint in the planner.
-    Enum.each(events, fn event -> assert :ok = RunLedger.append(ledger, event) end)
+    {:ok, workflow} = SymphonyElixir.PathSafety.canonicalize(Workflow.workflow_file_path())
+    assert {:ok, request} = SymphonyElixir.OperatorCursorApply.request(plan, workflow)
+    assert {:ok, %{appended: 1}} = SymphonyElixir.OperatorCursorApply.apply(request, request.sha256)
     assert String.starts_with?(File.read!(ledger), bytes)
     historical = stop_comment("historical-before-adoption", DateTime.add(boundary, -1, :second))
     Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue.id => [historical]})

@@ -440,13 +440,33 @@ a completed batch returns an empty list. Unexpected appends, changed prefix,
 truncated records, replacement files and mutated plans are rejected without repair.
 The plan digest detects accidental drift; it is not an authorization signature.
 
-There is **no production apply adapter**. Read-only rechecks cannot exclude a
-writer after the check. A reviewed managed adapter must hold the start-controller
-lock, establish exclusive ledger ownership and stopped-process identity, bind
-explicit approval to the exact plan, append through `RunLedger.append/2`, recheck
-between events and verify projection invariants before permitting startup. A
-partial JSON record must park for manual recovery, never be truncated or reset.
-Tests apply only to synthetic ledgers. Do not run an ad-hoc loop on a live ledger.
+`SymphonyElixir.OperatorCursorApply.request/2` builds a read-only request from the
+plan and exact workflow path. Its digest also binds workflow bytes and filesystem
+identities. `apply/2` accepts that request and the separately owner-approved request
+digest. The caller is responsible for recording real approval; a digest alone is
+not authentication. This is an offline library API, not a startup hook or HTTP route.
+
+The macOS adapter accepts only the managed `logs/log/run-ledger.jsonl` layout,
+private owned state directories and a single-link private ledger. It creates the
+same `start-controller.lock` directory used by managed start, with private owner
+metadata binding PID, process start and request digest. Existing locks (even dead
+owners) are never stolen. Fresh process snapshots, PID-file checks, workflow and
+ledger checks run before appends. Both lock and owner inodes are pinned. Events
+use `RunLedger.append/2`; exact-prefix validation runs after application. Success
+removes only the adapter's validated owner file and empty lock directory.
+
+Any error after lock acquisition, append failure, or task/process crash retains
+the lock and ledger for explicit recovery. Complete-event partial batches can be
+resumed after separately authorized lock recovery. Partial JSON records are never
+truncated, repaired or reset. Repetition after success is a no-op, but still requires
+the stopped-project guard. No workspace, command, image or attestation is removed.
+
+This is a cooperative single-user managed-controller protocol: all starts and
+ledger writers must obey the controller lock. It cannot fence malicious same-user
+or privileged writers bypassing it. Such access must be excluded by the operational
+single-writer window, not assumed away by a hash check. Deployment, live application
+and subsequent preflight/start remain separate owner gates. Tests mutate synthetic
+fixtures only; no ad-hoc append loop is an approved alternative.
 
 ### Dispatch pause
 

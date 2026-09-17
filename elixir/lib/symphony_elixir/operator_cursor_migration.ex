@@ -3,9 +3,10 @@ defmodule SymphonyElixir.OperatorCursorMigration do
   Read-only preparation of additive operator-cursor adoption evidence.
 
   This module never appends events or starts a runner. Its output is NOT a write
-  authorization or a concurrency lock. A future managed apply adapter must hold
-  the project start-controller lock, prove the runner stopped, and revalidate the
-  approved plan before every durable append. No such adapter is installed here.
+  authorization or a concurrency lock. OperatorCursorApply provides a separately
+  invoked adapter that holds the project start-controller lock, checks stopped
+  process identity and revalidates the approved request before durable appends.
+  Neither module is called automatically by runtime startup.
   """
 
   alias SymphonyElixir.RunLedger
