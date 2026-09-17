@@ -71,6 +71,11 @@ authority.
 
 ## Running Symphony
 
+The Elixir implementation includes a read-only operator-cursor adoption planner.
+It prepares additive boundary evidence and detects ledger drift; it does not
+authorize or apply a live migration, replay commands, or start a runner. See the
+[adoption boundary contract](elixir/README.md#offline-cursor-adoption-planning).
+
 ### Requirements
 
 Symphony works best in codebases that have adopted

@@ -3,6 +3,43 @@ defmodule SymphonyElixir.RecoveredOperatorStopTest do
 
   alias SymphonyElixir.{Linear.Comment, RunLedger}
 
+  test "explicit adoption boundary excludes history across restarts and admits only fresh owner stop" do
+    {state, issue, ledger, workspace} = restored_retry_fixture()
+    bytes = File.read!(ledger)
+    before_status = System.cmd("git", ["status", "--porcelain"], cd: workspace)
+    boundary = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+
+    expected = %{
+      sha256: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower),
+      runner_generation: state.runner_generation,
+      issue_ids: [issue.id],
+      boundary: DateTime.to_iso8601(boundary)
+    }
+
+    assert {:ok, plan} = SymphonyElixir.OperatorCursorMigration.prepare(ledger, expected)
+    assert {:ok, events} = SymphonyElixir.OperatorCursorMigration.remaining(ledger, plan)
+    # Test-only application using the existing validated durable append primitive.
+    # There is deliberately no production apply entrypoint in the planner.
+    Enum.each(events, fn event -> assert :ok = RunLedger.append(ledger, event) end)
+    assert String.starts_with?(File.read!(ledger), bytes)
+    historical = stop_comment("historical-before-adoption", DateTime.add(boundary, -1, :second))
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue.id => [historical]})
+    first = start_state(ledger) |> poll()
+    second = start_state(ledger) |> poll()
+    assert first.recovered_dispatches == state.recovered_dispatches
+    assert second.recovered_dispatches == state.recovered_dispatches
+    assert second.parked == %{}
+    assert second.operator_comment_cursors[issue.id].created_at == boundary
+
+    fresh = stop_comment("fresh-after-adoption", DateTime.add(boundary, 1, :second))
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue.id => [historical, fresh]})
+    assert poll(second).parked[issue.id].reason == "operator_stopped"
+    assert start_state(ledger).parked[issue.id].reason == "operator_stopped"
+    assert System.cmd("git", ["status", "--porcelain"], cd: workspace) == before_status
+    assert {:ok, recorded} = RunLedger.read_events(ledger)
+    assert Enum.filter(recorded, &(&1["transition"] == "operator_command_applied")) |> Enum.map(& &1["comment_id"]) == [fresh.id]
+  end
+
   test "fresh owner stop parks a restored retry across two startups without touching user work" do
     {state, issue, ledger, workspace} = restored_retry_fixture()
     before_status = System.cmd("git", ["status", "--porcelain"], cd: workspace)

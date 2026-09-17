@@ -422,6 +422,34 @@ When an existing parked wait or recovered retry has no operator cursor during th
 Symphony initializes the cursor at upgrade time. Historical comments are not executed retroactively;
 only comments created after that migration boundary can act as operator commands.
 
+### Offline cursor adoption planning
+
+`SymphonyElixir.OperatorCursorMigration.prepare/2` is a read-only library helper,
+not a CLI, startup hook, or live migration writer. It accepts a ledger path and an
+expected SHA-256, last `runner_generation`, exact set of recovered `issue_ids`, and
+UTC ISO-8601 `boundary` strictly later than their existing cursors. Missing cursors,
+unfinished runs, mismatched identities, and malformed ledgers fail closed.
+The caller must independently establish a stopped generation and choose the
+boundary after all historical comments to be excluded; no Linear access occurs.
+
+The plan binds the original byte prefix, file identity, queues, waits, outcomes,
+cursors, and intended `operator_cursor_initialized` events. These contain no
+fabricated comment ID or owner command. `remaining/2` returns only the unappended
+portion of an exact batch, including after a whole-event partial application;
+a completed batch returns an empty list. Unexpected appends, changed prefix,
+truncated records, replacement files and mutated plans are rejected without repair.
+The plan digest detects accidental drift; it is not an authorization signature.
+
+There is **no production apply adapter**. Read-only rechecks cannot exclude a
+writer after the check. A reviewed managed adapter must hold the start-controller
+lock, establish exclusive ledger ownership and stopped-process identity, bind
+explicit approval to the exact plan, append through `RunLedger.append/2`, recheck
+between events and verify projection invariants before permitting startup. A
+partial JSON record must park for manual recovery, never be truncated or reset.
+Tests apply only to synthetic ledgers. Do not run an ad-hoc loop on a live ledger.
+
+### Dispatch pause
+
 Global dispatch control is available locally through `GET /api/v1/pause` and
 `POST /api/v1/pause` with `{"paused": true}` or `{"paused": false}`. These endpoints accept only
 loopback callers. Pause is durable across restart and blocks new candidate and retry dispatch while
