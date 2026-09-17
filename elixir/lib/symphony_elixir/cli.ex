@@ -3,7 +3,7 @@ defmodule SymphonyElixir.CLI do
   Escript entrypoint for running Symphony with an explicit WORKFLOW.md path.
   """
 
-  alias SymphonyElixir.{LogFile, MergeLaneCLI, RuntimeIdentity}
+  alias SymphonyElixir.{LogFile, MergeLaneCLI, RuntimeIdentity, Workflow}
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
   @startup_protocol "3"
@@ -37,6 +37,13 @@ defmodule SymphonyElixir.CLI do
     end
   end
 
+  def main(["--managed-workflow-identity", workflow_path, expected_project_slug]) do
+    case managed_workflow_identity(workflow_path, expected_project_slug) do
+      {:ok, operator_user_ids} -> Enum.each(operator_user_ids, &IO.puts/1)
+      {:error, reason} -> halt_managed_workflow_identity(reason)
+    end
+  end
+
   def main(["merge-lane" | args]) do
     case admit_runtime_identity() do
       :ok -> run_merge_lane(args)
@@ -53,6 +60,36 @@ defmodule SymphonyElixir.CLI do
 
   @spec startup_protocol() :: String.t()
   def startup_protocol, do: @startup_protocol
+
+  @doc false
+  @spec managed_workflow_identity(Path.t(), String.t()) ::
+          {:ok, [String.t()]} | {:error, term()}
+  def managed_workflow_identity(workflow_path, expected_project_slug)
+      when is_binary(workflow_path) and is_binary(expected_project_slug) do
+    with {:ok, %{config: config}} <- Workflow.load(workflow_path),
+         tracker when is_map(tracker) <- Map.get(config, "tracker"),
+         :ok <- validate_managed_tracker(tracker, expected_project_slug),
+         operator_user_ids when is_list(operator_user_ids) <-
+           Map.get(tracker, "operator_user_ids", []),
+         true <- Enum.all?(operator_user_ids, &is_binary/1) do
+      {:ok, operator_user_ids}
+    else
+      {:error, reason} ->
+        {:error, reason}
+
+      nil ->
+        {:error, :tracker_must_be_a_map}
+
+      tracker when not is_map(tracker) ->
+        {:error, :tracker_must_be_a_map}
+
+      operator_user_ids when not is_list(operator_user_ids) ->
+        {:error, :operator_user_ids_must_be_a_list}
+
+      false ->
+        {:error, :operator_user_ids_must_contain_only_strings}
+    end
+  end
 
   @spec start_runtime([String.t()]) :: no_return()
   defp start_runtime(args) do
@@ -79,6 +116,35 @@ defmodule SymphonyElixir.CLI do
     end
   end
 
+  defp validate_managed_tracker(tracker, expected_project_slug) do
+    endpoint = Map.get(tracker, "endpoint", "https://api.linear.app/graphql")
+    webhook_secret = Map.get(tracker, "webhook_secret")
+    assignee = Map.get(tracker, "assignee")
+
+    cond do
+      Map.get(tracker, "kind") != "linear" ->
+        {:error, :tracker_kind_must_be_linear}
+
+      Map.get(tracker, "api_key") != "$LINEAR_API_KEY" ->
+        {:error, :tracker_api_key_must_use_linear_api_key_env}
+
+      webhook_secret not in [nil, "$LINEAR_WEBHOOK_SECRET"] ->
+        {:error, :tracker_webhook_secret_must_use_linear_webhook_secret_env}
+
+      is_binary(assignee) and String.starts_with?(assignee, "$") ->
+        {:error, :managed_tracker_assignee_must_not_use_ambient_env}
+
+      endpoint != "https://api.linear.app/graphql" ->
+        {:error, :tracker_endpoint_must_be_linear_graphql}
+
+      Map.get(tracker, "project_slug") != expected_project_slug ->
+        {:error, :tracker_project_slug_mismatch}
+
+      true ->
+        :ok
+    end
+  end
+
   defp run_merge_lane(args) do
     request_json = IO.read(:stdio, :eof)
 
@@ -97,6 +163,11 @@ defmodule SymphonyElixir.CLI do
   defp halt_runtime_identity(reason) do
     IO.puts(:stderr, "runtime_identity_unavailable: #{inspect(reason)}")
     System.halt(78)
+  end
+
+  defp halt_managed_workflow_identity(reason) do
+    IO.puts(:stderr, "managed_workflow_identity_unavailable: #{inspect(reason)}")
+    System.halt(65)
   end
 
   @spec evaluate([String.t()], deps()) :: :ok | {:error, String.t()}
