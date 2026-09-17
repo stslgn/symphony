@@ -19,6 +19,60 @@ defmodule SymphonyElixir.CLITest do
              ~r/\Aimage_sha256=[0-9a-f]{64}\nexecution_sha256=[0-9a-f]{64}\n\z/
   end
 
+  test "reports managed workflow operator ids without starting the application" do
+    workflow_path =
+      Path.join(System.tmp_dir!(), "symphony-managed-workflow-#{System.unique_integer([:positive])}.md")
+
+    on_exit(fn -> File.rm(workflow_path) end)
+
+    File.write!(workflow_path, """
+    ---
+    tracker:
+      kind: linear
+      api_key: $LINEAR_API_KEY
+      project_slug: test-project
+      operator_user_ids:
+        - 11111111-1111-1111-1111-111111111111
+    ---
+    ## Symphony Runtime Prompt
+    Test prompt.
+    """)
+
+    assert {:ok, ["11111111-1111-1111-1111-111111111111"]} =
+             CLI.managed_workflow_identity(workflow_path, "test-project")
+
+    assert capture_io(fn ->
+             assert :ok =
+                      CLI.main([
+                        "--managed-workflow-identity",
+                        workflow_path,
+                        "test-project"
+                      ])
+           end) == "11111111-1111-1111-1111-111111111111\n"
+  end
+
+  test "managed workflow identity rejects tracker authority drift" do
+    workflow_path =
+      Path.join(System.tmp_dir!(), "symphony-managed-workflow-#{System.unique_integer([:positive])}.md")
+
+    on_exit(fn -> File.rm(workflow_path) end)
+
+    File.write!(workflow_path, """
+    ---
+    tracker:
+      kind: linear
+      api_key: $OTHER_TOKEN
+      project_slug: test-project
+      operator_user_ids: []
+    ---
+    ## Symphony Runtime Prompt
+    Test prompt.
+    """)
+
+    assert {:error, :tracker_api_key_must_use_linear_api_key_env} =
+             CLI.managed_workflow_identity(workflow_path, "test-project")
+  end
+
   test "returns the guardrails acknowledgement banner when the flag is missing" do
     parent = self()
 
