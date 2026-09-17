@@ -144,19 +144,16 @@ defmodule SymphonyElixir.OperatorCursorApplyTest do
     assert File.read!(path) == before
   end
 
-  test "an actual append permission failure retains the lock and every prior byte" do
+  test "an actual append failure retains the lock and every prior byte" do
     {path, workflow, plan} = fixture()
     {:ok, request} = OperatorCursorApply.request(plan, workflow)
     before = File.read!(path)
-    assert {_, 0} = System.cmd("/usr/bin/chflags", ["uchg", path])
-
-    try do
-      assert {:error, {:workspace_preservation_required, _, _}} = OperatorCursorApply.apply(request, request.sha256)
-      assert File.read!(path) == before
-      assert File.dir?(Path.join(request.state_dir, "start-controller.lock"))
-    after
-      assert {_, 0} = System.cmd("/usr/bin/chflags", ["nouchg", path])
-    end
+    assert_append_failure(request, :os.type())
+    assert File.read!(path) == before
+    lock = Path.join(request.state_dir, "start-controller.lock")
+    assert File.dir?(lock)
+    assert File.read!(Path.join(lock, "owner")) =~ "plan_sha256=#{request.sha256}\n"
+    assert {:ok, [_]} = OperatorCursorMigration.remaining(path, plan)
   end
 
   test "replacing the lock owner inode with identical content still stops the writer" do
@@ -173,6 +170,55 @@ defmodule SymphonyElixir.OperatorCursorApplyTest do
     assert File.read!(owner) == bytes
     assert File.read!(owner <> ".preserved") == bytes
     assert {:ok, _} = OperatorCursorMigration.remaining(path, plan)
+  end
+
+  # macOS does not enforce RLIMIT_FSIZE on this append path. Both platforms
+  # exercise a real filesystem failure, without changing the required 0600 mode.
+  defp assert_append_failure(request, {:unix, :darwin}) do
+    path = request.plan.path
+    assert {_, 0} = System.cmd("/usr/bin/chflags", ["uchg", path])
+
+    try do
+      assert {:error, {:workspace_preservation_required, {:error, :eperm}, _}} =
+               OperatorCursorApply.apply(request, request.sha256)
+    after
+      assert {_, 0} = System.cmd("/usr/bin/chflags", ["nouchg", path])
+    end
+  end
+
+  defp assert_append_failure(request, {:unix, :linux}) do
+    before = File.read!(request.plan.path)
+    assert byte_size(before) > 1024
+    request_path = Path.join(request.state_dir, "synthetic-request.etf")
+    File.write!(request_path, :erlang.term_to_binary(request))
+    File.chmod!(request_path, 0o600)
+
+    # Limit only the child: the existing ledger exceeds either shell block size
+    # (512/1024 bytes), while the newly created lock owner fits below the limit.
+    # Ignoring SIGXFSZ lets the real write return EFBIG instead of killing the VM.
+    code = """
+    request = System.argv() |> hd() |> File.read!() |> :erlang.binary_to_term()
+    {:error, {:workspace_preservation_required, {:error, :efbig}, lock}} =
+      SymphonyElixir.OperatorCursorApply.apply(request, request.sha256)
+    true = lock == Path.join(request.state_dir, "start-controller.lock")
+    IO.puts("append_failed_with_efbig")
+    """
+
+    assert {"append_failed_with_efbig\n", 0} =
+             System.cmd("/bin/sh", [
+               "-c",
+               "trap '' XFSZ; ulimit -f 1 || exit 1; exec \"$@\"",
+               "cursor-append-limit",
+               System.find_executable("elixir"),
+               "--erl",
+               "+S 2:2",
+               "-pa",
+               Path.expand("_build/test/lib/*/ebin"),
+               "-e",
+               code,
+               "--",
+               request_path
+             ])
   end
 
   defp await_file(_, 0), do: flunk("controller lock was not published")
