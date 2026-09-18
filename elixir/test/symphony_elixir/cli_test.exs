@@ -74,7 +74,7 @@ defmodule SymphonyElixir.CLITest do
              CLI.managed_workflow_identity(workflow_path, "test-project")
   end
 
-  test "managed workflow identity rejects ambient assignee fallback" do
+  test "managed workflow identity accepts an omitted assignee independently of ambient state" do
     previous_assignee = System.get_env("LINEAR_ASSIGNEE")
     System.put_env("LINEAR_ASSIGNEE", "ambient-assignee")
 
@@ -88,7 +88,7 @@ defmodule SymphonyElixir.CLITest do
 
     workflow_path = write_managed_workflow("operator_user_ids: []", nil)
 
-    assert {:error, :managed_tracker_assignee_must_not_use_ambient_env} =
+    assert {:ok, []} =
              CLI.managed_workflow_identity(workflow_path, "test-project")
   end
 

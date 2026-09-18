@@ -407,6 +407,27 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.settings!().tracker.assignee == env_assignee
   end
 
+  test "managed runtime does not inherit LINEAR_ASSIGNEE" do
+    previous_linear_assignee = System.get_env("LINEAR_ASSIGNEE")
+    previous_managed_project = System.get_env("SYMPHONY_MANAGED_PROJECT")
+
+    on_exit(fn ->
+      restore_env("LINEAR_ASSIGNEE", previous_linear_assignee)
+      restore_env("SYMPHONY_MANAGED_PROJECT", previous_managed_project)
+    end)
+
+    System.put_env("LINEAR_ASSIGNEE", "ambient@example.com")
+    System.put_env("SYMPHONY_MANAGED_PROJECT", "managed-project")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_assignee: nil,
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server"
+    )
+
+    assert Config.settings!().tracker.assignee == nil
+  end
+
   test "workflow file path defaults to WORKFLOW.md in the current working directory when app env is unset" do
     original_workflow_path = Workflow.workflow_file_path()
 

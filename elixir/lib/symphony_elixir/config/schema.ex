@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Config.Schema do
   alias SymphonyElixir.PathSafety
 
   @primary_key false
+  @managed_project_env "SYMPHONY_MANAGED_PROJECT"
 
   @type t :: %__MODULE__{}
 
@@ -681,7 +682,7 @@ defmodule SymphonyElixir.Config.Schema do
             settings.tracker.webhook_secret,
             System.get_env("LINEAR_WEBHOOK_SECRET")
           ),
-        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+        assignee: resolve_secret_setting(settings.tracker.assignee, tracker_assignee_fallback())
     }
 
     workspace = %{
@@ -706,6 +707,12 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_keys(value) when is_list(value), do: Enum.map(value, &normalize_keys/1)
   defp normalize_keys(value), do: value
+
+  defp tracker_assignee_fallback do
+    if System.get_env(@managed_project_env) in [nil, ""] do
+      System.get_env("LINEAR_ASSIGNEE")
+    end
+  end
 
   defp normalize_optional_map(nil), do: nil
   defp normalize_optional_map(value) when is_map(value), do: normalize_keys(value)

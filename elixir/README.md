@@ -315,8 +315,9 @@ Notes:
   `bin/symphony --managed-workflow-identity <workflow-path> <project-slug>` in a clean environment.
   This side-effect-free probe validates the fixed Linear endpoint, environment-backed credential
   selectors, explicit project scope, non-ambient assignee routing, and UUID-shaped operator IDs,
-  then prints one operator ID per line. Invalid managed authority exits with status 65 before the
-  application starts.
+  then prints one operator ID per line. Managed runtime mode never falls back to
+  `LINEAR_ASSIGNEE`; the workflow may either declare a literal assignee or omit assignee routing.
+  Invalid managed authority exits with status 65 before the application starts.
   It also compares the workflow value with its single initial
   snapshot and measures the named image bytes. With `SYMPHONY_MANAGED_PROJECT`,
   `SYMPHONY_STARTUP_ATTESTATION_PATH` and

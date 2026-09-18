@@ -124,13 +124,7 @@ defmodule SymphonyElixir.CLI do
   defp validate_managed_webhook_secret(_secret),
     do: {:error, :tracker_webhook_secret_must_use_linear_webhook_secret_env}
 
-  defp validate_managed_assignee(nil) do
-    if System.get_env("LINEAR_ASSIGNEE") in [nil, ""] do
-      :ok
-    else
-      {:error, :managed_tracker_assignee_must_not_use_ambient_env}
-    end
-  end
+  defp validate_managed_assignee(nil), do: :ok
 
   defp validate_managed_assignee(assignee) when is_binary(assignee) do
     if String.starts_with?(assignee, "$") do
