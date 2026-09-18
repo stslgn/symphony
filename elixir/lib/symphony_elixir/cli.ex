@@ -61,9 +61,8 @@ defmodule SymphonyElixir.CLI do
       when is_binary(workflow_path) and is_binary(expected_project_slug) do
     with {:ok, %{config: config}} <- Workflow.load(workflow_path),
          {:ok, tracker} <- managed_tracker(config),
-         :ok <- validate_managed_tracker(tracker, expected_project_slug),
-         {:ok, operator_user_ids} <- validate_managed_operator_user_ids(tracker) do
-      {:ok, operator_user_ids}
+         :ok <- validate_managed_tracker(tracker, expected_project_slug) do
+      validate_managed_operator_user_ids(tracker)
     end
   end
 
@@ -101,39 +100,58 @@ defmodule SymphonyElixir.CLI do
 
   defp validate_managed_tracker(tracker, expected_project_slug) do
     endpoint = Map.get(tracker, "endpoint", "https://api.linear.app/graphql")
-    webhook_secret = Map.get(tracker, "webhook_secret")
-    assignee = Map.get(tracker, "assignee")
-    ambient_assignee = System.get_env("LINEAR_ASSIGNEE")
 
-    cond do
-      Map.get(tracker, "kind") != "linear" ->
-        {:error, :tracker_kind_must_be_linear}
-
-      Map.get(tracker, "api_key") != "$LINEAR_API_KEY" ->
-        {:error, :tracker_api_key_must_use_linear_api_key_env}
-
-      webhook_secret not in [nil, "$LINEAR_WEBHOOK_SECRET"] ->
-        {:error, :tracker_webhook_secret_must_use_linear_webhook_secret_env}
-
-      not is_nil(assignee) and not is_binary(assignee) ->
-        {:error, :managed_tracker_assignee_must_be_a_string}
-
-      is_binary(assignee) and String.starts_with?(assignee, "$") ->
-        {:error, :managed_tracker_assignee_must_not_use_ambient_env}
-
-      is_nil(assignee) and ambient_assignee not in [nil, ""] ->
-        {:error, :managed_tracker_assignee_must_not_use_ambient_env}
-
-      endpoint != "https://api.linear.app/graphql" ->
-        {:error, :tracker_endpoint_must_be_linear_graphql}
-
-      Map.get(tracker, "project_slug") != expected_project_slug ->
-        {:error, :tracker_project_slug_mismatch}
-
-      true ->
-        :ok
+    with :ok <- validate_managed_tracker_kind(Map.get(tracker, "kind")),
+         :ok <- validate_managed_api_key(Map.get(tracker, "api_key")),
+         :ok <- validate_managed_webhook_secret(Map.get(tracker, "webhook_secret")),
+         :ok <- validate_managed_assignee(Map.get(tracker, "assignee")),
+         :ok <- validate_managed_endpoint(endpoint) do
+      validate_managed_project_slug(Map.get(tracker, "project_slug"), expected_project_slug)
     end
   end
+
+  defp validate_managed_tracker_kind("linear"), do: :ok
+  defp validate_managed_tracker_kind(_kind), do: {:error, :tracker_kind_must_be_linear}
+
+  defp validate_managed_api_key("$LINEAR_API_KEY"), do: :ok
+
+  defp validate_managed_api_key(_api_key),
+    do: {:error, :tracker_api_key_must_use_linear_api_key_env}
+
+  defp validate_managed_webhook_secret(secret) when secret in [nil, "$LINEAR_WEBHOOK_SECRET"],
+    do: :ok
+
+  defp validate_managed_webhook_secret(_secret),
+    do: {:error, :tracker_webhook_secret_must_use_linear_webhook_secret_env}
+
+  defp validate_managed_assignee(nil) do
+    if System.get_env("LINEAR_ASSIGNEE") in [nil, ""] do
+      :ok
+    else
+      {:error, :managed_tracker_assignee_must_not_use_ambient_env}
+    end
+  end
+
+  defp validate_managed_assignee(assignee) when is_binary(assignee) do
+    if String.starts_with?(assignee, "$") do
+      {:error, :managed_tracker_assignee_must_not_use_ambient_env}
+    else
+      :ok
+    end
+  end
+
+  defp validate_managed_assignee(_assignee),
+    do: {:error, :managed_tracker_assignee_must_be_a_string}
+
+  defp validate_managed_endpoint("https://api.linear.app/graphql"), do: :ok
+
+  defp validate_managed_endpoint(_endpoint),
+    do: {:error, :tracker_endpoint_must_be_linear_graphql}
+
+  defp validate_managed_project_slug(expected_project_slug, expected_project_slug), do: :ok
+
+  defp validate_managed_project_slug(_actual_project_slug, _expected_project_slug),
+    do: {:error, :tracker_project_slug_mismatch}
 
   defp validate_managed_operator_user_ids(tracker) do
     case Map.get(tracker, "operator_user_ids", []) do
@@ -164,6 +182,7 @@ defmodule SymphonyElixir.CLI do
     System.halt(78)
   end
 
+  @spec halt_managed_workflow_identity(term()) :: no_return()
   defp halt_managed_workflow_identity(reason) do
     IO.puts(:stderr, "managed_workflow_identity_unavailable: #{inspect(reason)}")
     System.halt(65)
