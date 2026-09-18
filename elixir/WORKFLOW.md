@@ -36,7 +36,7 @@ agent:
   max_run_uncached_input_tokens:
   max_run_seconds: 7200
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
+  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.6-terra"' --config model_reasoning_effort=medium app-server
   approval_policy: never
   thread_sandbox: workspace-write
   dynamic_tool_allowlist:
