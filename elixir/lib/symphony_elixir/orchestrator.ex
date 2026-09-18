@@ -718,6 +718,7 @@ defmodule SymphonyElixir.Orchestrator do
       admission_ids: Map.keys(tracker_admissions(state)),
       parked_ids: Map.keys(state.parked),
       retry_issue_ids: retry_issue_ids,
+      retry_reconciliation: retry_retirement_candidates(state),
       comment_requests: operator_comment_requests(state, operator_user_ids),
       operator_user_ids: operator_user_ids,
       dispatch_paused: state.dispatch_paused,
@@ -798,6 +799,7 @@ defmodule SymphonyElixir.Orchestrator do
       running: fetch_issue_states(request.running_ids, tracker_context),
       admissions: fetch_issue_states(Map.get(request, :admission_ids, []), tracker_context),
       parked: fetch_issue_states(request.parked_ids, tracker_context),
+      retry_states: fetch_issue_states(Map.keys(Map.get(request, :retry_reconciliation, %{})), tracker_context),
       comments: fetch_operator_comments(request.comment_requests, tracker_context),
       dispatch: fetch_dispatch_candidates(request.dispatch_paused, tracker_context)
     }
@@ -861,6 +863,8 @@ defmodule SymphonyElixir.Orchestrator do
       state
     else
       effective_operator_user_ids = operator_user_ids(state)
+      retry_states = Map.get(result, :retry_states)
+      dispatch = exclude_parked_retry_candidates(Map.get(result, :dispatch), retry_states, request)
 
       state
       |> apply_tracker_admission_poll_result(
@@ -878,11 +882,102 @@ defmodule SymphonyElixir.Orchestrator do
         effective_operator_user_ids,
         Map.get(result, :comments, %{})
       )
-      |> apply_dispatch_poll_result(request, Map.get(result, :dispatch))
+      |> reconcile_parked_retries(request, retry_states)
+      |> apply_dispatch_poll_result(request, dispatch)
     end
   end
 
   defp apply_poll_result(%State{} = state, _invalid_result), do: state
+
+  # Bind the read to one pending dispatch. An in-flight poll may not retire a
+  # replacement attempt, running worker, typed wait, resume or cleanup owner.
+  defp retry_retirement_candidates(%State{dispatch_paused: true}), do: %{}
+
+  defp retry_retirement_candidates(state) do
+    due = Map.filter(state.retry_attempts, fn {_id, retry} -> retry.status == :dispatching end)
+
+    state.recovered_dispatches
+    |> Map.merge(due)
+    |> Map.reject(fn {id, _} ->
+      Enum.any?([state.running, state.parked, state.queued_resumes, state.cleanup_pending], &Map.has_key?(&1, id))
+    end)
+    |> Map.new(fn {id, retry} ->
+      {id, Map.take(retry, [:previous_run_id, :previous_attempt, :attempt, :identifier, :worker_host, :workspace_path, :workspace_root])}
+    end)
+  end
+
+  defp verified_parked_retry?(%Issue{} = issue, context) do
+    not is_nil(OperatorWait.reason_for_tracker_state(issue.state)) and
+      not MapSet.member?(active_state_set(context.active_states), normalize_issue_state(issue.state))
+  end
+
+  defp exclude_parked_retry_candidates({:ok, candidates}, {:ok, issues}, request) do
+    ids = Map.get(request, :retry_reconciliation, %{})
+    parked_ids = for issue <- issues, Map.has_key?(ids, issue.id), verified_parked_retry?(issue, request.tracker_context), do: issue.id
+    {:ok, Enum.reject(candidates, &(&1.id in parked_ids))}
+  end
+
+  defp exclude_parked_retry_candidates(dispatch, _retry_states, _request), do: dispatch
+
+  defp reconcile_parked_retries(state, request, {:ok, issues}) do
+    expected = Map.get(request, :retry_reconciliation, %{})
+
+    Enum.reduce(issues, state, fn issue, acc ->
+      binding = Map.get(expected, issue.id)
+
+      if Tracker.authority_valid?(request.tracker_context) and
+           is_map(binding) and binding == Map.get(retry_retirement_candidates(acc), issue.id) and
+           verified_parked_retry?(issue, request.tracker_context) do
+        retire_parked_retry(acc, issue, binding)
+      else
+        acc
+      end
+    end)
+  end
+
+  defp reconcile_parked_retries(state, _request, _result), do: state
+
+  defp retire_parked_retry(%State{run_ledger_path: nil} = state, _issue, _binding), do: state
+
+  defp retire_parked_retry(state, issue, binding) do
+    event = %{
+      transition: "retry_retired",
+      stage: "released",
+      release_reason: "tracker_parked",
+      tracker_state: issue.state,
+      run_id: Map.get(binding, :previous_run_id),
+      issue_id: issue.id,
+      issue_identifier: Map.get(binding, :identifier),
+      attempt: Map.get(binding, :previous_attempt),
+      next_attempt: Map.get(binding, :attempt),
+      worker_host: Map.get(binding, :worker_host),
+      workspace_path: Map.get(binding, :workspace_path),
+      workspace_root: Map.get(binding, :workspace_root)
+    }
+
+    case append_run_event(state, event) do
+      :ok ->
+        case state.retry_attempts[issue.id] do
+          %{timer_ref: ref} when is_reference(ref) -> Process.cancel_timer(ref)
+          _ -> :ok
+        end
+
+        Logger.info("Retired parked retry without cleanup issue_id=#{issue.id} issue_identifier=#{issue.identifier}")
+
+        %{
+          state
+          | retry_attempts: Map.delete(state.retry_attempts, issue.id),
+            recovered_dispatches: Map.delete(state.recovered_dispatches, issue.id),
+            recovered_attempts: Map.delete(state.recovered_attempts, issue.id),
+            claimed: MapSet.delete(state.claimed, issue.id)
+        }
+
+      {:error, _reason} ->
+        Logger.warning("Could not persist retry retirement issue_id=#{issue.id} issue_identifier=#{issue.identifier}; retaining ownership")
+        state = %{state | claimed: MapSet.put(state.claimed, issue.id)}
+        defer_pending_dispatch(state, issue.id, :retry_retirement_failed)
+    end
+  end
 
   defp apply_tracker_admission_poll_result(
          %State{} = state,

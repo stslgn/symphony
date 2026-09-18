@@ -14,6 +14,14 @@ Symphony can bound each autonomous run by turns, observed Codex tokens, and
 wall-clock time. Reaching a configured budget parks the run for explicit
 operator resolution instead of silently starting another attempt.
 
+Completed runs can leave a continuation while their issue has already entered
+Human Review or another parked state. Pending and recovered retries are checked
+by exact tracker ID under the pinned authority, not inferred missing from the
+active candidate list. A verified parked retry is durably retired without
+starting a worker, creating an operator wait, or cleaning its workspace.
+Unknown/error responses preserve the pending work. Retirement is distinct from
+task acceptance and workspace cleanup.
+
 Automatic terminal cleanup is fail-closed. Human/operator wait states always
 preserve their workspace, even when a legacy workflow also lists them as
 terminal. A true terminal cleanup first proves that the Git workspace has no

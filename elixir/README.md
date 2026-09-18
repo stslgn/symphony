@@ -125,6 +125,24 @@ cursor. An eligible issue is then redispatched with an incremented attempt and
 a new run id. Interrupted attempts keep a durable recovery entry containing the
 original worker host and canonical workspace path until the next claim.
 
+Pending continuations/retries and recovered dispatches also receive a bounded
+exact-ID tracker read. Verified Human Review, Human Clarification, Deploy Ready
+or Blocked states retire a matching dispatch through `retry_retired` with
+`release_reason: tracker_parked`. The event binds the prior run/attempt, next
+attempt and workspace affinity. It is persisted before retry/claim ownership
+is released; append failure retains ownership. Stale results, changed tracker
+authority, missing/error lookup, active issues, existing typed waits, resumes
+and cleanup owners cannot authorize retirement. This read never authorizes a
+worker independently of the normal candidate/admission gates.
+
+Retirement preserves workspace and evidence, creates no fabricated run/wait,
+and never triggers cleanup. Replay removes only the matching pending dispatch.
+Old ledgers remain readable, but older binaries do not understand the new
+`retry_retired` event. After the first such event, do not roll back to an older
+reader, truncate the ledger, or edit away the record: retain a compatible
+runtime and use an explicitly approved forward recovery. Publication, promotion
+and managed restart remain separately authorized operational steps.
+
 Persisted operator waits reject invalid UTF-8, Unicode controls, empty values,
 and oversized fields before append and recovery. Wait/issue/run ids are capped
 at 128 bytes, issue identifiers at 96, tracker state at 128, worker host at 255,

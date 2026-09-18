@@ -268,6 +268,7 @@ defmodule SymphonyElixir.RunLedgerTest do
 
     assert recovery.recovered_dispatches["issue-stale"] == %{
              attempt: 3,
+             previous_attempt: 2,
              previous_run_id: "run-stale",
              identifier: "DUD-2",
              stage: "recovery_queued",
@@ -786,6 +787,7 @@ defmodule SymphonyElixir.RunLedgerTest do
 
     assert recovery.recovered_dispatches[issue_id] == %{
              attempt: 4,
+             previous_attempt: 3,
              previous_run_id: run_id,
              identifier: identifier,
              worker_host: "worker-a",
@@ -885,6 +887,7 @@ defmodule SymphonyElixir.RunLedgerTest do
 
     assert recovery.recovered_dispatches[issue_id] == %{
              attempt: 3,
+             previous_attempt: 2,
              previous_run_id: run_id,
              identifier: identifier,
              worker_host: "worker-a",

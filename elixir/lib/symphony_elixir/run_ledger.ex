@@ -28,6 +28,7 @@ defmodule SymphonyElixir.RunLedger do
     "run_parked" => ["parked"],
     "run_stopped" => ["released"],
     "retry_scheduled" => ["retry_queued"],
+    "retry_retired" => ["released"],
     "wait_resumed" => ["parked", "resume_queued"],
     "resume_queued" => ["resume_queued"],
     "wait_rejected" => ["parked"],
@@ -122,6 +123,11 @@ defmodule SymphonyElixir.RunLedger do
     },
     "retry_scheduled" => %{
       required_strings: ~w(stage run_id issue_id issue_identifier),
+      required_attempt: true,
+      required_next_attempt: true
+    },
+    "retry_retired" => %{
+      required_strings: ~w(stage run_id issue_id issue_identifier release_reason tracker_state),
       required_attempt: true,
       required_next_attempt: true
     },
@@ -260,12 +266,23 @@ defmodule SymphonyElixir.RunLedger do
       )
 
     with :ok <- validate_event_payload(stringify_keys(payload)),
+         :ok <- validate_retirement_append(path, stringify_keys(payload)),
          :ok <- File.mkdir_p(Path.dirname(path)),
          :ok <- ensure_private_file(path),
          {:ok, encoded} <- Jason.encode(payload) do
       append_synced(path, encoded <> "\n")
     end
   end
+
+  # Retirement is rare and must be checked against the durable pending identity
+  # before writing, not merely discovered to be invalid on the next startup.
+  defp validate_retirement_append(path, %{"transition" => "retry_retired"} = event) do
+    with {:ok, events} <- read_events(path) do
+      validate_ordered_events(events ++ [event])
+    end
+  end
+
+  defp validate_retirement_append(_path, _event), do: :ok
 
   @spec reconcile_startup(Path.t(), String.t()) ::
           {:ok, map()} | {:error, term()}
@@ -579,6 +596,9 @@ defmodule SymphonyElixir.RunLedger do
     Map.delete(acc, issue_id)
   end
 
+  defp update_recovered_dispatch_state(%{"transition" => "retry_retired", "issue_id" => id}, acc),
+    do: Map.delete(acc, id)
+
   defp update_recovered_dispatch_state(_event, acc), do: acc
 
   defp update_cleanup_pending_state(
@@ -669,6 +689,7 @@ defmodule SymphonyElixir.RunLedger do
   defp recovered_dispatch(event) do
     %{
       attempt: event["attempt"] + 1,
+      previous_attempt: event["attempt"],
       previous_run_id: event["run_id"],
       identifier: event["issue_identifier"],
       worker_host: event["worker_host"],
@@ -681,6 +702,7 @@ defmodule SymphonyElixir.RunLedger do
   defp recovered_next_action_dispatch(event, attempt) do
     %{
       attempt: attempt,
+      previous_attempt: event["attempt"],
       previous_run_id: event["run_id"],
       identifier: event["issue_identifier"],
       worker_host: event["worker_host"],
@@ -1087,6 +1109,18 @@ defmodule SymphonyElixir.RunLedger do
       else: {:error, {:invalid_field, "release_reason"}}
   end
 
+  defp validate_release_reason(%{"transition" => "retry_retired"} = event) do
+    allowed = ~w(schema_version event_id occurred_at transition stage run_id runner_generation
+                 issue_id issue_identifier attempt next_attempt release_reason tracker_state
+                 worker_host workspace_path workspace_root)
+
+    if event["release_reason"] == "tracker_parked" and
+         not is_nil(SymphonyElixir.OperatorWait.reason_for_tracker_state(event["tracker_state"])) and
+         Enum.all?(event, fn {key, value} -> key in allowed or is_nil(value) end),
+       do: :ok,
+       else: {:error, :invalid_retry_retirement}
+  end
+
   defp validate_release_reason(event) do
     if is_nil(event["release_reason"]),
       do: :ok,
@@ -1378,6 +1412,15 @@ defmodule SymphonyElixir.RunLedger do
         true ->
           {:ok, next_state}
       end
+    end
+  end
+
+  defp validate_ordered_event(%{"transition" => "retry_retired"} = event, state) do
+    with {:ok, run} <- fetch_run(state, event),
+         :ok <- require_terminal(run),
+         :ok <- validate_retired_dispatch(state, run, event) do
+      state = put_run(state, run.run_id, %{run | dispatch_intent: nil})
+      {:ok, %{state | dispatches: Map.delete(state.dispatches, run.issue_id)}}
     end
   end
 
@@ -1884,6 +1927,19 @@ defmodule SymphonyElixir.RunLedger do
 
         if fields_match?, do: :ok, else: {:error, :dispatch_identity_mismatch}
     end
+  end
+
+  defp validate_retired_dispatch(state, run, event) do
+    dispatch = Map.get(state.dispatches, run.issue_id)
+    affinity = [:worker_host, :workspace_path, :workspace_root]
+
+    if is_map(dispatch) and Map.get(dispatch, :previous_run_id) == run.run_id and
+         dispatch.attempt == event["next_attempt"] and
+         dispatch.stage in ["retry_queued", "recovery_queued"] and
+         not run.cleanup_intent and not Map.has_key?(state.waits, run.issue_id) and
+         Enum.all?(affinity, &(Map.get(run, &1) == event[Atom.to_string(&1)])),
+       do: :ok,
+       else: {:error, :retry_retirement_identity_mismatch}
   end
 
   defp identity_value_matches?(nil, _incoming), do: true
