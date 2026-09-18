@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.CLITest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   import ExUnit.CaptureIO
 
@@ -31,6 +31,7 @@ defmodule SymphonyElixir.CLITest do
       kind: linear
       api_key: $LINEAR_API_KEY
       project_slug: test-project
+      assignee: managed-assignee
       operator_user_ids:
         - 11111111-1111-1111-1111-111111111111
     ---
@@ -71,6 +72,43 @@ defmodule SymphonyElixir.CLITest do
 
     assert {:error, :tracker_api_key_must_use_linear_api_key_env} =
              CLI.managed_workflow_identity(workflow_path, "test-project")
+  end
+
+  test "managed workflow identity rejects ambient assignee fallback" do
+    previous_assignee = System.get_env("LINEAR_ASSIGNEE")
+    System.put_env("LINEAR_ASSIGNEE", "ambient-assignee")
+
+    on_exit(fn ->
+      if previous_assignee do
+        System.put_env("LINEAR_ASSIGNEE", previous_assignee)
+      else
+        System.delete_env("LINEAR_ASSIGNEE")
+      end
+    end)
+
+    workflow_path = write_managed_workflow("operator_user_ids: []", nil)
+
+    assert {:error, :managed_tracker_assignee_must_not_use_ambient_env} =
+             CLI.managed_workflow_identity(workflow_path, "test-project")
+  end
+
+  test "managed workflow identity rejects malformed operator ids" do
+    for operator_user_ids <- [
+          "operator_user_ids: operator",
+          "operator_user_ids: [123]",
+          "operator_user_ids: ['']",
+          "operator_user_ids: [\"11111111-1111-1111-1111-111111111111\\n22222222-2222-2222-2222-222222222222\"]"
+        ] do
+      workflow_path = write_managed_workflow(operator_user_ids)
+
+      expected_reason =
+        if operator_user_ids == "operator_user_ids: operator",
+          do: :operator_user_ids_must_be_a_list,
+          else: :operator_user_ids_must_be_linear_actor_ids
+
+      assert {:error, ^expected_reason} =
+               CLI.managed_workflow_identity(workflow_path, "test-project")
+    end
   end
 
   test "returns the guardrails acknowledgement banner when the flag is missing" do
@@ -121,6 +159,29 @@ defmodule SymphonyElixir.CLITest do
     }
 
     assert :ok = CLI.evaluate([@ack_flag], deps)
+  end
+
+  defp write_managed_workflow(operator_user_ids, assignee \\ "managed-assignee") do
+    workflow_path =
+      Path.join(System.tmp_dir!(), "symphony-managed-workflow-#{System.unique_integer([:positive])}.md")
+
+    on_exit(fn -> File.rm(workflow_path) end)
+
+    assignee_line = if assignee, do: "assignee: #{assignee}\n  ", else: ""
+
+    File.write!(workflow_path, """
+    ---
+    tracker:
+      kind: linear
+      api_key: $LINEAR_API_KEY
+      project_slug: test-project
+      #{assignee_line}#{operator_user_ids}
+    ---
+    ## Symphony Runtime Prompt
+    Test prompt.
+    """)
+
+    workflow_path
   end
 
   test "uses an explicit workflow path override when provided" do

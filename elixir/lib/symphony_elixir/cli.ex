@@ -60,27 +60,10 @@ defmodule SymphonyElixir.CLI do
   def managed_workflow_identity(workflow_path, expected_project_slug)
       when is_binary(workflow_path) and is_binary(expected_project_slug) do
     with {:ok, %{config: config}} <- Workflow.load(workflow_path),
-         tracker when is_map(tracker) <- Map.get(config, "tracker"),
+         {:ok, tracker} <- managed_tracker(config),
          :ok <- validate_managed_tracker(tracker, expected_project_slug),
-         operator_user_ids when is_list(operator_user_ids) <-
-           Map.get(tracker, "operator_user_ids", []),
-         true <- Enum.all?(operator_user_ids, &is_binary/1) do
+         {:ok, operator_user_ids} <- validate_managed_operator_user_ids(tracker) do
       {:ok, operator_user_ids}
-    else
-      {:error, reason} ->
-        {:error, reason}
-
-      nil ->
-        {:error, :tracker_must_be_a_map}
-
-      tracker when not is_map(tracker) ->
-        {:error, :tracker_must_be_a_map}
-
-      operator_user_ids when not is_list(operator_user_ids) ->
-        {:error, :operator_user_ids_must_be_a_list}
-
-      false ->
-        {:error, :operator_user_ids_must_contain_only_strings}
     end
   end
 
@@ -109,10 +92,18 @@ defmodule SymphonyElixir.CLI do
     end
   end
 
+  defp managed_tracker(config) do
+    case Map.get(config, "tracker") do
+      tracker when is_map(tracker) -> {:ok, tracker}
+      _other -> {:error, :tracker_must_be_a_map}
+    end
+  end
+
   defp validate_managed_tracker(tracker, expected_project_slug) do
     endpoint = Map.get(tracker, "endpoint", "https://api.linear.app/graphql")
     webhook_secret = Map.get(tracker, "webhook_secret")
     assignee = Map.get(tracker, "assignee")
+    ambient_assignee = System.get_env("LINEAR_ASSIGNEE")
 
     cond do
       Map.get(tracker, "kind") != "linear" ->
@@ -124,7 +115,13 @@ defmodule SymphonyElixir.CLI do
       webhook_secret not in [nil, "$LINEAR_WEBHOOK_SECRET"] ->
         {:error, :tracker_webhook_secret_must_use_linear_webhook_secret_env}
 
+      not is_nil(assignee) and not is_binary(assignee) ->
+        {:error, :managed_tracker_assignee_must_be_a_string}
+
       is_binary(assignee) and String.starts_with?(assignee, "$") ->
+        {:error, :managed_tracker_assignee_must_not_use_ambient_env}
+
+      is_nil(assignee) and ambient_assignee not in [nil, ""] ->
         {:error, :managed_tracker_assignee_must_not_use_ambient_env}
 
       endpoint != "https://api.linear.app/graphql" ->
@@ -137,6 +134,29 @@ defmodule SymphonyElixir.CLI do
         :ok
     end
   end
+
+  defp validate_managed_operator_user_ids(tracker) do
+    case Map.get(tracker, "operator_user_ids", []) do
+      operator_user_ids when is_list(operator_user_ids) ->
+        if Enum.all?(operator_user_ids, &linear_actor_id?/1) do
+          {:ok, operator_user_ids}
+        else
+          {:error, :operator_user_ids_must_be_linear_actor_ids}
+        end
+
+      _other ->
+        {:error, :operator_user_ids_must_be_a_list}
+    end
+  end
+
+  defp linear_actor_id?(value) when is_binary(value) do
+    Regex.match?(
+      ~r/\A[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\z/,
+      value
+    )
+  end
+
+  defp linear_actor_id?(_value), do: false
 
   @spec halt_runtime_identity(term()) :: no_return()
   defp halt_runtime_identity(reason) do
