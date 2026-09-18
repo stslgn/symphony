@@ -311,6 +311,13 @@ Notes:
   build manifest, and live probe all agree. Before application startup, Symphony computes the
   execution fingerprint from loaded code and refuses an image/path A-B-A substitution even if the
   pathname bytes are restored.
+  A managed launcher may also call
+  `bin/symphony --managed-workflow-identity <workflow-path> <project-slug>` in a clean environment.
+  This side-effect-free probe validates the fixed Linear endpoint, environment-backed credential
+  selectors, explicit project scope, non-ambient assignee routing, and UUID-shaped operator IDs,
+  then prints one operator ID per line. Managed runtime mode never falls back to
+  `LINEAR_ASSIGNEE`; the workflow may either declare a literal assignee or omit assignee routing.
+  Invalid managed authority exits with status 65 before the application starts.
   It also compares the workflow value with its single initial
   snapshot and measures the named image bytes. With `SYMPHONY_MANAGED_PROJECT`,
   `SYMPHONY_STARTUP_ATTESTATION_PATH` and
